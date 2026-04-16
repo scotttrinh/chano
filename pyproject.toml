@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chano"
+version = "0.1.0"
+description = "A tiny Python library that never gives you up."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+  { name = "Scott Trinh" },
+]
+keywords = ["rickroll", "youtube", "fun"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Operating System :: OS Independent",
+]
+license-files = []
+
+[project.urls]
+Repository = "https://github.com/scotttrinh/chano"
+Issues = "https://github.com/scotttrinh/chano/issues"
+
+[project.scripts]
+chano = "chano:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
