@@ -3702,12 +3702,12 @@ def test_set_cookie_and_delete_cookie():
 
     response = Response()
     with pytest.raises(ValueError, match="samesite"):
-        response.set_cookie("bad", samesite="sometimes")  # type: ignore[arg-type]
+        response.set_cookie("bad", samesite="sometimes")  # ty: ignore[invalid-argument-type]
     with pytest.raises(ValueError):
         response.set_cookie("bad key", "x")
     # delete_cookie has exactly the spec's signature.
     with pytest.raises(TypeError):
-        response.delete_cookie("old", secure=False)  # type: ignore[call-arg]
+        response.delete_cookie("old", secure=False)  # ty: ignore[unknown-argument]
 
 
 # @lat: [[tests#Set-cookie on every response type]]
@@ -3744,12 +3744,13 @@ def test_set_cookie_on_every_response_type(make_response):
     ],
 )
 def test_set_cookie_rejects_unencodable_values(kwargs):
+    params: dict[str, Any] = {"value": "x", **kwargs}
     with pytest.raises(ValueError, match="cookie"):
-        Response().set_cookie("city", **{"value": "x", **kwargs})
+        Response().set_cookie("city", **params)
 
     def handler():
         response = Response("ok")
-        response.set_cookie("city", **{"value": "x", **kwargs})
+        response.set_cookie("city", **params)
         return response
 
     # The error surfaces in the handler, so the client gets a whole 500
@@ -4124,6 +4125,7 @@ def test_lazy_cancelled_waiter_does_not_cancel_creation():
 
     async def factory():
         calls.append(1)
+        assert release is not None
         await release.wait()
         return "pool"
 
