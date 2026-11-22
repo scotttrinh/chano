@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import dataclasses
 import functools
 import inspect
@@ -175,22 +176,35 @@ def lazy(factory: Callable[[], Any]) -> Callable[[], Any]:
                 task.add_done_callback(functools.partial(settle, future))
                 pending = (future, task)
             future, _ = pending
-        waiter = asyncio.wrap_future(future)
-        try:
-            # shield: cancelling this caller must not cancel the shared future.
-            return await asyncio.shield(waiter)
-        except asyncio.CancelledError:
-            # Nobody awaits the abandoned waiter now, so retrieve its outcome
-            # to keep asyncio from reporting an unretrieved exception.
-            waiter.add_done_callback(_retrieve)
-            raise
+        return await _await_shared(future)
 
     return _named(aget, factory)
 
 
-def _retrieve(future: asyncio.Future[Any]) -> None:
-    if not future.cancelled():
-        future.exception()
+async def _await_shared(future: concurrent.futures.Future[Any]) -> Any:
+    """Await a shared ``concurrent.futures.Future`` without cancelling it if
+    this caller is cancelled, and without logging when an abandoned waiter's
+    source later fails."""
+    loop = asyncio.get_running_loop()
+    waiter: asyncio.Future[Any] = loop.create_future()
+
+    def resolve(done: concurrent.futures.Future[Any]) -> None:
+        if waiter.done():
+            return
+        if done.cancelled():
+            waiter.cancel()
+        elif (error := done.exception()) is not None:
+            waiter.set_exception(error)
+        else:
+            waiter.set_result(done.result())
+
+    def forward(done: concurrent.futures.Future[Any]) -> None:
+        if not waiter.done():
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(resolve, done)
+
+    future.add_done_callback(forward)
+    return await waiter
 
 
 def _is_async(factory: Callable[..., Any]) -> bool:

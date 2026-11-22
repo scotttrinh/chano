@@ -57,6 +57,7 @@ from chano.routing import discover_routes, load_module
 EXAMPLE = Path(__file__).parent.parent / "examples" / "hello"
 FULLSTACK = Path(__file__).parent.parent / "examples" / "fullstack"
 AUTH = {"Authorization": "Bearer secret"}
+HOST_PYTHON = f"{sys.version_info.major}.{sys.version_info.minor}"
 
 
 def make_client(app, root_path: str = ""):
@@ -365,7 +366,7 @@ def test_emit_build_preserves_public_and_config_isolation(
 @pytest.fixture(scope="module")
 def output():
     # Vendor for this machine so the function can be invoked locally.
-    return build(EXAMPLE, platform=None)
+    return build(EXAMPLE, python=HOST_PYTHON, platform=None)
 
 
 # @lat: [[tests#Build output layout]]
@@ -392,7 +393,8 @@ def test_build_output_layout(output):
     }
     func = functions / "api" / "items" / "[item_id].func"
     vc_config = json.loads((func / ".vc-config.json").read_text())
-    assert vc_config["runtime"] == "python3.12"
+    assert vc_config["runtime"] == f"python{HOST_PYTHON}"
+    assert plan_build(EXAMPLE).python == "3.12"
     assert vc_config["handler"] == "vc__handler__python.vc_handler"
     assert vc_config["maxDuration"] == 10
     assert (func / "_vendor" / "chano").is_dir()
@@ -633,7 +635,7 @@ def prefixed_output(prefixed_project):
         with pytest.MonkeyPatch.context() as patch:
             patch.setattr(build_module, "_install_dependencies", install_like_example)
             patch.setattr(sys, "dont_write_bytecode", True)
-            return build(prefixed_project, platform=None)
+            return build(prefixed_project, python=HOST_PYTHON, platform=None)
     finally:
         sys.path[:] = path
         for name in set(sys.modules) - modules:
@@ -1899,7 +1901,7 @@ def test_workspace_build(tmp_path, isolated_imports, monkeypatch):
     assert plan.workspace_root == workspace.resolve()
     assert plan.package == "api"
 
-    output = build(api, platform=None)
+    output = build(api, python=HOST_PYTHON, platform=None)
     assert output == api.resolve() / ".vercel" / "output"
 
     vendor = output / "functions" / "index.func" / "_vendor"
@@ -1937,7 +1939,7 @@ def test_fullstack_example_build(tmp_path, isolated_imports):
     assert plan.package == "fullstack-api"
     assert plan.config.base_path == "/api"
 
-    output = build(backend, platform=None, output=out)
+    output = build(backend, python=HOST_PYTHON, platform=None, output=out)
     assert output == out.resolve()
 
     config = json.loads((output / "config.json").read_text())
@@ -2372,7 +2374,9 @@ def test_tree_shaking_workspace_build(tmp_path, isolated_imports, monkeypatch, c
     assert by_name["alpha"].include == ()
     assert by_name["included"].include == ("pkg-d",)
 
-    shaken = build(api, platform=None, output=tmp_path / "out-shaken")
+    shaken = build(
+        api, python=HOST_PYTHON, platform=None, output=tmp_path / "out-shaken"
+    )
     report_out = capsys.readouterr().out
 
     def dists_for(out_dir: Path, func_name: str) -> set[str]:
@@ -2443,7 +2447,9 @@ def test_tree_shaking_workspace_build(tmp_path, isolated_imports, monkeypatch, c
     (api / "pyproject.toml").write_text(
         base_pyproject + '\n[tool.chano]\ninclude = ["Pkg_D"]\n'
     )
-    with_proj_inc = build(api, platform=None, output=tmp_path / "out-proj-inc")
+    with_proj_inc = build(
+        api, python=HOST_PYTHON, platform=None, output=tmp_path / "out-proj-inc"
+    )
     capsys.readouterr()
     beta_with_inc = dists_for(with_proj_inc, "beta")
     assert always | {"pkg-b", "pkg-d"} <= beta_with_inc
@@ -2456,7 +2462,7 @@ def test_tree_shaking_workspace_build(tmp_path, isolated_imports, monkeypatch, c
     (api / "pyproject.toml").write_text(
         base_pyproject + "\n[tool.chano]\ntree_shake = false\n"
     )
-    full = build(api, platform=None, output=tmp_path / "out-full")
+    full = build(api, python=HOST_PYTHON, platform=None, output=tmp_path / "out-full")
     full_report = capsys.readouterr().out
     all_expected = always | {"pkg-a", "pkg-trans", "pkg-b", "pkg-c", "pkg-d"}
     for func_name in ("alpha", "beta", "dynamic", "dunder", "included"):
