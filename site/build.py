@@ -24,10 +24,42 @@ STATIC_DIR = ROOT / "static"
 DIST_DIR = ROOT / "dist"
 
 VBG_CSS_URL = "https://vercel.com/geist/vercel-brand.css"
+FONTS_URL = (
+    "https://fonts.googleapis.com/css2"
+    "?family=Geist:wght@400..600&family=Geist+Mono:wght@400..600&display=swap"
+)
 GITHUB_URL = "https://github.com/scotttrinh/chano"
 SITE_NAME = "Chano"
 
 _FORMATTER = HtmlFormatter(nowrap=True)
+
+HERO_CODE_SAMPLE = """\
+from typing import Annotated
+from msgspec import Meta, Struct
+from chano import Depends, HTTPBearer, HTTPException, raises
+
+class Item(Struct):
+    name: str
+    price: Annotated[float, Meta(gt=0)]
+
+bearer = HTTPBearer()
+
+@raises(401, "Not authenticated")
+def current_user(token: str = Depends(bearer)) -> str:
+    if token != "secret":
+        raise HTTPException(401, "Not authenticated")
+    return "alice"
+
+def GET(item_id: int, verbose: bool = False):
+    return {"item_id": item_id, "verbose": verbose}
+
+async def PUT(
+    item_id: int,
+    item: Item,
+    user: str = Depends(current_user),
+) -> Item:
+    return item
+"""
 
 
 @dataclass(frozen=True)
@@ -42,8 +74,12 @@ class Page:
     out: Path
     url: str
     title: str
+    nav_title: str
     description: str
     lede: str
+    layout: str
+    section: str
+    order: int
     body_html: str
     toc: list[TocItem]
 
@@ -68,7 +104,7 @@ def parse_frontmatter(raw: str) -> tuple[dict[str, str], str]:
     return meta, raw[end + 5 :]
 
 
-def highlight_code(code: str, lang: str, _attrs: str) -> str:
+def highlight_code(code: str, lang: str, _attrs: str = "") -> str:
     language = (lang or "").strip().split()[0] if lang else ""
     try:
         lexer = get_lexer_by_name(language) if language else TextLexer()
@@ -76,10 +112,7 @@ def highlight_code(code: str, lang: str, _attrs: str) -> str:
         lexer = TextLexer()
     highlighted = highlight(code, lexer, _FORMATTER)
     lang_attr = f' data-lang="{html.escape(language)}"' if language else ""
-    return (
-        f'<pre class="vbg-custom-code"{lang_attr}>'
-        f"<code>{highlighted}</code></pre>\n"
-    )
+    return f'<pre class="vbg-custom-code"{lang_attr}><code>{highlighted}</code></pre>\n'
 
 
 def render_markdown(source: str) -> tuple[str, list[TocItem]]:
@@ -121,10 +154,324 @@ def render_markdown(source: str) -> tuple[str, list[TocItem]]:
     return rendered, toc
 
 
-def render_page(page: Page) -> str:
-    page_title = (
-        f"{page.title} — {SITE_NAME}" if page.title != SITE_NAME else SITE_NAME
+def render_header(active_section: str) -> str:
+    guides_current = ' aria-current="page"' if active_section == "guides" else ""
+    ref_current = ' aria-current="page"' if active_section == "reference" else ""
+    return f"""    <header class="vbg-custom-header">
+      <a class="vbg-custom-brand" href="/">{SITE_NAME}</a>
+      <nav class="vbg-custom-nav" aria-label="Primary">
+        <a href="/guides/getting-started"{guides_current}>Guides</a>
+        <a href="/reference/routing"{ref_current}>Reference</a>
+        <a href="{GITHUB_URL}">GitHub</a>
+        <span class="vbg-custom-nav-meta">Python 3.12+</span>
+      </nav>
+    </header>"""
+
+
+def render_footer() -> str:
+    return f"""    <footer class="vbg-custom-footer">
+      <span class="vbg-custom-footer-brand">{SITE_NAME}</span>
+      <span>
+        Serverless-first Python web framework ·
+        <a href="/guides/getting-started">Guides</a> ·
+        <a href="/reference/routing">Reference</a> ·
+        <a href="{GITHUB_URL}">GitHub</a>
+      </span>
+    </footer>"""
+
+
+def render_document(page: Page, main_html: str) -> str:
+    page_title = f"{page.title} | {SITE_NAME}" if page.title != SITE_NAME else SITE_NAME
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{html.escape(page_title)}</title>
+  <meta name="description" content="{html.escape(page.description)}">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="{FONTS_URL}" rel="stylesheet" referrerpolicy="no-referrer">
+  <link href="{VBG_CSS_URL}" rel="stylesheet">
+  <link href="/site.css" rel="stylesheet">
+</head>
+<body class="vbg-report">
+  <div class="vbg-shell">
+    <a class="vbg-skip-link" href="#main">Skip to content</a>
+{render_header(page.section)}
+    <main id="main">
+{main_html}
+    </main>
+{render_footer()}
+  </div>
+</body>
+</html>
+"""
+
+
+def render_landing(page: Page) -> str:
+    hero_code_html = highlight_code(HERO_CODE_SAMPLE, "python")
+    install_html = highlight_code('uv add chano && uv add --dev "chano[dev]"', "sh")
+    main_html = f"""      <section class="vbg-custom-hero">
+        <div class="vbg-custom-hero-copy">
+          <h1 class="vbg-display">FastAPI ergonomics, one function per route.</h1>
+          <p class="vbg-lede">{html.escape(page.lede)}</p>
+          <div class="vbg-custom-actions">
+            <a class="vbg-custom-btn-primary" href="/guides/getting-started">
+              Get started
+            </a>
+            <a class="vbg-custom-btn-secondary" href="/reference/routing">
+              API reference
+            </a>
+          </div>
+          <div class="vbg-custom-install">
+            <p class="vbg-label">Install with uv</p>
+            {install_html.strip()}
+          </div>
+        </div>
+        <div class="vbg-custom-hero-code">
+          <div class="vbg-custom-code-bar">
+            <span class="vbg-mono">app/api/items/[item_id]/route.py</span>
+            <span class="vbg-mono">/api/items/{{item_id}}</span>
+          </div>
+          {hero_code_html.strip()}
+        </div>
+      </section>
+
+      <section class="vbg-custom-landing-section">
+        <div class="vbg-custom-section-head">
+          <h2 class="vbg-heading-24">Built for isolated serverless functions</h2>
+          <p class="vbg-custom-section-lead">
+            Chano keeps typed Python handlers and dependency injection while
+            replacing the single long-lived server with per-route functions.
+          </p>
+        </div>
+        <div class="vbg-custom-pillar-grid">
+          <div class="vbg-custom-pillar">
+            <h3 class="vbg-heading-16">One function per route</h3>
+            <p>
+              Each <code>route.py</code> compiles into its own Vercel function with
+              independent <code>memory</code>, <code>max_duration</code>,
+              <code>regions</code>, and AST tree-shaken dependencies.
+            </p>
+          </div>
+          <div class="vbg-custom-pillar">
+            <h3 class="vbg-heading-16">Minimal ASGI and msgspec</h3>
+            <p>
+              Built directly on ASGI and <code>msgspec</code> for single-pass JSON
+              decoding and validation, with automatic
+              <code>pydantic.BaseModel</code> support when imported.
+            </p>
+          </div>
+          <div class="vbg-custom-pillar">
+            <h3 class="vbg-heading-16">Folder-scoped conventions</h3>
+            <p>
+              Drop <code>middleware.py</code>, <code>error.py</code>, or
+              <code>dependencies.py</code> in any folder under <code>app/</code>
+              to scope behavior to that subtree without central app wiring.
+            </p>
+          </div>
+          <div class="vbg-custom-pillar">
+            <h3 class="vbg-heading-16">Static docs and serverless lifecycles</h3>
+            <p>
+              OpenAPI 3.1 and Swagger UI pre-render to the CDN at build time. Use
+              <code>lazy()</code> for warm singletons and <code>after()</code> for
+              <code>wait_until</code> background work.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section class="vbg-custom-landing-section">
+        <div class="vbg-custom-section-head">
+          <h2 class="vbg-heading-24">Familiar to FastAPI developers</h2>
+          <p class="vbg-custom-section-lead">
+            Keep typed signatures and <code>Depends()</code>, adapted to
+            file-system routing and Vercel Build Output API v3.
+            <a href="/guides/serverless-mental-model">Read the full comparison.</a>
+          </p>
+        </div>
+        <div class="vbg-table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Concept</th>
+                <th scope="col">FastAPI</th>
+                <th scope="col">Chano</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <th scope="row">Entry point</th>
+                <td><code>app = FastAPI()</code></td>
+                <td>
+                  No central app object; routes live in
+                  <code>app/**/route.py</code>
+                </td>
+              </tr>
+              <tr>
+                <th scope="row">Route handlers</th>
+                <td><code>@app.get("/items/{{id}}")</code></td>
+                <td>
+                  <code>def GET(id: int):</code> in
+                  <code>app/items/[id]/route.py</code>
+                </td>
+              </tr>
+              <tr>
+                <th scope="row">Validation</th>
+                <td>Pydantic</td>
+                <td>
+                  <code>msgspec</code> (optional
+                  <code>pydantic.BaseModel</code> support)
+                </td>
+              </tr>
+              <tr>
+                <th scope="row">Shared hooks</th>
+                <td><code>APIRouter</code>, middleware, exception handlers</td>
+                <td>
+                  Folder-scoped <code>dependencies.py</code>,
+                  <code>middleware.py</code>, <code>error.py</code>
+                </td>
+              </tr>
+              <tr>
+                <th scope="row">Background work</th>
+                <td><code>BackgroundTasks</code></td>
+                <td>
+                  <code>after()</code> backed by
+                  <code>vercel.functions.wait_until</code>
+                </td>
+              </tr>
+              <tr>
+                <th scope="row">OpenAPI and /docs</th>
+                <td>Generated at runtime in Python</td>
+                <td>Pre-rendered at build time to static CDN files</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="vbg-custom-landing-section">
+        <div class="vbg-custom-section-head">
+          <h2 class="vbg-heading-24">Develop locally, deploy prebuilt</h2>
+          <p class="vbg-custom-section-lead">
+            Three commands take a project from local hot reload to isolated
+            production functions.
+          </p>
+        </div>
+        <div class="vbg-custom-steps">
+          <div class="vbg-custom-step">
+            <p class="vbg-custom-step-cmd"><code>uv run chano dev</code></p>
+            <p>
+              Run all routes, <code>/docs</code>, <code>/openapi.json</code>, and
+              <code>public/</code> locally with reload.
+            </p>
+          </div>
+          <div class="vbg-custom-step">
+            <p class="vbg-custom-step-cmd"><code>uv run chano build</code></p>
+            <p>
+              Emit deterministic Build Output API v3 functions with tree-shaken
+              <code>_vendor/</code> bundles.
+            </p>
+          </div>
+          <div class="vbg-custom-step">
+            <p class="vbg-custom-step-cmd"><code>vercel deploy --prebuilt</code></p>
+            <p>
+              Upload prebuilt functions and static CDN assets directly without a
+              remote build step.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section class="vbg-custom-landing-section">
+        <div class="vbg-custom-next-grid">
+          <a class="vbg-custom-next-link" href="/guides/getting-started">
+            <span class="vbg-heading-20">Guides</span>
+            <span class="vbg-custom-next-desc">
+              Walk through project setup, the serverless mental model, folder
+              conventions, and Vercel deployment.
+            </span>
+          </a>
+          <a class="vbg-custom-next-link" href="/reference/routing">
+            <span class="vbg-heading-20">Reference</span>
+            <span class="vbg-custom-next-desc">
+              Look up exact routing rules, parameter markers, response classes,
+              pyproject.toml keys, and CLI flags.
+            </span>
+          </a>
+        </div>
+      </section>"""
+    return render_document(page, main_html)
+
+
+def render_sidebar(current: Page, sections: dict[str, list[Page]]) -> str:
+    groups: list[str] = []
+    for key, heading in (("guides", "Guides"), ("reference", "Reference")):
+        pages = sections.get(key, [])
+        if not pages:
+            continue
+        items = []
+        for p in pages:
+            aria = ' aria-current="page"' if p.url == current.url else ""
+            items.append(
+                f'            <li><a href="{html.escape(p.url)}"{aria}>'
+                f"{html.escape(p.nav_title)}</a></li>"
+            )
+        groups.append(
+            f"""        <div class="vbg-custom-sidebar-group">
+          <p class="vbg-custom-sidebar-title">{html.escape(heading)}</p>
+          <ul class="vbg-custom-sidebar-list">
+{chr(10).join(items)}
+          </ul>
+        </div>"""
+        )
+    return f"""      <nav class="vbg-custom-sidebar" aria-label="Documentation">
+{chr(10).join(groups)}
+      </nav>"""
+
+
+def render_pager(current: Page, sections: dict[str, list[Page]]) -> str:
+    siblings = sections.get(current.section, [])
+    try:
+        idx = next(i for i, p in enumerate(siblings) if p.url == current.url)
+    except StopIteration:
+        return ""
+
+    prev_page = siblings[idx - 1] if idx > 0 else None
+    next_page = siblings[idx + 1] if idx + 1 < len(siblings) else None
+    if not prev_page and not next_page:
+        return ""
+
+    prev_url = html.escape(prev_page.url) if prev_page else ""
+    prev_title = html.escape(prev_page.nav_title) if prev_page else ""
+    next_url = html.escape(next_page.url) if next_page else ""
+    next_title = html.escape(next_page.nav_title) if next_page else ""
+
+    prev_html = (
+        f'          <a class="vbg-custom-pager-link" href="{prev_url}">\n'
+        f'            <span class="vbg-custom-pager-label">Previous</span>\n'
+        f'            <span class="vbg-custom-pager-title">{prev_title}</span>\n'
+        f"          </a>"
+        if prev_page
+        else "          <span></span>"
     )
+    next_html = (
+        f'          <a class="vbg-custom-pager-link vbg-custom-pager-next"'
+        f' href="{next_url}">\n'
+        f'            <span class="vbg-custom-pager-label">Next</span>\n'
+        f'            <span class="vbg-custom-pager-title">{next_title}</span>\n'
+        f"          </a>"
+        if next_page
+        else "          <span></span>"
+    )
+    return f"""        <nav class="vbg-custom-pager" aria-label="Pagination">
+{prev_html}
+{next_html}
+        </nav>"""
+
+
+def render_doc(page: Page, sections: dict[str, list[Page]]) -> str:
     toc_html = ""
     if page.toc:
         items = "\n".join(
@@ -140,60 +487,67 @@ def render_page(page: Page) -> str:
       </aside>"""
 
     lede_html = (
-        f'        <p class="vbg-lede">{html.escape(page.lede)}</p>' if page.lede else ""
+        f'          <p class="vbg-lede">{html.escape(page.lede)}</p>'
+        if page.lede
+        else ""
     )
-    fonts_url = (
-        "https://fonts.googleapis.com/css2"
-        "?family=Geist:wght@400..600&family=Geist+Mono:wght@400..600&display=swap"
+    sidebar_html = render_sidebar(page, sections)
+    pager_html = render_pager(page, sections)
+    layout_class = (
+        "vbg-custom-docs-layout vbg-custom-docs-with-toc"
+        if page.toc
+        else "vbg-custom-docs-layout"
     )
 
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{html.escape(page_title)}</title>
-  <meta name="description" content="{html.escape(page.description)}">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="{fonts_url}" rel="stylesheet" referrerpolicy="no-referrer">
-  <link href="{VBG_CSS_URL}" rel="stylesheet">
-  <link href="/site.css" rel="stylesheet">
-</head>
-<body class="vbg-report">
-  <div class="vbg-shell">
-    <a class="vbg-skip-link" href="#main">Skip to content</a>
-    <header class="vbg-custom-header">
-      <a class="vbg-custom-brand" href="/">{SITE_NAME}</a>
-      <nav class="vbg-custom-nav" aria-label="Primary">
-        <a href="/" aria-current="page">Guide</a>
-        <a href="{GITHUB_URL}">GitHub</a>
-        <span class="vbg-custom-nav-meta">Python 3.12+</span>
-      </nav>
-    </header>
-    <main id="main">
-      <section class="vbg-custom-opening">
-        <h1 class="vbg-title">{html.escape(page.title)}</h1>
+    main_html = f"""      <div class="{layout_class}">
+{sidebar_html}
+        <div class="vbg-custom-doc-main">
+          <section class="vbg-custom-opening">
+            <h1 class="vbg-title">{html.escape(page.title)}</h1>
 {lede_html}
-      </section>
-      <div class="vbg-custom-doc-layout">
-{toc_html}
-        <article class="vbg-custom-prose">
+          </section>
+          <article class="vbg-custom-prose">
 {page.body_html}
-        </article>
-      </div>
-    </main>
-    <footer class="vbg-custom-footer">
-      <span class="vbg-custom-footer-brand">{SITE_NAME}</span>
-      <span>
-        Serverless-first Python web framework ·
-        <a href="{GITHUB_URL}">github.com/scotttrinh/chano</a>
-      </span>
-    </footer>
-  </div>
-</body>
-</html>
-"""
+          </article>
+{pager_html}
+        </div>
+{toc_html}
+      </div>"""
+    return render_document(page, main_html)
+
+
+def load_pages() -> list[Page]:
+    pages: list[Page] = []
+    for md_path in sorted(CONTENT_DIR.rglob("*.md")):
+        rel = md_path.relative_to(CONTENT_DIR)
+        meta, body = parse_frontmatter(md_path.read_text(encoding="utf-8"))
+        body_html, toc = render_markdown(body)
+
+        if rel.name == "index.md":
+            out_path = DIST_DIR / rel.with_suffix(".html")
+            url = "/" if rel.parent == Path(".") else f"/{rel.parent.as_posix()}/"
+        else:
+            out_path = DIST_DIR / rel.with_suffix("") / "index.html"
+            url = f"/{rel.with_suffix('').as_posix()}"
+
+        title = meta.get("title", SITE_NAME)
+        pages.append(
+            Page(
+                src=md_path,
+                out=out_path,
+                url=url,
+                title=title,
+                nav_title=meta.get("nav_title", title),
+                description=meta.get("description", ""),
+                lede=meta.get("lede", ""),
+                layout=meta.get("layout", "doc"),
+                section=meta.get("section", ""),
+                order=int(meta.get("order", "99")),
+                body_html=body_html,
+                toc=toc,
+            )
+        )
+    return pages
 
 
 def build() -> list[Page]:
@@ -208,32 +562,22 @@ def build() -> list[Page]:
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dest)
 
-    pages: list[Page] = []
-    for md_path in sorted(CONTENT_DIR.rglob("*.md")):
-        rel = md_path.relative_to(CONTENT_DIR)
-        meta, body = parse_frontmatter(md_path.read_text(encoding="utf-8"))
-        body_html, toc = render_markdown(body)
+    pages = load_pages()
+    sections: dict[str, list[Page]] = {}
+    for page in pages:
+        if page.section:
+            sections.setdefault(page.section, []).append(page)
+    for group in sections.values():
+        group.sort(key=lambda p: (p.order, p.nav_title))
 
-        if rel.name == "index.md":
-            out_path = DIST_DIR / rel.with_suffix(".html")
-            url = "/" if rel.parent == Path(".") else f"/{rel.parent.as_posix()}/"
-        else:
-            out_path = DIST_DIR / rel.with_suffix("") / "index.html"
-            url = f"/{rel.with_suffix('').as_posix()}"
-
-        page = Page(
-            src=md_path,
-            out=out_path,
-            url=url,
-            title=meta.get("title", SITE_NAME),
-            description=meta.get("description", ""),
-            lede=meta.get("lede", ""),
-            body_html=body_html,
-            toc=toc,
+    for page in pages:
+        html_output = (
+            render_landing(page)
+            if page.layout == "landing"
+            else render_doc(page, sections)
         )
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(render_page(page), encoding="utf-8")
-        pages.append(page)
+        page.out.parent.mkdir(parents=True, exist_ok=True)
+        page.out.write_text(html_output, encoding="utf-8")
 
     return pages
 

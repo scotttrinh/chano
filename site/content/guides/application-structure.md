@@ -1,0 +1,164 @@
+---
+title: Application structure
+description: Structure shared authentication, middleware, error boundaries, lazy singletons, and background work in Chano.
+lede: Because each route compiles into its own function, Chano replaces central app wiring with file-system conventions and lazy initialization.
+section: guides
+order: 3
+nav_title: Application structure
+---
+
+## Dependencies and authentication
+
+`Depends(fn)` resolves dependencies recursively and caches results **per request** by callable identity. If two dependencies both request `get_user`, it runs once for that request.
+
+For Bearer authentication, combine `HTTPBearer()` with `@raises`:
+
+```python
+from chano import Depends, HTTPBearer, HTTPException, raises
+
+bearer = HTTPBearer()
+
+
+@raises(401, "Not authenticated")
+def current_user(token: str = Depends(bearer)) -> str:
+    if token != "secret":
+        raise HTTPException(401, "Not authenticated")
+    return "alice"
+
+
+def GET(user: str = Depends(current_user)):
+    return {"user": user}
+```
+
+- `Depends(bearer)` reads `Authorization: Bearer <token>`, returns `401` with `WWW-Authenticate: Bearer` when missing, and registers an HTTP Bearer security scheme in `openapi.json`.
+- `@raises(status, description)` documents error responses in `openapi.json` for every handler or dependency that uses it. It is documentation-only; your code still raises `HTTPException`.
+
+## Folder-scoped `dependencies.py`
+
+To protect a subtree of routes without repeating `Depends(...)` in every handler, add a `dependencies.py` file to any folder under `app/`. Export a `dependencies` list or tuple of callables:
+
+```python
+# app/(admin)/dependencies.py
+from chano import Depends, HTTPBearer, HTTPException, raises
+
+bearer = HTTPBearer()
+
+
+@raises(403, "Admin access required")
+def require_admin(token: str = Depends(bearer)) -> None:
+    if token != "admin-secret":
+        raise HTTPException(403, "Admin access required")
+
+
+dependencies = [require_admin]
+```
+
+Every `route.py` at or below `app/(admin)/` runs `require_admin` before resolving handler arguments. Because `(admin)` is a route group, `app/(admin)/users/route.py` is served at `/users` without adding `/admin` to the URL.
+
+## Folder-scoped `middleware.py`
+
+Add a `middleware.py` exporting `async def middleware(request, call_next) -> Response` to wrap every route at or below that directory:
+
+```python
+# app/middleware.py
+import time
+
+from chano import Request, Response
+
+
+async def middleware(request: Request, call_next) -> Response:
+    start = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    response.headers["x-response-time"] = f"{elapsed_ms:.2f}ms"
+    return response
+```
+
+Multiple `middleware.py` files along a route's path run **root-to-leaf** (outermost to innermost). Middleware can short-circuit by returning a `Response` without awaiting `call_next`.
+
+## Folder-scoped `error.py`
+
+Add an `error.py` exporting `handle_error(request, exc) -> Response` (sync or async) to customize error responses for a subtree of routes:
+
+```python
+# app/api/error.py
+from chano import HTTPException, JSONResponse, Request, Response
+
+
+def handle_error(request: Request, exc: Exception) -> Response:
+    if isinstance(exc, HTTPException):
+        return JSONResponse(
+            {"error": exc.detail, "path": request.path},
+            status_code=exc.status_code,
+            headers=exc.headers,
+        )
+    raise exc
+```
+
+Error boundaries run **leaf-to-root** (nearest wins). If `handle_error` re-raises, the exception bubbles up to the next ancestor `error.py`, or falls back to Chano's default error mapping.
+
+## `lazy()` instead of startup hooks
+
+In serverless, there is no global app startup. Use `lazy(factory)` to initialize a process-wide client or pool on first call and reuse it across warm invocations:
+
+```python
+import httpx
+
+from chano import Depends, lazy
+
+
+def create_http_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(timeout=10.0)
+
+
+get_http_client = lazy(create_http_client)
+
+
+async def GET(client: httpx.AsyncClient = Depends(get_http_client)):
+    resp = await client.get("https://httpbin.org/uuid")
+    return resp.json()
+```
+
+`lazy()` is thread-safe for sync factories and task-safe for async factories. If `factory` raises, nothing is cached and the next request retries.
+
+## Background work with `after()`
+
+Use `after(fn, /, *args, **kwargs)` to run sync or async work after the HTTP response has been sent:
+
+```python
+from chano import after
+
+
+async def send_audit_log(user_id: str, action: str) -> None:
+    ...
+
+
+def POST(user_id: str):
+    after(send_audit_log, user_id, "created_item")
+    return {"status": "accepted"}
+```
+
+- In `chano dev` and tests, queued callbacks drain in the request's `finally` block.
+- In built Vercel functions, `after()` delegates to `vercel.functions.wait_until` so the platform keeps the function alive until the callback completes.
+
+## Streaming and Server-Sent Events
+
+For token streams or live updates, return `StreamingResponse` or `SSEResponse`:
+
+```python
+import asyncio
+
+from chano import SSEResponse, ServerSentEvent
+
+
+async def event_stream():
+    for i in range(3):
+        yield ServerSentEvent(data={"step": i}, event="progress")
+        await asyncio.sleep(0.5)
+
+
+async def GET():
+    return SSEResponse(event_stream(), ping=15)
+```
+
+`SSEResponse` sets `content-type: text/event-stream` and `cache-control: no-cache`, JSON-encodes structured payloads automatically, and sends `: ping` keepalive comments when `ping` is set. On client disconnect, Chano cancels the producer and closes the iterator cleanly.
