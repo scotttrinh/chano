@@ -1,0 +1,9 @@
+[project]
+name = "chano-docs"
+version = "0.1.0"
+description = "Static documentation site for Chano (chanochano.com)"
+requires-python = ">=3.12"
+dependencies = [
+    "markdown-it-py>=3.0.0",
+    "pygments>=2.18.0",
+]
