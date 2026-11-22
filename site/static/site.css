@@ -59,12 +59,6 @@
   font-weight: var(--vbg-weight-medium);
 }
 
-.vbg-custom-nav-meta {
-  color: var(--vbg-text-secondary);
-  font-family: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: var(--vbg-type-metadata);
-}
-
 /* Landing page */
 
 .vbg-custom-hero {
@@ -211,6 +205,19 @@
 @media (min-width: 720px) {
   .vbg-custom-pillar-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.vbg-custom-example-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--vbg-space-6);
+}
+
+@media (min-width: 840px) {
+  .vbg-custom-example-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--vbg-space-8);
   }
 }
 
@@ -622,7 +629,7 @@
   text-underline-offset: 0.18em;
 }
 
-/* Code blocks + Pygments monochrome-first tokens */
+/* Code blocks + highlight.js integration */
 
 pre.vbg-custom-code {
   min-width: 0;
@@ -639,59 +646,10 @@ pre.vbg-custom-code {
   tab-size: 4;
 }
 
-.vbg-custom-code .c,
-.vbg-custom-code .c1,
-.vbg-custom-code .ch,
-.vbg-custom-code .cm,
-.vbg-custom-code .cs,
-.vbg-custom-code .sd {
-  color: var(--vbg-text-secondary);
-}
-
-.vbg-custom-code .k,
-.vbg-custom-code .kd,
-.vbg-custom-code .kn,
-.vbg-custom-code .kp,
-.vbg-custom-code .kr,
-.vbg-custom-code .kt,
-.vbg-custom-code .ow {
-  color: var(--vbg-text-primary);
-  font-weight: var(--vbg-weight-medium);
-}
-
-.vbg-custom-code .s,
-.vbg-custom-code .s1,
-.vbg-custom-code .s2,
-.vbg-custom-code .sa,
-.vbg-custom-code .sb,
-.vbg-custom-code .sc,
-.vbg-custom-code .se,
-.vbg-custom-code .sh,
-.vbg-custom-code .si,
-.vbg-custom-code .sr {
-  color: var(--vbg-chart-2);
-}
-
-.vbg-custom-code .nf,
-.vbg-custom-code .fm,
-.vbg-custom-code .nc,
-.vbg-custom-code .nd {
-  color: var(--vbg-chart-1);
-}
-
-.vbg-custom-code .mi,
-.vbg-custom-code .mf,
-.vbg-custom-code .mh,
-.vbg-custom-code .mo,
-.vbg-custom-code .nb,
-.vbg-custom-code .bp,
-.vbg-custom-code .kc {
-  color: var(--vbg-chart-3);
-}
-
-.vbg-custom-code .o,
-.vbg-custom-code .p {
-  color: var(--vbg-text-secondary);
+pre.vbg-custom-code code.hljs {
+  background: transparent;
+  padding: 0;
+  color: inherit;
 }
 
 /* Footer */

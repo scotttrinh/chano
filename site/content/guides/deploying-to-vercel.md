@@ -76,3 +76,26 @@ With `base_path = "/api"`:
 - Docs serve at `/api/docs` and `/api/openapi.json`
 
 Your `app/` directory stays clean without an extra `api/` wrapper folder, and `chano dev` mirrors the exact same prefixed URLs.
+
+## Running on other platforms (ASGI)
+
+`chano build` is specific to Vercel's Build Output API v3, but your application itself is a standard ASGI app. To deploy the entire project to another platform — such as a container, VM, or any Python ASGI host — create a small entrypoint with `create_app()`:
+
+```python
+# main.py
+from chano import create_app
+
+app = create_app("app", public_dir="public")
+```
+
+Then serve it with any ASGI server such as Uvicorn, Hypercorn, or Granian:
+
+```sh
+uv run uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
+When running as a single ASGI app:
+
+- All routes under `app/`, `/docs`, `/openapi.json`, and `public/` are served from the same process.
+- `base_path` from `[tool.chano]` in `pyproject.toml` is applied automatically (or can be passed explicitly to `create_app()`).
+- `after()` callbacks drain in the request's `finally` block instead of delegating to `vercel.functions.wait_until`.

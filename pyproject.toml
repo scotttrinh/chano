@@ -40,6 +40,9 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
+[tool.ty.src]
+exclude = ["site"]
+
 [tool.uv]
 exclude-newer = "2 days"
 # Rebuild when sources change, so apps depending on a local checkout by path

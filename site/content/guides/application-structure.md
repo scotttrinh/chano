@@ -99,7 +99,7 @@ Error boundaries run **leaf-to-root** (nearest wins). If `handle_error` re-raise
 
 ## `lazy()` instead of startup hooks
 
-In serverless, there is no global app startup. Use `lazy(factory)` to initialize a process-wide client or pool on first call and reuse it across warm invocations:
+With Vercel Functions, there is no global app startup. Use `lazy(factory)` to initialize a process-wide client or pool on first call and reuse it across warm invocations:
 
 ```python
 import httpx

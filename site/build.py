@@ -13,10 +13,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from markdown_it import MarkdownIt
-from pygments import highlight
-from pygments.formatters import HtmlFormatter
-from pygments.lexers import TextLexer, get_lexer_by_name
-from pygments.util import ClassNotFound
 
 ROOT = Path(__file__).resolve().parent
 CONTENT_DIR = ROOT / "content"
@@ -28,10 +24,16 @@ FONTS_URL = (
     "https://fonts.googleapis.com/css2"
     "?family=Geist:wght@400..600&family=Geist+Mono:wght@400..600&display=swap"
 )
+HLJS_VERSION = "11.11.1"
+HLJS_JS_URL = (
+    f"https://unpkg.com/@highlightjs/cdn-assets@{HLJS_VERSION}/highlight.min.js"
+)
+HLJS_LIGHT_CSS_URL = (
+    f"https://unpkg.com/@highlightjs/cdn-assets@{HLJS_VERSION}/styles/github.min.css"
+)
+HLJS_DARK_CSS_URL = f"https://unpkg.com/@highlightjs/cdn-assets@{HLJS_VERSION}/styles/github-dark.min.css"
 GITHUB_URL = "https://github.com/scotttrinh/chano"
 SITE_NAME = "Chano"
-
-_FORMATTER = HtmlFormatter(nowrap=True)
 
 HERO_CODE_SAMPLE = """\
 from typing import Annotated
@@ -59,6 +61,31 @@ async def PUT(
     user: str = Depends(current_user),
 ) -> Item:
     return item
+"""
+
+DEPS_CODE_SAMPLE = """\
+from chano import Depends, HTTPBearer, HTTPException, raises
+
+bearer = HTTPBearer()
+
+@raises(403, "Admin access required")
+def require_admin(token: str = Depends(bearer)) -> None:
+    if token != "admin-secret":
+        raise HTTPException(403, "Admin access required")
+
+dependencies = [require_admin]
+"""
+
+MIDDLEWARE_CODE_SAMPLE = """\
+import time
+from chano import Request, Response
+
+async def middleware(request: Request, call_next) -> Response:
+    start = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    response.headers["x-response-time"] = f"{elapsed_ms:.2f}ms"
+    return response
 """
 
 
@@ -105,14 +132,18 @@ def parse_frontmatter(raw: str) -> tuple[dict[str, str], str]:
 
 
 def highlight_code(code: str, lang: str, _attrs: str = "") -> str:
-    language = (lang or "").strip().split()[0] if lang else ""
-    try:
-        lexer = get_lexer_by_name(language) if language else TextLexer()
-    except ClassNotFound:
-        lexer = TextLexer()
-    highlighted = highlight(code, lexer, _FORMATTER)
-    lang_attr = f' data-lang="{html.escape(language)}"' if language else ""
-    return f'<pre class="vbg-custom-code"{lang_attr}><code>{highlighted}</code></pre>\n'
+    language = (lang or "").strip().split()[0].lower() if lang else ""
+    escaped = html.escape(code)
+    if not language or language in ("text", "plaintext"):
+        return (
+            '<pre class="vbg-custom-code">'
+            f'<code class="nohighlight">{escaped}</code></pre>\n'
+        )
+    hljs_lang = "bash" if language == "sh" else language
+    return (
+        f'<pre class="vbg-custom-code" data-lang="{html.escape(language)}">'
+        f'<code class="language-{html.escape(hljs_lang)}">{escaped}</code></pre>\n'
+    )
 
 
 def render_markdown(source: str) -> tuple[str, list[TocItem]]:
@@ -163,7 +194,6 @@ def render_header(active_section: str) -> str:
         <a href="/guides/getting-started"{guides_current}>Guides</a>
         <a href="/reference/routing"{ref_current}>Reference</a>
         <a href="{GITHUB_URL}">GitHub</a>
-        <span class="vbg-custom-nav-meta">Python 3.12+</span>
       </nav>
     </header>"""
 
@@ -172,7 +202,7 @@ def render_footer() -> str:
     return f"""    <footer class="vbg-custom-footer">
       <span class="vbg-custom-footer-brand">{SITE_NAME}</span>
       <span>
-        Serverless-first Python web framework ·
+        Python web framework for Vercel Functions ·
         <a href="/guides/getting-started">Guides</a> ·
         <a href="/reference/routing">Reference</a> ·
         <a href="{GITHUB_URL}">GitHub</a>
@@ -193,6 +223,12 @@ def render_document(page: Page, main_html: str) -> str:
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="{FONTS_URL}" rel="stylesheet" referrerpolicy="no-referrer">
   <link href="{VBG_CSS_URL}" rel="stylesheet">
+  <link href="{HLJS_LIGHT_CSS_URL}" rel="stylesheet">
+  <link
+    href="{HLJS_DARK_CSS_URL}"
+    rel="stylesheet"
+    media="(prefers-color-scheme: dark)"
+  >
   <link href="/site.css" rel="stylesheet">
 </head>
 <body class="vbg-report">
@@ -204,6 +240,8 @@ def render_document(page: Page, main_html: str) -> str:
     </main>
 {render_footer()}
   </div>
+  <script src="{HLJS_JS_URL}"></script>
+  <script>hljs.highlightAll();</script>
 </body>
 </html>
 """
@@ -212,9 +250,13 @@ def render_document(page: Page, main_html: str) -> str:
 def render_landing(page: Page) -> str:
     hero_code_html = highlight_code(HERO_CODE_SAMPLE, "python")
     install_html = highlight_code('uv add chano && uv add --dev "chano[dev]"', "sh")
+    deps_code_html = highlight_code(DEPS_CODE_SAMPLE, "python")
+    middleware_code_html = highlight_code(MIDDLEWARE_CODE_SAMPLE, "python")
     main_html = f"""      <section class="vbg-custom-hero">
         <div class="vbg-custom-hero-copy">
-          <h1 class="vbg-display">FastAPI ergonomics, one function per route.</h1>
+          <h1 class="vbg-display">
+            Familiar Python APIs, one Vercel Function per route.
+          </h1>
           <p class="vbg-lede">{html.escape(page.lede)}</p>
           <div class="vbg-custom-actions">
             <a class="vbg-custom-btn-primary" href="/guides/getting-started">
@@ -240,17 +282,18 @@ def render_landing(page: Page) -> str:
 
       <section class="vbg-custom-landing-section">
         <div class="vbg-custom-section-head">
-          <h2 class="vbg-heading-24">Built for isolated serverless functions</h2>
+          <h2 class="vbg-heading-24">Built for Vercel Functions</h2>
           <p class="vbg-custom-section-lead">
-            Chano keeps typed Python handlers and dependency injection while
-            replacing the single long-lived server with per-route functions.
+            Chano keeps familiar typed Python handlers and dependency injection
+            while compiling each route into its own Vercel Function via Build
+            Output API v3.
           </p>
         </div>
         <div class="vbg-custom-pillar-grid">
           <div class="vbg-custom-pillar">
             <h3 class="vbg-heading-16">One function per route</h3>
             <p>
-              Each <code>route.py</code> compiles into its own Vercel function with
+              Each <code>route.py</code> compiles into its own Vercel Function with
               independent <code>memory</code>, <code>max_duration</code>,
               <code>regions</code>, and AST tree-shaken dependencies.
             </p>
@@ -272,11 +315,11 @@ def render_landing(page: Page) -> str:
             </p>
           </div>
           <div class="vbg-custom-pillar">
-            <h3 class="vbg-heading-16">Static docs and serverless lifecycles</h3>
+            <h3 class="vbg-heading-16">Static docs and function lifecycles</h3>
             <p>
-              OpenAPI 3.1 and Swagger UI pre-render to the CDN at build time. Use
-              <code>lazy()</code> for warm singletons and <code>after()</code> for
-              <code>wait_until</code> background work.
+              OpenAPI 3.1 and Swagger UI pre-render to the Vercel CDN at build time.
+              Use <code>lazy()</code> for warm singletons and <code>after()</code>
+              for <code>wait_until</code> background work.
             </p>
           </div>
         </div>
@@ -284,79 +327,38 @@ def render_landing(page: Page) -> str:
 
       <section class="vbg-custom-landing-section">
         <div class="vbg-custom-section-head">
-          <h2 class="vbg-heading-24">Familiar to FastAPI developers</h2>
+          <h2 class="vbg-heading-24">Familiar patterns, scoped to folders</h2>
           <p class="vbg-custom-section-lead">
-            Keep typed signatures and <code>Depends()</code>, adapted to
-            file-system routing and Vercel Build Output API v3.
-            <a href="/guides/serverless-mental-model">Read the full comparison.</a>
+            Share auth checks, middleware, and error handling across a route
+            subtree by placing special files in any directory under
+            <code>app/</code>.
+            <a href="/guides/application-structure">Explore application structure.</a>
           </p>
         </div>
-        <div class="vbg-table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th scope="col">Concept</th>
-                <th scope="col">FastAPI</th>
-                <th scope="col">Chano</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr>
-                <th scope="row">Entry point</th>
-                <td><code>app = FastAPI()</code></td>
-                <td>
-                  No central app object; routes live in
-                  <code>app/**/route.py</code>
-                </td>
-              </tr>
-              <tr>
-                <th scope="row">Route handlers</th>
-                <td><code>@app.get("/items/{{id}}")</code></td>
-                <td>
-                  <code>def GET(id: int):</code> in
-                  <code>app/items/[id]/route.py</code>
-                </td>
-              </tr>
-              <tr>
-                <th scope="row">Validation</th>
-                <td>Pydantic</td>
-                <td>
-                  <code>msgspec</code> (optional
-                  <code>pydantic.BaseModel</code> support)
-                </td>
-              </tr>
-              <tr>
-                <th scope="row">Shared hooks</th>
-                <td><code>APIRouter</code>, middleware, exception handlers</td>
-                <td>
-                  Folder-scoped <code>dependencies.py</code>,
-                  <code>middleware.py</code>, <code>error.py</code>
-                </td>
-              </tr>
-              <tr>
-                <th scope="row">Background work</th>
-                <td><code>BackgroundTasks</code></td>
-                <td>
-                  <code>after()</code> backed by
-                  <code>vercel.functions.wait_until</code>
-                </td>
-              </tr>
-              <tr>
-                <th scope="row">OpenAPI and /docs</th>
-                <td>Generated at runtime in Python</td>
-                <td>Pre-rendered at build time to static CDN files</td>
-              </tr>
-            </tbody>
-          </table>
+        <div class="vbg-custom-example-grid">
+          <div class="vbg-custom-hero-code">
+            <div class="vbg-custom-code-bar">
+              <span class="vbg-mono">app/(admin)/dependencies.py</span>
+              <span class="vbg-mono">Subtree auth</span>
+            </div>
+            {deps_code_html.strip()}
+          </div>
+          <div class="vbg-custom-hero-code">
+            <div class="vbg-custom-code-bar">
+              <span class="vbg-mono">app/middleware.py</span>
+              <span class="vbg-mono">Root-to-leaf middleware</span>
+            </div>
+            {middleware_code_html.strip()}
+          </div>
         </div>
       </section>
 
       <section class="vbg-custom-landing-section">
         <div class="vbg-custom-section-head">
-          <h2 class="vbg-heading-24">Develop locally, deploy prebuilt</h2>
+          <h2 class="vbg-heading-24">Develop locally, deploy to Vercel</h2>
           <p class="vbg-custom-section-lead">
-            Three commands take a project from local hot reload to isolated
-            production functions.
+            Three commands take a project from local hot reload to prebuilt
+            Build Output API v3 functions.
           </p>
         </div>
         <div class="vbg-custom-steps">
@@ -382,6 +384,14 @@ def render_landing(page: Page) -> str:
             </p>
           </div>
         </div>
+        <p class="vbg-custom-section-lead">
+          Deploying outside Vercel? Call <code>create_app()</code> to run the
+          entire application as a standard ASGI app on Uvicorn or any ASGI
+          platform.
+          <a href="/guides/deploying-to-vercel#running-on-other-platforms-asgi">
+            See ASGI hosting.
+          </a>
+        </p>
       </section>
 
       <section class="vbg-custom-landing-section">
@@ -389,8 +399,8 @@ def render_landing(page: Page) -> str:
           <a class="vbg-custom-next-link" href="/guides/getting-started">
             <span class="vbg-heading-20">Guides</span>
             <span class="vbg-custom-next-desc">
-              Walk through project setup, the serverless mental model, folder
-              conventions, and Vercel deployment.
+              Walk through project setup, the Vercel Functions model, folder
+              conventions, and deployment.
             </span>
           </a>
           <a class="vbg-custom-next-link" href="/reference/routing">

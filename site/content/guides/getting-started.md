@@ -121,5 +121,5 @@ Your local server exposes:
 
 ## Next steps
 
-- Read the [Serverless mental model](/guides/serverless-mental-model) to see how Chano maps FastAPI idioms to isolated functions.
+- Read the [Vercel Functions model](/guides/vercel-functions) to see how Chano maps familiar Python API patterns to isolated Vercel Functions.
 - Learn how to organize shared auth, middleware, and error handling in [Application structure](/guides/application-structure).
