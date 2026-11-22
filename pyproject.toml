@@ -1,6 +1,6 @@
 [project]
 name = "chano"
-version = "0.1.0"
+version = "1.0.0a1"
 description = "A serverless-first Python web framework"
 readme = "README.md"
 requires-python = ">=3.12"
