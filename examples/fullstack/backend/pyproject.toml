@@ -1,0 +1,14 @@
+[project]
+name = "fullstack-api"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["chano"]
+
+[dependency-groups]
+dev = ["chano[dev]"]
+
+[tool.chano]
+base_path = "/api"
+
+[tool.uv]
+package = false

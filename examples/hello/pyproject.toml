@@ -1,0 +1,15 @@
+[project]
+name = "hello"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["chano"]
+
+[dependency-groups]
+dev = ["chano[dev]"]
+
+[tool.uv]
+exclude-newer = "2 days"
+package = false
+
+[tool.uv.sources]
+chano = { path = "../..", editable = true }

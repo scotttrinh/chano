@@ -1,0 +1,15 @@
+{
+  "services": {
+    "web": { "root": "frontend/", "framework": "nextjs" },
+    "api": {
+      "root": "backend/",
+      "framework": "vite",
+      "buildCommand": "uv run --frozen chano build",
+      "devCommand": "uv run --frozen chano dev --port $PORT"
+    }
+  },
+  "rewrites": [
+    { "source": "/api/:path*", "destination": { "service": "api" } },
+    { "source": "/(.*)", "destination": { "service": "web" } }
+  ]
+}
