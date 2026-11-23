@@ -6,9 +6,9 @@ Chano infers each handler parameter's source, coercion rules, and dependencies d
 
 [[src/chano/params.py#_field]] classifies each parameter of a handler or dependency into one of seven sources (`path`, `query`, `header`, `cookie`, `body`, `request`, `depends`).
 
-1. [[src/chano/params.py#Depends]] (as default or inside `Annotated`) creates a recursive [[src/chano/params.py#Endpoint]] (`depends`).
+1. [[src/chano/params.py#Depends]] (inside `Annotated`) creates a recursive [[src/chano/params.py#Endpoint]] (`depends`).
 2. A [[src/chano/requests.py#Request]] annotation receives the raw request (`request`).
-3. Explicit [[src/chano/params.py#Query]], [[src/chano/params.py#Header]], [[src/chano/params.py#Cookie]], or [[src/chano/params.py#Body]] markers override inference; `Header()` converts parameter underscores to hyphens unless `alias` is set.
+3. Explicit [[src/chano/params.py#Query]], [[src/chano/params.py#Header]], [[src/chano/params.py#Cookie]], or [[src/chano/params.py#Body]] markers inside `Annotated` override inference; `Header()` converts parameter underscores to hyphens unless `alias` is set. Using any marker or `Depends()` as a default value raises `TypeError`.
 4. A parameter name matching a route `{segment}` comes from `path`.
 5. A model type ([[src/chano/params.py#_is_model]]: `msgspec.Struct`, `dataclass`, `attrs` class, or `pydantic.BaseModel` via [[src/chano/_pydantic.py#is_pydantic_model]]) comes from `body`.
 6. Everything else defaults to `query`.
@@ -47,7 +47,7 @@ Schema traversal reads the same tree without calling it. [[src/chano/params.py#E
 
 Dependencies declare a credential scheme with [[src/chano/security.py#HTTPBearer]], and handlers or dependencies declare documented error responses with [[src/chano/params.py#raises]].
 
-- **Bearer credentials**: an `HTTPBearer` instance is an ordinary dependency (`token: str = Depends(bearer)`). Its `name` must match [[src/chano/security.py#_COMPONENT_NAME]], the OpenAPI component-name pattern, or the constructor raises `ValueError`. [[src/chano/security.py#HTTPBearer#__call__]] takes the raw [[src/chano/requests.py#Request]], so it adds no `authorization` header parameter. It splits `Authorization` on its first space, matches `Bearer` case-insensitively, strips the token, and raises `401` `Not authenticated` with `WWW-Authenticate: Bearer` when the scheme or token is missing.
+- **Bearer credentials**: an `HTTPBearer` instance is an ordinary dependency (`token: Annotated[str, Depends(bearer)]`). Its `name` must match [[src/chano/security.py#_COMPONENT_NAME]], the OpenAPI component-name pattern, or the constructor raises `ValueError`. [[src/chano/security.py#HTTPBearer#__call__]] takes the raw [[src/chano/requests.py#Request]], so it adds no `authorization` header parameter. It splits `Authorization` on its first space, matches `Bearer` case-insensitively, strips the token, and raises `401` `Not authenticated` with `WWW-Authenticate: Bearer` when the scheme or token is missing.
 - **Declared responses**: `@raises(status, description)` stores `{status: description}` on the function and only documents; code still raises [[src/chano/exceptions.py#HTTPException]]. It raises `TypeError` for a non-`int` (or `bool`) status and `ValueError` outside `400`–`599`. Stacked decorators repeating a status keep the outermost description.
 - **Traversal**: [[src/chano/params.py#Endpoint#security_schemes]] yields every `HTTPBearer` in the dependency tree and inherited checks, and [[src/chano/params.py#Endpoint#declared_responses]] merges `raises` declarations breadth-first, keeping the first description per status: the handler; then its direct dependencies in parameter order, followed by its inherited checks nearest segment first and in declared order within a segment; then their dependencies. A handler beats its dependencies, and a direct dependency beats a nested one in an earlier parameter. Both read the signatures already parsed by [[src/chano/params.py#Endpoint]] and never call a dependency, so a dependency that raises still permits schema generation.
 

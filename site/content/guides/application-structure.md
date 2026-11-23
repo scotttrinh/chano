@@ -9,29 +9,57 @@ nav_title: Application structure
 
 ## Dependencies and authentication
 
-`Depends(fn)` resolves dependencies recursively and caches results **per request** by callable identity. If two dependencies both request `get_user`, it runs once for that request.
+`Annotated[T, Depends(fn)]` resolves dependencies recursively and caches results **per request** by callable identity. If two dependencies both request `get_user`, it runs once for that request.
 
-For Bearer authentication, combine `HTTPBearer()` with `@raises`:
+Dependencies can declare their own validated parameters (queries, headers, cookies, bodies) and other dependencies. For Bearer authentication, combine `HTTPBearer()` with `@raises`:
 
 ```python
+from typing import Annotated
+
 from chano import Depends, HTTPBearer, HTTPException, raises
 
 bearer = HTTPBearer()
 
 
 @raises(401, "Not authenticated")
-def current_user(token: str = Depends(bearer)) -> str:
+def current_user(token: Annotated[str, Depends(bearer)]) -> str:
     if token != "secret":
         raise HTTPException(401, "Not authenticated")
     return "alice"
 
 
-def GET(user: str = Depends(current_user)):
+def GET(user: Annotated[str, Depends(current_user)]):
     return {"user": user}
 ```
 
-- `Depends(bearer)` reads `Authorization: Bearer <token>`, returns `401` with `WWW-Authenticate: Bearer` when missing, and registers an HTTP Bearer security scheme in `openapi.json`.
+- `Annotated[str, Depends(bearer)]` reads `Authorization: Bearer <token>`, returns `401` with `WWW-Authenticate: Bearer` when missing, and registers an HTTP Bearer security scheme in `openapi.json`.
 - `@raises(status, description)` documents error responses in `openapi.json` for every handler or dependency that uses it. It is documentation-only; your code still raises `HTTPException`.
+
+You can also extract reusable, validated inputs into a dependency:
+
+```python
+from typing import Annotated
+
+from msgspec import Meta, Struct
+
+from chano import Depends, Query
+
+
+class Pagination(Struct):
+    skip: int
+    limit: int
+
+
+def pagination(
+    skip: Annotated[int, Meta(ge=0), Query()] = 0,
+    limit: Annotated[int, Meta(ge=1, le=100), Query()] = 20,
+) -> Pagination:
+    return Pagination(skip=skip, limit=limit)
+
+
+def GET(page: Annotated[Pagination, Depends(pagination)]):
+    return {"skip": page.skip, "limit": page.limit}
+```
 
 ## Folder-scoped `dependencies.py`
 
@@ -39,13 +67,15 @@ To protect a subtree of routes without repeating `Depends(...)` in every handler
 
 ```python
 # app/(admin)/dependencies.py
+from typing import Annotated
+
 from chano import Depends, HTTPBearer, HTTPException, raises
 
 bearer = HTTPBearer()
 
 
 @raises(403, "Admin access required")
-def require_admin(token: str = Depends(bearer)) -> None:
+def require_admin(token: Annotated[str, Depends(bearer)]) -> None:
     if token != "admin-secret":
         raise HTTPException(403, "Admin access required")
 
@@ -53,7 +83,7 @@ def require_admin(token: str = Depends(bearer)) -> None:
 dependencies = [require_admin]
 ```
 
-Every `route.py` at or below `app/(admin)/` runs `require_admin` before resolving handler arguments. Because `(admin)` is a route group, `app/(admin)/users/route.py` is served at `/users` without adding `/admin` to the URL.
+Every `route.py` at or below `app/(admin)/` runs `require_admin` before resolving handler arguments. Because `(admin)` is a route group, `app/(admin)/users/route.py` is served at `/users` without adding `/admin` to the URL. Inherited checks share the same per-request cache as `Depends(...)`, so if both `dependencies.py` and a handler depend on `current_user`, it runs once per request.
 
 ## Folder-scoped `middleware.py`
 
@@ -102,6 +132,8 @@ Error boundaries run **leaf-to-root** (nearest wins). If `handle_error` re-raise
 With Vercel Functions, there is no global app startup. Use `lazy(factory)` to initialize a process-wide client or pool on first call and reuse it across warm invocations:
 
 ```python
+from typing import Annotated
+
 import httpx
 
 from chano import Depends, lazy
@@ -114,7 +146,7 @@ def create_http_client() -> httpx.AsyncClient:
 get_http_client = lazy(create_http_client)
 
 
-async def GET(client: httpx.AsyncClient = Depends(get_http_client)):
+async def GET(client: Annotated[httpx.AsyncClient, Depends(get_http_client)]):
     resp = await client.get("https://httpbin.org/uuid")
     return resp.json()
 ```

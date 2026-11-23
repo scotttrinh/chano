@@ -47,7 +47,7 @@ class Item(Struct):
 bearer = HTTPBearer()
 
 @raises(401, "Not authenticated")
-def current_user(token: str = Depends(bearer)) -> str:
+def current_user(token: Annotated[str, Depends(bearer)]) -> str:
     if token != "secret":
         raise HTTPException(401, "Not authenticated")
     return "alice"
@@ -58,18 +58,19 @@ def GET(item_id: int, verbose: bool = False):
 async def PUT(
     item_id: int,
     item: Item,
-    user: str = Depends(current_user),
+    user: Annotated[str, Depends(current_user)],
 ) -> Item:
     return item
 """
 
 DEPS_CODE_SAMPLE = """\
+from typing import Annotated
 from chano import Depends, HTTPBearer, HTTPException, raises
 
 bearer = HTTPBearer()
 
 @raises(403, "Admin access required")
-def require_admin(token: str = Depends(bearer)) -> None:
+def require_admin(token: Annotated[str, Depends(bearer)]) -> None:
     if token != "admin-secret":
         raise HTTPException(403, "Admin access required")
 

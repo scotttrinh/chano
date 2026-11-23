@@ -15,7 +15,7 @@ _COMPONENT_NAME = re.compile(r"[a-zA-Z0-9._-]+")
 class HTTPBearer:
     """A dependency returning the token from ``Authorization: Bearer <token>``.
 
-    Use it as ``token: str = Depends(bearer)``. A missing or non-bearer
+    Use it as ``token: Annotated[str, Depends(bearer)]``. A missing or non-bearer
     credential gets a ``401`` with ``WWW-Authenticate: Bearer``. OpenAPI
     documents it once under ``components.securitySchemes[name]`` and lists it
     in the ``security`` of every operation that depends on it.

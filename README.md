@@ -37,7 +37,7 @@ bearer = HTTPBearer()
 
 
 @raises(401, "Not authenticated")
-def current_user(token: str = Depends(bearer)) -> str:
+def current_user(token: Annotated[str, Depends(bearer)]) -> str:
     if token != "secret":
         raise HTTPException(401, "Not authenticated")
     return "scott"
@@ -47,7 +47,9 @@ def GET(item_id: int, verbose: bool = False):
     return {"item_id": item_id, "verbose": verbose}
 
 
-async def PUT(item_id: int, item: Item, user: str = Depends(current_user)) -> Item:
+async def PUT(
+    item_id: int, item: Item, user: Annotated[str, Depends(current_user)]
+) -> Item:
     return item
 ```
 
@@ -57,13 +59,13 @@ A handler's signature declares its inputs, which are validated with
 - a parameter named after a `[segment]` comes from the path
 - a model (a msgspec `Struct`, dataclass or attrs class) comes from the JSON
   body, decoded and validated in a single pass
-- `Depends(fn)` is the result of calling `fn`, whose own signature is resolved
+- `Annotated[T, Depends(fn)]` is the result of calling `fn`, whose own signature is resolved
   the same way
 - a `Request` annotation receives the raw request
-- anything else is a query parameter; `Query()`, `Header()` and `Body()`
-  override the default
+- anything else is a query parameter; `Annotated[T, Query()]`, `Annotated[T, Header()]`,
+  `Annotated[T, Cookie()]`, and `Annotated[T, Body()]` override the default
 
-`Depends(HTTPBearer())` returns the token from `Authorization: Bearer <token>`
+`Annotated[str, Depends(HTTPBearer())]` returns the token from `Authorization: Bearer <token>`
 (or responds `401`) and documents an HTTP bearer security scheme in
 `openapi.json`. `@raises(401, "Not authenticated")` on a handler or dependency
 documents an error response for every operation using it.

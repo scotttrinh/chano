@@ -7,8 +7,9 @@
 - ``Depends(fn)`` is the result of calling ``fn``, resolved the same way
 - anything else is a query parameter
 
-``Query()``, ``Header()``, ``Cookie()`` and ``Body()`` override the inferred source.
-``lazy(factory)`` makes a process-wide value usable as ``Depends(...)``.
+``Annotated[T, Query()]``, ``Annotated[T, Header()]``, ``Annotated[T, Cookie()]``,
+and ``Annotated[T, Body()]`` override the inferred source.
+``lazy(factory)`` makes a process-wide value usable as ``Annotated[T, Depends(...)]``.
 ``@raises(status, description)`` documents an error response in OpenAPI.
 """
 
@@ -48,16 +49,12 @@ class DependsInfo:
 
 
 class ParamInfo:
-    def __init__(self, source: str, default: Any, alias: str | None) -> None:
+    def __init__(self, source: str, alias: str | None) -> None:
         self.source = source
-        self.default = default
         self.alias = alias
 
 
-# These return Any so they type-check as defaults: `q: str = Query("x")`.
-
-
-def Depends(dependency: Callable[..., Any]) -> Any:
+def Depends(dependency: Callable[..., Any]) -> DependsInfo:
     return DependsInfo(dependency)
 
 
@@ -88,20 +85,20 @@ def raises[F: Callable[..., Any]](
     return decorate
 
 
-def Query(default: Any = ..., *, alias: str | None = None) -> Any:
-    return ParamInfo("query", default, alias)
+def Query(*, alias: str | None = None) -> ParamInfo:
+    return ParamInfo("query", alias)
 
 
-def Header(default: Any = ..., *, alias: str | None = None) -> Any:
-    return ParamInfo("header", default, alias)
+def Header(*, alias: str | None = None) -> ParamInfo:
+    return ParamInfo("header", alias)
 
 
-def Cookie(default: Any = ..., *, alias: str | None = None) -> Any:
-    return ParamInfo("cookie", default, alias)
+def Cookie(*, alias: str | None = None) -> ParamInfo:
+    return ParamInfo("cookie", alias)
 
 
-def Body(default: Any = ..., *, alias: str | None = None) -> Any:
-    return ParamInfo("body", default, alias)
+def Body(*, alias: str | None = None) -> ParamInfo:
+    return ParamInfo("body", alias)
 
 
 @overload
@@ -591,7 +588,16 @@ def _field(parameter: inspect.Parameter, path_params: set[str]) -> Field:
     if default is inspect.Parameter.empty:
         default = _MISSING
 
-    # A marker may be the default (`q: str = Query()`) or in Annotated metadata.
+    # Markers and Depends() live in Annotated metadata: `q: Annotated[str, Query()]`.
+    if isinstance(default, DependsInfo):
+        raise TypeError(
+            f"parameter {name!r}: Depends() must be placed inside Annotated[...]"
+        )
+    if isinstance(default, ParamInfo):
+        marker_name = f"{default.source.capitalize()}()"
+        raise TypeError(
+            f"parameter {name!r}: {marker_name} must be placed inside Annotated[...]"
+        )
     marker = None
     declared = annotation
     if get_origin(annotation) is Annotated:
@@ -599,15 +605,6 @@ def _field(parameter: inspect.Parameter, path_params: set[str]) -> Field:
         marker = next(
             (m for m in metadata if isinstance(m, DependsInfo | ParamInfo)), None
         )
-    if isinstance(default, DependsInfo | ParamInfo):
-        marker = default
-        default = _MISSING
-    if (
-        isinstance(marker, ParamInfo)
-        and default is _MISSING
-        and marker.default is not ...
-    ):
-        default = marker.default
 
     if isinstance(marker, DependsInfo):
         dependency = Endpoint(marker.dependency, path_params)

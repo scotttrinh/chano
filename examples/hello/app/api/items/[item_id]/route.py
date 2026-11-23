@@ -17,7 +17,7 @@ bearer = HTTPBearer()
 
 
 @raises(401, "Not authenticated")
-def current_user(token: str = Depends(bearer)) -> str:
+def current_user(token: Annotated[str, Depends(bearer)]) -> str:
     if token != "secret":
         raise HTTPException(401, "Not authenticated")
     return "scott"
@@ -28,6 +28,8 @@ def GET(item_id: int, verbose: bool = False):
     return {"item_id": item_id, "verbose": verbose}
 
 
-async def PUT(item_id: int, item: Item, user: str = Depends(current_user)) -> Item:
+async def PUT(
+    item_id: int, item: Item, user: Annotated[str, Depends(current_user)]
+) -> Item:
     """Replace an item. Requires `Authorization: Bearer secret`."""
     return item

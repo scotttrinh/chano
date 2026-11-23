@@ -136,9 +136,9 @@ Like FastAPI, Chano reads your handler's signature and type annotations to deter
 
 For each parameter in a handler (or a `Depends` function):
 
-1. **`Depends(fn)`** (as a default value or inside `Annotated`) — calls `fn`, resolving its own signature recursively.
+1. **`Depends(fn)`** (inside `Annotated[T, Depends(fn)]`) — calls `fn`, resolving its own signature recursively.
 2. **`Request` annotation** — injects the raw `chano.Request` object.
-3. **Explicit markers** — `Query()`, `Header()`, `Cookie()`, or `Body()` override automatic inference.
+3. **Explicit markers** — `Query()`, `Header()`, `Cookie()`, or `Body()` inside `Annotated[...]` override automatic inference. Using a marker or `Depends()` as a default value raises `TypeError`.
    - `Header()` automatically maps Python underscores to HTTP hyphens (e.g., `x_request_id: Annotated[str | None, Header()] = None` reads `x-request-id`) unless you specify `Header(alias=...)`.
 4. **Path parameter** — if the parameter name matches a `[segment]` in the route's directory path, it comes from the URL path.
 5. **Request body model** — if the type is a `msgspec.Struct`, `dataclass`, `attrs` class, or `pydantic.BaseModel`, it is decoded from the JSON request body.
@@ -151,30 +151,36 @@ For each parameter in a handler (or a `Depends` function):
 
 ### Example with `msgspec.Struct` and `Meta`
 
+Attach validation constraints to any parameter or model field using `Annotated[..., Meta(...)]`. You can combine `Meta(...)` with `Query()`, `Header()`, `Cookie()`, or `Body()` and a Python default value:
+
 ```python
 # app/api/items/[item_id]/route.py
 from typing import Annotated
 
 from msgspec import Meta, Struct
 
-from chano import Cookie, Header
+from chano import Cookie, Header, Query
 
 
 class Item(Struct):
-    name: str
+    name: Annotated[str, Meta(min_length=1, max_length=100)]
     price: Annotated[float, Meta(gt=0)]
-    tags: list[str] = []
+    tags: Annotated[list[str], Meta(max_length=10)] = []
 
 
-def GET(item_id: int, verbose: bool = False):
+def GET(
+    item_id: Annotated[int, Meta(ge=1)],
+    limit: Annotated[int, Meta(ge=1, le=100), Query()] = 20,
+    verbose: bool = False,
+):
     """Fetch an item."""
-    return {"item_id": item_id, "verbose": verbose}
+    return {"item_id": item_id, "limit": limit, "verbose": verbose}
 
 
 async def PUT(
-    item_id: int,
+    item_id: Annotated[int, Meta(ge=1)],
     item: Item,
-    x_trace_id: Annotated[str | None, Header()] = None,
+    x_trace_id: Annotated[str | None, Meta(min_length=8), Header()] = None,
     session: Annotated[str | None, Cookie()] = None,
 ) -> Item:
     """Update an item."""
@@ -208,30 +214,50 @@ Because Chano deploys each `route.py` as an independent function, there is no ce
 
 ### 1. `Depends()` and `HTTPBearer()`
 
-`Depends(fn)` works like FastAPI's dependency injection:
-- Dependencies can declare their own parameters (headers, queries, other `Depends`).
+`Annotated[T, Depends(fn)]` works like FastAPI's dependency injection:
+- Dependencies can declare their own parameters (queries, headers, cookies, bodies, or other `Depends`).
 - Results are cached **per request** by callable identity, so if two dependencies both depend on `get_db`, `get_db` runs once for that request.
+- Because `Depends(...)` lives inside `Annotated[...]`, required dependencies have no default value and follow normal Python parameter ordering (place them before parameters with defaults).
 
-For Bearer token authentication, Chano provides `HTTPBearer()` and `@raises`:
+Dependencies can be plain functions, `async` functions, or callable instances—for example, sharing pagination or auth across handlers:
 
 ```python
-from chano import Depends, HTTPBearer, HTTPException, raises
+from typing import Annotated
+
+from msgspec import Meta, Struct
+
+from chano import Depends, HTTPBearer, HTTPException, Query, raises
 
 bearer = HTTPBearer()
 
 
+class PageParams(Struct):
+    skip: int
+    limit: int
+
+
+def pagination(
+    skip: Annotated[int, Meta(ge=0), Query()] = 0,
+    limit: Annotated[int, Meta(ge=1, le=100), Query()] = 20,
+) -> PageParams:
+    return PageParams(skip=skip, limit=limit)
+
+
 @raises(401, "Not authenticated")
-def current_user(token: str = Depends(bearer)) -> str:
+def current_user(token: Annotated[str, Depends(bearer)]) -> str:
     if token != "secret":
         raise HTTPException(401, "Not authenticated")
     return "alice"
 
 
-def GET(user: str = Depends(current_user)):
-    return {"user": user}
+def GET(
+    user: Annotated[str, Depends(current_user)],
+    page: Annotated[PageParams, Depends(pagination)],
+):
+    return {"user": user, "skip": page.skip, "limit": page.limit}
 ```
 
-- `Depends(bearer)` extracts the token from `Authorization: Bearer <token>`, returns `401` with `WWW-Authenticate: Bearer` if missing, and registers an HTTP Bearer security scheme in `openapi.json`.
+- `Annotated[str, Depends(bearer)]` extracts the token from `Authorization: Bearer <token>`, returns `401` with `WWW-Authenticate: Bearer` if missing, and registers an HTTP Bearer security scheme in `openapi.json`.
 - `@raises(status, description)` documents error responses in `openapi.json` for any handler or dependency that uses it (note: it is documentation-only; your code still raises `HTTPException`).
 
 ### 2. `lazy()` Instead of Startup/Lifespan Hooks
@@ -241,6 +267,8 @@ In FastAPI, you create database pools or HTTP clients in a `lifespan` function a
 Use `lazy(factory)` to create a process-wide singleton on first call (thread-safe for sync factories, task-safe for async factories), which is then reused across warm invocations:
 
 ```python
+from typing import Annotated
+
 import httpx
 
 from chano import Depends, lazy
@@ -253,7 +281,7 @@ def create_http_client() -> httpx.AsyncClient:
 get_http_client = lazy(create_http_client)
 
 
-async def GET(client: httpx.AsyncClient = Depends(get_http_client)):
+async def GET(client: Annotated[httpx.AsyncClient, Depends(get_http_client)]):
     resp = await client.get("https://httpbin.org/uuid")
     return resp.json()
 ```
@@ -264,13 +292,15 @@ In FastAPI, you protect a group of endpoints with `APIRouter(dependencies=[Depen
 
 ```python
 # app/(admin)/dependencies.py
+from typing import Annotated
+
 from chano import Depends, HTTPBearer, HTTPException, raises
 
 bearer = HTTPBearer()
 
 
 @raises(403, "Admin access required")
-def require_admin(token: str = Depends(bearer)) -> None:
+def require_admin(token: Annotated[str, Depends(bearer)]) -> None:
     if token != "admin-secret":
         raise HTTPException(403, "Admin access required")
 
