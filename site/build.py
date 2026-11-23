@@ -40,9 +40,12 @@ from typing import Annotated
 from msgspec import Meta, Struct
 from chano import Depends, HTTPBearer, HTTPException, raises
 
-class Item(Struct):
+class ItemInput(Struct):
     name: str
     price: Annotated[float, Meta(gt=0)]
+
+class Item(Struct):
+    id: str
 
 bearer = HTTPBearer()
 
@@ -57,7 +60,7 @@ def GET(item_id: int, verbose: bool = False):
 
 async def PUT(
     item_id: int,
-    item: Item,
+    item: ItemInput,
     user: Annotated[str, Depends(current_user)],
 ) -> Item:
     return item
@@ -256,7 +259,7 @@ def render_landing(page: Page) -> str:
     main_html = f"""      <section class="vbg-custom-hero">
         <div class="vbg-custom-hero-copy">
           <h1 class="vbg-display">
-            Familiar Python APIs, one Vercel Function per route.
+            Python at Vercel scale
           </h1>
           <p class="vbg-lede">{html.escape(page.lede)}</p>
           <div class="vbg-custom-actions">
@@ -286,8 +289,8 @@ def render_landing(page: Page) -> str:
           <h2 class="vbg-heading-24">Built for Vercel Functions</h2>
           <p class="vbg-custom-section-lead">
             Chano keeps familiar typed Python handlers and dependency injection
-            while compiling each route into its own Vercel Function via Build
-            Output API v3.
+            while compiling each route into its own Vercel Function for infinite
+            serverless scaling.
           </p>
         </div>
         <div class="vbg-custom-pillar-grid">
@@ -300,7 +303,7 @@ def render_landing(page: Page) -> str:
             </p>
           </div>
           <div class="vbg-custom-pillar">
-            <h3 class="vbg-heading-16">Minimal ASGI and msgspec</h3>
+            <h3 class="vbg-heading-16">Small runtime</h3>
             <p>
               Built directly on ASGI and <code>msgspec</code> for single-pass JSON
               decoding and validation, with automatic
@@ -310,7 +313,7 @@ def render_landing(page: Page) -> str:
           <div class="vbg-custom-pillar">
             <h3 class="vbg-heading-16">Folder-scoped conventions</h3>
             <p>
-              Drop <code>middleware.py</code>, <code>error.py</code>, or
+              Place <code>middleware.py</code>, <code>error.py</code>, or
               <code>dependencies.py</code> in any folder under <code>app/</code>
               to scope behavior to that subtree without central app wiring.
             </p>
@@ -320,7 +323,14 @@ def render_landing(page: Page) -> str:
             <p>
               OpenAPI 3.1 and Swagger UI pre-render to the Vercel CDN at build time.
               Use <code>lazy()</code> for warm singletons and <code>after()</code>
-              for <code>wait_until</code> background work.
+              for background work.
+            </p>
+          </div>
+          <div class="vbg-custom-pillar">
+            <h3 class="vbg-heading-16">Seamless Vercel</h3>
+            <p>
+              Get access to Vercel's whole ecosystem of platform services like
+              Queues, Workflows, Sandboxes, Daemons, Schedules, and more.
             </p>
           </div>
         </div>
@@ -359,7 +369,7 @@ def render_landing(page: Page) -> str:
           <h2 class="vbg-heading-24">Develop locally, deploy to Vercel</h2>
           <p class="vbg-custom-section-lead">
             Three commands take a project from local hot reload to prebuilt
-            Build Output API v3 functions.
+            Vercel-compatible functions.
           </p>
         </div>
         <div class="vbg-custom-steps">
@@ -373,7 +383,7 @@ def render_landing(page: Page) -> str:
           <div class="vbg-custom-step">
             <p class="vbg-custom-step-cmd"><code>uv run chano build</code></p>
             <p>
-              Emit deterministic Build Output API v3 functions with tree-shaken
+              Emit deterministic Build Output API functions with tree-shaken
               <code>_vendor/</code> bundles.
             </p>
           </div>
