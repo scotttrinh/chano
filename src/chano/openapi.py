@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import copy
 import html
 import inspect
 import json
 import re
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 import msgspec
@@ -20,6 +23,146 @@ if TYPE_CHECKING:
 
 _REF = "#/components/schemas/{name}"
 _PYDANTIC_REF = "#/components/schemas/{model}"
+_OPENAPI = "__chano_openapi__"
+
+
+@dataclass(frozen=True, slots=True)
+class OpenAPIInfo:
+    """OpenAPI operation metadata attached to a route handler via ``@openapi``."""
+
+    include_in_schema: bool | None = None
+    summary: str | None = None
+    description: str | None = None
+    operation_id: str | None = None
+    tags: tuple[str, ...] | None = None
+    deprecated: bool | None = None
+    response_description: str | None = None
+    openapi_extra: dict[str, Any] | None = None
+
+
+def _deep_merge(base: Mapping[str, Any], updates: Mapping[str, Any]) -> dict[str, Any]:
+    merged: dict[str, Any] = {k: copy.deepcopy(v) for k, v in base.items()}
+    for key, value in updates.items():
+        if isinstance(value, Mapping) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _check_optional_bool(name: str, value: Any) -> None:
+    if value is not None and not isinstance(value, bool):
+        raise TypeError(f"openapi() `{name}` must be a bool, got {value!r}")
+
+
+def _check_optional_str(name: str, value: Any) -> None:
+    if value is not None and not isinstance(value, str):
+        raise TypeError(f"openapi() `{name}` must be a str, got {value!r}")
+
+
+def openapi[F: Callable[..., Any]](
+    *,
+    include_in_schema: bool | None = None,
+    summary: str | None = None,
+    description: str | None = None,
+    operation_id: str | None = None,
+    tags: Sequence[str] | None = None,
+    deprecated: bool | None = None,
+    response_description: str | None = None,
+    openapi_extra: Mapping[str, Any] | None = None,
+) -> Callable[[F], F]:
+    """Attach OpenAPI operation metadata to a route handler.
+
+    ``@openapi`` only affects the generated OpenAPI document and ``/docs``;
+    it never changes request dispatch or response behavior. When stacked,
+    the outermost decorator wins for each specified field, and
+    ``openapi_extra`` mappings are deep-merged with outer keys winning.
+    """
+    _check_optional_bool("include_in_schema", include_in_schema)
+    _check_optional_bool("deprecated", deprecated)
+    _check_optional_str("summary", summary)
+    _check_optional_str("description", description)
+    _check_optional_str("operation_id", operation_id)
+    _check_optional_str("response_description", response_description)
+
+    normalized_tags: tuple[str, ...] | None = None
+    if tags is not None:
+        if (
+            not isinstance(tags, Sequence)
+            or isinstance(tags, str | bytes)
+            or not all(isinstance(tag, str) for tag in tags)
+        ):
+            raise TypeError(f"openapi() `tags` must be a sequence of str, got {tags!r}")
+        normalized_tags = tuple(tags)
+
+    normalized_extra: dict[str, Any] | None = None
+    if openapi_extra is not None:
+        if not isinstance(openapi_extra, Mapping) or not all(
+            isinstance(key, str) for key in openapi_extra
+        ):
+            raise TypeError(
+                "openapi() `openapi_extra` must be a mapping with str keys, "
+                f"got {openapi_extra!r}"
+            )
+        normalized_extra = _deep_merge({}, openapi_extra)
+
+    def decorate(func: F) -> F:
+        existing = openapi_info(func)
+        if existing is None:
+            merged = OpenAPIInfo(
+                include_in_schema=include_in_schema,
+                summary=summary,
+                description=description,
+                operation_id=operation_id,
+                tags=normalized_tags,
+                deprecated=deprecated,
+                response_description=response_description,
+                openapi_extra=normalized_extra,
+            )
+        else:
+            if existing.openapi_extra is not None and normalized_extra is not None:
+                merged_extra: dict[str, Any] | None = _deep_merge(
+                    existing.openapi_extra, normalized_extra
+                )
+            elif normalized_extra is not None:
+                merged_extra = normalized_extra
+            else:
+                merged_extra = existing.openapi_extra
+            merged = OpenAPIInfo(
+                include_in_schema=(
+                    include_in_schema
+                    if include_in_schema is not None
+                    else existing.include_in_schema
+                ),
+                summary=summary if summary is not None else existing.summary,
+                description=(
+                    description if description is not None else existing.description
+                ),
+                operation_id=(
+                    operation_id if operation_id is not None else existing.operation_id
+                ),
+                tags=normalized_tags if normalized_tags is not None else existing.tags,
+                deprecated=(
+                    deprecated if deprecated is not None else existing.deprecated
+                ),
+                response_description=(
+                    response_description
+                    if response_description is not None
+                    else existing.response_description
+                ),
+                openapi_extra=merged_extra,
+            )
+        setattr(func, _OPENAPI, merged)
+        return func
+
+    return decorate
+
+
+def openapi_info(func: Callable[..., Any]) -> OpenAPIInfo | None:
+    """Return ``@openapi`` metadata attached to ``func``, if any."""
+    info = getattr(func, _OPENAPI, None)
+    return info if isinstance(info, OpenAPIInfo) else None
+
 
 _VALIDATION_ERROR = {
     "description": "Validation Error",
@@ -130,13 +273,28 @@ def _operation(
     components: dict[str, Any],
     security_schemes: dict[str, Any],
 ) -> dict[str, Any]:
+    info = openapi_info(endpoint.func)
     doc = inspect.getdoc(endpoint.func) or ""
     operation: dict[str, Any] = {
-        "summary": doc.split("\n")[0] or f"{method} {path}",
-        "operationId": re.sub(r"\W+", "_", f"{method}_{path}".lower()).strip("_"),
+        "summary": (
+            info.summary
+            if info is not None and info.summary is not None
+            else doc.split("\n")[0] or f"{method} {path}"
+        ),
+        "operationId": (
+            info.operation_id
+            if info is not None and info.operation_id is not None
+            else re.sub(r"\W+", "_", f"{method}_{path}".lower()).strip("_")
+        ),
     }
-    if "\n" in doc:
+    if info is not None and info.description is not None:
+        operation["description"] = info.description
+    elif "\n" in doc:
         operation["description"] = doc
+    if info is not None and info.tags:
+        operation["tags"] = list(info.tags)
+    if info is not None and info.deprecated:
+        operation["deprecated"] = True
 
     fields = endpoint.request_inputs()
     parameters = [
@@ -176,7 +334,13 @@ def _operation(
             "content": {"application/json": {"schema": body_schema}},
         }
 
-    success: dict[str, Any] = {"description": "Successful Response"}
+    success: dict[str, Any] = {
+        "description": (
+            info.response_description
+            if info is not None and info.response_description is not None
+            else "Successful Response"
+        )
+    }
     returns = inspect.signature(endpoint.func, eval_str=True).return_annotation
     is_response = isinstance(returns, type) and issubclass(returns, Response)
     if returns not in (inspect.Signature.empty, None) and not is_response:
@@ -199,6 +363,8 @@ def _operation(
         operation["security"] = [{name: [] for name in schemes}]
         for name, scheme in schemes.items():
             security_schemes[name] = scheme.openapi()
+    if info is not None and info.openapi_extra is not None:
+        operation = _deep_merge(operation, info.openapi_extra)
     return operation
 
 

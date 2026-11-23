@@ -16,7 +16,7 @@ from typing import Any, Literal
 
 from chano.config import normalize_base_path
 from chano.exceptions import HTTPException, RequestValidationError
-from chano.openapi import openapi_schema, swagger_html
+from chano.openapi import openapi_info, openapi_schema, swagger_html
 from chano.params import Endpoint
 from chano.requests import Receive, Request, Scope, Send
 from chano.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
@@ -251,13 +251,14 @@ class Chano:
         handler: Callable[..., Any],
         methods: list[str],
         *,
-        include_in_schema: bool = True,
+        include_in_schema: bool | None = None,
         middleware: Sequence[Middleware] = (),
         error_handlers: Sequence[ErrorHandler] = (),
         dependencies: Sequence[Sequence[Callable[..., Any]]] = (),
     ) -> None:
         """Register ``handler`` for ``path``; ``include_in_schema=False``
-        serves it without documenting it in OpenAPI.
+        (or ``@openapi(include_in_schema=False)`` on ``handler``) serves it
+        without documenting it in OpenAPI.
 
         ``middleware`` wraps every method of ``path``, outermost first.
         ``error_handlers`` (root to leaf) handle its endpoint's errors,
@@ -265,6 +266,13 @@ class Chano:
         ``dependencies`` holds one group of checks per segment, root to leaf;
         they run in that order before ``handler``'s arguments, sharing their
         per-request ``Depends`` cache."""
+        if include_in_schema is None:
+            info = openapi_info(handler)
+            include_in_schema = (
+                True
+                if info is None or info.include_in_schema is None
+                else info.include_in_schema
+            )
         path_params = {m[1] for m in _PATH_PARAM.finditer(path)}
         endpoint = Endpoint(handler, path_params, dependencies)
         endpoints = next((e for p, _, e in self.routes if p == path), None)

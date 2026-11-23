@@ -84,9 +84,9 @@ The checks run inside [[src/chano/params.py#Endpoint#call]], within the error bo
 
 ## Schema Visibility
 
-A route module may set `include_in_schema = False` to keep its operations out of `openapi.json` while still serving them.
+A route handler may be decorated with `@openapi(include_in_schema=False)` to keep that method out of `openapi.json` while still serving it.
 
-[[src/chano/routing.py#_include_in_schema]] reads the module-level value, defaulting to `True` and raising `TypeError` for anything that is not a `bool`. [[src/chano/routing.py#_add_route]] passes it to [[src/chano/app.py#Chano#add_route]], which records hidden `(path, method)` pairs in the `hidden_operations` set of [[src/chano/app.py#Chano]]. Dispatch ignores that set; only [[src/chano/openapi.py#openapi_schema]] reads it. Dev and the build's static `openapi.json` both come from [[src/chano/routing.py#create_app]], so they agree.
+[[src/chano/openapi.py#openapi]] attaches an [[src/chano/openapi.py#OpenAPIInfo]] record to the handler function (supporting `include_in_schema`, `summary`, `description`, `operation_id`, `tags`, `deprecated`, `response_description`, and `openapi_extra`), validating types eagerly and letting outer stacked decorators override inner ones. [[src/chano/app.py#Chano#add_route]] reads `include_in_schema` via [[src/chano/openapi.py#openapi_info]] (defaulting to `True`, with an explicit `include_in_schema` argument taking precedence) and records hidden `(path, method)` pairs in the `hidden_operations` set of [[src/chano/app.py#Chano]]. Dispatch ignores that set; only [[src/chano/openapi.py#openapi_schema]] reads it. Dev and the build's static `openapi.json` both come from [[src/chano/routing.py#create_app]], so they agree.
 
 ## Background Work
 

@@ -43,6 +43,7 @@ from chano import (
     create_route_app,
     lazy,
     load_config,
+    openapi,
     raises,
 )
 from chano import build as build_module
@@ -3962,15 +3963,21 @@ def test_include_in_schema_false(tmp_path, isolated_imports):
             "pyproject.toml": '[project]\nname = "hiding"\nversion = "0"\n',
             "schema_models.py": SCHEMA_MODELS,
             "app/items/route.py": (
-                "from schema_models import Shared\n\n"
-                "include_in_schema = True\n\n"
-                "def POST(item: Shared) -> Shared:\n    return item\n"
+                "from chano import openapi\n"
+                "from schema_models import Secret, Shared\n\n"
+                "@openapi(include_in_schema=True)\n"
+                "def POST(item: Shared) -> Shared:\n    return item\n\n"
+                "@openapi(include_in_schema=False)\n"
+                "def DELETE(secret: Secret) -> dict[str, bool]:\n"
+                "    return {'deleted': bool(secret.token)}\n"
             ),
             "app/internal/[key]/route.py": (
+                "from chano import openapi\n"
                 "from schema_models import Secret, SecretReply, Shared\n\n"
-                "include_in_schema = False\n\n"
+                "@openapi(include_in_schema=False)\n"
                 "def GET(key: str, verbose: bool = False) -> Shared:\n"
                 "    return Shared(name=key)\n\n"
+                "@openapi(include_in_schema=False)\n"
                 "def POST(key: str, secret: Secret) -> SecretReply:\n"
                 "    return SecretReply(ok=secret.token == key)\n"
             ),
@@ -3981,10 +3988,12 @@ def test_include_in_schema_false(tmp_path, isolated_imports):
 
     schema = client("GET", "/openapi.json").json()
     assert list(schema["paths"]) == ["/items"]
+    assert list(schema["paths"]["/items"]) == ["post"]
     assert set(schema["components"]["schemas"]) == {"Shared"}
     assert "internal" not in json.dumps(schema)
 
-    # Hidden is only about documentation: the route still serves requests.
+    # Hidden is only about documentation: hidden methods still serve requests.
+    assert client("DELETE", "/items", json={"token": "x"}).json() == {"deleted": True}
     assert client("GET", "/internal/abc").json() == {"name": "abc"}
     reply = client("POST", "/internal/abc", json={"token": "abc"})
     assert reply.json() == {"ok": True}
@@ -4011,8 +4020,9 @@ def test_include_in_schema_only_hidden_routes(tmp_path, isolated_imports):
         {
             "schema_models.py": SCHEMA_MODELS,
             "app/route.py": (
+                "from chano import openapi\n"
                 "from schema_models import Secret\n\n"
-                "include_in_schema = False\n\n"
+                "@openapi(include_in_schema=False)\n"
                 "def POST(secret: Secret) -> Secret:\n    return secret\n"
             ),
         },
@@ -4026,16 +4036,103 @@ def test_include_in_schema_only_hidden_routes(tmp_path, isolated_imports):
     assert make_client(app)("POST", "/", json={"token": "t"}).json() == {"token": "t"}
 
 
-# @lat: [[tests#Invalid include_in_schema]]
-@pytest.mark.parametrize("value", ["'no'", "0", "None"])
-def test_include_in_schema_must_be_bool(tmp_path, isolated_imports, value):
-    project = tmp_path / "bad"
+# @lat: [[tests#Invalid openapi metadata]]
+@pytest.mark.parametrize(
+    ("kwargs", "field"),
+    [
+        ({"include_in_schema": "no"}, "include_in_schema"),
+        ({"include_in_schema": 0}, "include_in_schema"),
+        ({"deprecated": 1}, "deprecated"),
+        ({"summary": 123}, "summary"),
+        ({"description": 123}, "description"),
+        ({"operation_id": 123}, "operation_id"),
+        ({"response_description": 123}, "response_description"),
+        ({"tags": "items"}, "tags"),
+        ({"tags": [123]}, "tags"),
+        ({"openapi_extra": ["x"]}, "openapi_extra"),
+        ({"openapi_extra": {1: "x"}}, "openapi_extra"),
+    ],
+)
+def test_openapi_decorator_validation(kwargs, field):
+    with pytest.raises(TypeError, match=field):
+        openapi(**kwargs)
+
+
+# @lat: [[tests#OpenAPI decorator metadata]]
+def test_openapi_decorator_metadata(tmp_path, isolated_imports):
+    extra = {
+        "x-rate-limit": 60,
+        "responses": {"200": {"headers": {"X-Trace": {"schema": {"type": "string"}}}}},
+    }
+    app = Chano()
+
+    @openapi(
+        summary="List widgets",
+        description="Returns every visible widget.",
+        operation_id="listWidgets",
+        tags=["widgets", "public"],
+        deprecated=True,
+        response_description="A list of widgets",
+        openapi_extra=extra,
+    )
+    def list_widgets() -> list[str]:
+        """Ignored docstring summary.
+
+        Ignored docstring body.
+        """
+        return ["a"]
+
+    extra["x-rate-limit"] = 999
+    extra["responses"]["200"]["headers"]["X-Mutated"] = {}
+
+    @openapi(tags=["outer"], openapi_extra={"x-a": 1, "nested": {"k": "outer"}})
+    @openapi(
+        tags=["inner"],
+        summary="Stacked summary",
+        deprecated=True,
+        openapi_extra={"x-b": 2, "nested": {"k": "inner", "keep": True}},
+    )
+    def stacked() -> dict[str, bool]:
+        return {"ok": True}
+
+    app.add_route("/widgets", list_widgets, ["GET"])
+    app.add_route("/stacked", stacked, ["GET"])
+
+    schema = app.openapi()
+    assert schema == app.openapi()
+
+    op = schema["paths"]["/widgets"]["get"]
+    assert op["summary"] == "List widgets"
+    assert op["description"] == "Returns every visible widget."
+    assert op["operationId"] == "listWidgets"
+    assert op["tags"] == ["widgets", "public"]
+    assert op["deprecated"] is True
+    assert op["responses"]["200"]["description"] == "A list of widgets"
+    assert op["responses"]["200"]["headers"] == {
+        "X-Trace": {"schema": {"type": "string"}}
+    }
+    assert "content" in op["responses"]["200"]
+    assert op["x-rate-limit"] == 60
+
+    stacked_op = schema["paths"]["/stacked"]["get"]
+    assert stacked_op["tags"] == ["outer"]
+    assert stacked_op["summary"] == "Stacked summary"
+    assert stacked_op["deprecated"] is True
+    assert stacked_op["x-a"] == 1
+    assert stacked_op["x-b"] == 2
+    assert stacked_op["nested"] == {"k": "outer", "keep": True}
+
+    # Module-level include_in_schema is no longer special.
+    project = tmp_path / "module_var_ignored"
     write_project(
         project,
-        {"app/route.py": f"include_in_schema = {value}\n\ndef GET():\n    return 1\n"},
+        {
+            "app/route.py": (
+                "include_in_schema = False\n\ndef GET() -> int:\n    return 1\n"
+            )
+        },
     )
-    with pytest.raises(TypeError, match="include_in_schema"):
-        create_app(project / "app")
+    assert "/" in create_app(project / "app").openapi()["paths"]
 
 
 # @lat: [[tests#Lazy values#Sync lazy creates once]]
@@ -4387,8 +4484,8 @@ def test_explicit_security_and_responses(tmp_path, isolated_imports):
                 "    return value\n"
             ),
             "app/internal/route.py": (
-                "from chano import Depends, HTTPBearer, raises\n\n"
-                "include_in_schema = False\n\n"
+                "from chano import Depends, HTTPBearer, openapi, raises\n\n"
+                "@openapi(include_in_schema=False)\n"
                 "@raises(401, 'Internal only')\n"
                 "def GET(token: str = Depends(HTTPBearer('internal'))) -> str:\n"
                 "    return token\n"

@@ -398,8 +398,9 @@ regions = ["iad1"] # pin to a specific Vercel region (e.g. near your database)
 ```
 
 Other route-level options:
-- `include_in_schema = False` — hides all methods in this `route.py` from `/openapi.json` and `/docs` while still serving requests.
 - `include = ["some-pkg"]` — explicitly bundles a package if it is loaded dynamically and missed by static import tracing.
+
+To hide individual methods from `/openapi.json` and `/docs` (or set `tags`, `summary`, `deprecated`, `operation_id`, `response_description`, or `openapi_extra`), decorate the handler with `@openapi(include_in_schema=False)`.
 
 ### Dependency Tree-Shaking
 

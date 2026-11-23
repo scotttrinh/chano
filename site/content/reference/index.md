@@ -9,7 +9,7 @@ nav_title: Overview
 
 ## Reference sections
 
-- [Routing and special files](/reference/routing): File-system route conventions, HTTP methods, match precedence, `middleware.py`, `error.py`, `dependencies.py`, and route-level options.
+- [Routing and special files](/reference/routing): File-system route conventions, HTTP methods, match precedence, `middleware.py`, `error.py`, `dependencies.py`, route-level options, and `@openapi`.
 - [Parameters and validation](/reference/parameters-and-validation): Parameter source inference, `Query`, `Header`, `Cookie`, `Body`, `Depends`, `lazy`, `HTTPBearer`, `@raises`, and error types.
 - [Requests, responses, and background work](/reference/requests-and-responses): `Request` and `Geo`, buffered and streaming responses, cookies, Server-Sent Events, and `after()`.
 - [Configuration and CLI](/reference/configuration-and-cli): `[tool.chano]` settings, `chano dev`, `chano build`, Build Output API v3 layout, and programmatic app factories.

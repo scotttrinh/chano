@@ -1,6 +1,7 @@
 from chano.app import Chano, after
 from chano.config import ChanoConfig, load_config
 from chano.exceptions import HTTPException, RequestValidationError
+from chano.openapi import openapi
 from chano.params import Body, Cookie, Depends, Header, Query, lazy, raises
 from chano.requests import Geo, Request
 from chano.responses import (
@@ -42,5 +43,6 @@ __all__ = [
     "create_route_app",
     "lazy",
     "load_config",
+    "openapi",
     "raises",
 ]

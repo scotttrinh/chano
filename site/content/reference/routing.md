@@ -46,7 +46,7 @@ GET  POST  PUT  PATCH  DELETE  OPTIONS  HEAD
 
 ## Route-level module options
 
-A `route.py` may define module-level variables to configure its deployed Vercel function and OpenAPI visibility:
+A `route.py` may define module-level variables to configure its deployed Vercel function:
 
 | Variable | Type | Default | Effect |
 | --- | --- | --- | --- |
@@ -54,7 +54,35 @@ A `route.py` may define module-level variables to configure its deployed Vercel 
 | `memory` | `int` | Platform default | Sets `memory` (MB) in `.vc-config.json` |
 | `regions` | `list[str]` | Platform default | Sets `regions` in `.vc-config.json` |
 | `include` | `Sequence[str]` | `()` | Extra distribution names bundled into this function |
-| `include_in_schema` | `bool` | `True` | When `False`, omits all methods in this file from `/openapi.json` and `/docs` |
+
+## OpenAPI operation metadata
+
+Decorate individual HTTP method handlers with `@openapi(...)` to customize or hide them in `/openapi.json` and `/docs` without changing runtime dispatch:
+
+```python
+from chano import openapi
+
+@openapi(tags=["items"], summary="List items", deprecated=False)
+def GET() -> list[dict]:
+    return []
+
+@openapi(include_in_schema=False)
+def DELETE() -> dict[str, bool]:
+    return {"deleted": True}
+```
+
+| Parameter | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `include_in_schema` | `bool` | `True` | When `False`, omits this method from `/openapi.json` and `/docs` |
+| `summary` | `str` | Docstring first line | Overrides the operation `summary` |
+| `description` | `str` | Docstring body | Overrides the operation `description` |
+| `operation_id` | `str` | Generated | Overrides the operation `operationId` |
+| `tags` | `Sequence[str]` | None | Adds OpenAPI `tags` to group the operation |
+| `deprecated` | `bool` | `False` | Emits `"deprecated": true` when `True` |
+| `response_description` | `str` | `"Successful Response"` | Overrides the `200` response description |
+| `openapi_extra` | `Mapping[str, Any]` | None | Deep-merged into the generated operation object |
+
+Stacking `@openapi(...)` decorators lets the outermost decorator override each specified field and deep-merge `openapi_extra` with outer keys winning.
 
 ## Folder-scoped special files
 

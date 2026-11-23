@@ -43,7 +43,8 @@ regions = ["iad1"] # pin near your database
 You can also set:
 
 - `include = ["some-pkg"]`: bundle an extra distribution if it is loaded dynamically and missed by static import tracing.
-- `include_in_schema = False`: exclude all methods in this `route.py` from `/openapi.json` and `/docs` while still serving requests.
+
+To exclude an individual method from `/openapi.json` and `/docs` while still serving requests, decorate the handler with `@openapi(include_in_schema=False)`.
 
 ## Dependency tree-shaking and `--explain`
 

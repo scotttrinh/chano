@@ -350,15 +350,19 @@ Verify that threads released together by a barrier all read the same generated `
 
 ## Hidden routes leave the schema
 
-Verify `include_in_schema = False` drops a route's operations and its exclusive component schemas from dev `/openapi.json` and the build's static `openapi.json`, keeps shared schemas, and still serves the route in dev and as a deployed function.
+Verify `@openapi(include_in_schema=False)` hides individual methods or whole routes and exclusive schemas from dev and built `openapi.json`, while keeping sibling methods, shared schemas, and request serving.
 
 ## Schema with only hidden routes
 
-Verify that when every route is hidden, `openapi.json` has empty `paths` and no `components`, while the hidden route still answers requests.
+Verify that when every route handler is hidden via `@openapi(include_in_schema=False)`, `openapi.json` has empty `paths` and no `components`, while the hidden route still answers requests.
 
-## Invalid include_in_schema
+## Invalid openapi metadata
 
-Verify a non-`bool` `include_in_schema` (a string, `0` or `None`) fails app creation with a `TypeError` naming the setting, instead of being read as truthy or falsy.
+Verify invalid argument types passed to [[src/chano/openapi.py#openapi]] (such as non-`bool` `include_in_schema`/`deprecated`, non-`str` text fields, string or non-`str` `tags`, or non-mapping/non-`str`-key `openapi_extra`) raise `TypeError` naming the field at decoration time.
+
+## OpenAPI decorator metadata
+
+Verify [[src/chano/openapi.py#openapi]] sets `summary`, `description`, `operation_id`, `tags`, `deprecated`, `response_description`, and deep-merged `openapi_extra`, supports stacking with outer winning, and ignores module-level `include_in_schema`.
 
 ## Explicit security and responses
 
