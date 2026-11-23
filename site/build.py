@@ -44,8 +44,8 @@ class ItemInput(Struct):
     name: str
     price: Annotated[float, Meta(gt=0)]
 
-class Item(Struct):
-    id: str
+class Item(ItemInput):
+    id: int
 
 bearer = HTTPBearer()
 
@@ -63,7 +63,7 @@ async def PUT(
     item: ItemInput,
     user: Annotated[str, Depends(current_user)],
 ) -> Item:
-    return item
+    return Item(id=item_id, name=item.name, price=item.price)
 """
 
 DEPS_CODE_SAMPLE = """\
