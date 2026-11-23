@@ -14,3 +14,5 @@
 - uv run ruff check .
 - uv run ruff format --check src tests examples site/build.py
 - lat check
+- gh actions-lock (updates `.github/workflows/actions.lock` after editing GitHub Actions pins)
+- uvx zizmor . (audits `.github/workflows/` and the lockfile)
