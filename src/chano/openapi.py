@@ -9,14 +9,29 @@ import json
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from http import HTTPStatus
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    ForwardRef,
+    Literal,
+    TypeAliasType,
+    get_args,
+    get_origin,
+)
 
 import msgspec
 
 from chano._pydantic import json_schema as pydantic_json_schema
 from chano._pydantic import pydantic_adapter
 from chano.params import Endpoint, RequestInput
-from chano.responses import Response
+from chano.representation import (
+    ReturnBranch,
+    matches_response_type,
+    resolve_representation,
+)
+from chano.responses import JSONResponse, is_bodyless_status
 
 if TYPE_CHECKING:
     from chano.app import Chano
@@ -267,6 +282,43 @@ def _input_schema(
     return schemas[0] if len(schemas) == 1 else {"allOf": schemas}
 
 
+def _contains_forward_ref(annotation: Any, seen: frozenset[int] = frozenset()) -> bool:
+    if isinstance(annotation, ForwardRef):
+        return True
+    if isinstance(annotation, TypeAliasType):
+        if id(annotation) in seen:
+            return False
+        return _contains_forward_ref(annotation.__value__, seen | {id(annotation)})
+    origin = get_origin(annotation)
+    if origin is None:
+        return False
+    if origin is Annotated:
+        inner, *_ = get_args(annotation)
+        return _contains_forward_ref(inner, seen)
+    if (
+        isinstance(origin, TypeAliasType)
+        and id(origin) not in seen
+        and _contains_forward_ref(origin.__value__, seen | {id(origin)})
+    ):
+        return True
+    return any(_contains_forward_ref(arg, seen) for arg in get_args(annotation))
+
+
+def _status_description(
+    status_code: int, explicit: str | None, fallback: str | None
+) -> str:
+    if explicit is not None:
+        return explicit
+    if fallback is not None:
+        return fallback
+    if status_code == 200:
+        return "Successful Response"
+    try:
+        return HTTPStatus(status_code).phrase
+    except ValueError:
+        return "Successful Response"
+
+
 def _error_openapi_response(
     description: str,
     status: int,
@@ -274,10 +326,10 @@ def _error_openapi_response(
     components: dict[str, Any],
 ) -> dict[str, Any]:
     entry: dict[str, Any] = {"description": description}
-    error_annotation = representation.error_type(status)
+    error_annotation = representation.body_type(status, None)
     if error_annotation is not None:
         entry["content"] = {
-            representation.error_media_type: {
+            representation.media_type(status): {
                 "schema": _schema(error_annotation, components, mode="serialization")
             }
         }
@@ -353,44 +405,99 @@ def _operation(
             "content": {"application/json": {"schema": body_schema}},
         }
 
-    success: dict[str, Any] = {
-        "description": (
-            info.response_description
-            if info is not None and info.response_description is not None
-            else "Successful Response"
+    return_spec = endpoint.return_spec
+    active_rep = (
+        return_spec.representation if return_spec.has_representation else representation
+    )
+    grouped: dict[int, list[ReturnBranch]] = {}
+    for branch in return_spec.branches:
+        grouped.setdefault(branch.status_code, []).append(branch)
+
+    responses: dict[int, Any] = {}
+    for status, branches in grouped.items():
+        explicit_desc = next(
+            (b.description for b in branches if b.description is not None), None
         )
-    }
-    returns = inspect.signature(endpoint.func, eval_str=True).return_annotation
-    is_response = isinstance(returns, type) and issubclass(returns, Response)
-    if returns not in (inspect.Signature.empty, None) and not is_response:
-        if representation is None:
-            media_type = "application/json"
-            body_type = returns
-        else:
-            media_type = representation.media_type
-            body_type = representation.success_type(returns)
-        if body_type not in (inspect.Signature.empty, None):
-            success["content"] = {
-                media_type: {
-                    "schema": _schema(body_type, components, mode="serialization")
-                }
-            }
-    responses: dict[int, Any] = {200: success}
-    if fields:
-        if representation is None:
+        fallback_desc = (
+            info.response_description
+            if info is not None
+            and info.response_description is not None
+            and (status == 200 or len(grouped) == 1)
+            else None
+        )
+        entry: dict[str, Any] = {
+            "description": _status_description(status, explicit_desc, fallback_desc)
+        }
+        if not is_bodyless_status(status):
+            media_entries: dict[str, list[tuple[Any, bool]]] = {}
+            for branch in branches:
+                payload = branch.payload_type
+                if payload is inspect.Signature.empty:
+                    continue
+                effective_cls = (
+                    JSONResponse if branch.response_cls is None else branch.response_cls
+                )
+                if active_rep is not None and matches_response_type(
+                    active_rep, effective_cls, status
+                ):
+                    media_entries.setdefault(active_rep.media_type(status), []).append(
+                        (payload, True)
+                    )
+                elif effective_cls.media_type is not None:
+                    media_entries.setdefault(effective_cls.media_type, []).append(
+                        (payload, False)
+                    )
+            content: dict[str, Any] = {}
+            for media_type, items in media_entries.items():
+                if not any(uses_rep for _, uses_rep in items) and all(
+                    p in (None, type(None)) for p, _ in items
+                ):
+                    continue
+                schemas: list[dict[str, Any]] = []
+                for payload, uses_rep in items:
+                    if _contains_forward_ref(payload):
+                        continue
+                    if uses_rep and active_rep is not None:
+                        rep_payload = None if payload is type(None) else payload
+                        body_type = active_rep.body_type(status, rep_payload)
+                    else:
+                        body_type = payload
+                    if body_type is inspect.Signature.empty or _contains_forward_ref(
+                        body_type
+                    ):
+                        continue
+                    if body_type in (None, type(None)) and (
+                        uses_rep or payload not in (None, type(None))
+                    ):
+                        continue
+                    branch_schema = _schema(body_type, components, mode="serialization")
+                    if branch_schema not in schemas:
+                        schemas.append(branch_schema)
+                if schemas:
+                    content[media_type] = {
+                        "schema": (
+                            schemas[0] if len(schemas) == 1 else {"anyOf": schemas}
+                        )
+                    }
+            if content:
+                entry["content"] = content
+        responses[status] = entry
+
+    if fields and 422 not in responses:
+        if active_rep is None or resolve_representation(active_rep, 422) is None:
             responses[422] = _VALIDATION_ERROR
         else:
             responses[422] = _error_openapi_response(
-                "Validation Error", 422, representation, components
+                "Validation Error", 422, active_rep, components
             )
     for status, description in endpoint.declared_responses().items():
         if status in responses:
             continue
-        if representation is None:
+        if active_rep is None or resolve_representation(active_rep, status) is None:
             responses[status] = {"description": description}
         else:
             responses[status] = _error_openapi_response(
-                description, status, representation, components
+                description, status, active_rep, components
             )
     operation["responses"] = {str(k): v for k, v in sorted(responses.items())}
 

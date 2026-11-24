@@ -7,12 +7,17 @@ from collections.abc import AsyncIterable, AsyncIterator, Coroutine, Iterable
 from datetime import UTC, datetime
 from email.utils import format_datetime
 from http.cookies import CookieError, SimpleCookie
-from typing import Any, Literal
+from typing import Any, Literal, overload
 
 import msgspec
 
 from chano._pydantic import enc_hook as _pydantic_enc_hook
 from chano.requests import Message, Receive, Send
+
+
+def is_bodyless_status(status_code: int) -> bool:
+    """Return True for HTTP statuses that must not carry a response body."""
+    return status_code in (204, 205, 304)
 
 
 def _header_dict(
@@ -41,14 +46,36 @@ def _is_latin_1(text: str) -> bool:
     return True
 
 
-class Response:
+class Response[T]:
     """A buffered response.
+
+    ``content`` holds the unrendered payload; ``body`` renders it lazily on
+    first access (or when sent), setting ``content-length`` unless the status
+    is bodyless (``204``, ``205``, ``304``) with an empty body.
 
     ``headers`` holds one value per name. Headers that repeat, such as
     ``set-cookie``, go through ``_append_header`` and are sent after them.
     """
 
     media_type: str | None = None
+
+    @overload
+    def __init__(
+        self: Response[bytes],
+        content: bytes = b"",
+        status_code: int = 200,
+        headers: dict[str, str] | None = None,
+        media_type: str | None = None,
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self,
+        content: T,
+        status_code: int = 200,
+        headers: dict[str, str] | None = None,
+        media_type: str | None = None,
+    ) -> None: ...
 
     def __init__(
         self,
@@ -57,15 +84,39 @@ class Response:
         headers: dict[str, str] | None = None,
         media_type: str | None = None,
     ) -> None:
+        self._content: T = content
         self.status_code = status_code
-        self.body = self.render(content)
+        self._body: bytes | None = None
         self._init_headers(headers, media_type)
-        self.headers["content-length"] = str(len(self.body))
+
+    @property
+    def content(self) -> T:
+        return self._content
+
+    @property
+    def body(self) -> bytes:
+        if self._body is None:
+            self._body = self.render(self._content)
+            if not is_bodyless_status(self.status_code):
+                self.headers.setdefault("content-length", str(len(self._body)))
+        return self._body
+
+    @body.setter
+    def body(self, value: bytes) -> None:
+        self._body = value
+        if not is_bodyless_status(self.status_code):
+            self.headers["content-length"] = str(len(value))
 
     def _init_headers(
         self, headers: dict[str, str] | None, media_type: str | None
     ) -> None:
+        had_explicit_ct = media_type is not None or any(
+            key.lower() == "content-type" for key in (headers or ())
+        )
         self.headers = _header_dict(headers, media_type or self.media_type)
+        self._default_content_type: str | None = (
+            None if had_explicit_ct else self.headers.get("content-type")
+        )
         self._appended_headers: list[tuple[str, str]] = []
 
     def _append_header(self, key: str, value: str) -> None:
@@ -145,43 +196,76 @@ class Response:
         return content if isinstance(content, bytes) else str(content).encode()
 
     def _start_message(self) -> Message:
+        bodyless = is_bodyless_status(self.status_code)
         return {
             "type": "http.response.start",
             "status": self.status_code,
             "headers": [
                 (key.encode("latin-1"), value.encode("latin-1"))
                 for key, value in [*self.headers.items(), *self._appended_headers]
+                if not (bodyless and key == "content-length")
             ],
         }
 
     async def __call__(
         self, receive: Receive, send: Send, *, include_body: bool = True
     ) -> None:
+        if is_bodyless_status(self.status_code):
+            await send(self._start_message())
+            await send({"type": "http.response.body", "body": b""})
+            return
+        body = self.body
+        if include_body:
+            self.headers["content-length"] = str(len(body))
+        else:
+            self.headers.setdefault("content-length", str(len(body)))
         await send(self._start_message())
-        body = self.body if include_body else b""
+        if not include_body:
+            body = b""
         await send({"type": "http.response.body", "body": body})
 
 
-class JSONResponse(Response):
+class JSONResponse[T](Response[T]):
     """Serializes Structs, dataclasses, attrs, BaseModels, datetimes, etc. as JSON."""
 
     media_type = "application/json"
+
+    def __init__(
+        self,
+        content: T,
+        status_code: int = 200,
+        headers: dict[str, str] | None = None,
+        media_type: str | None = None,
+    ) -> None:
+        super().__init__(
+            content,
+            status_code=status_code,
+            headers=headers,
+            media_type=media_type,
+        )
 
     def render(self, content: Any) -> bytes:
         return msgspec.json.encode(content, enc_hook=_pydantic_enc_hook)
 
 
-class HTMLResponse(Response):
+class HTMLResponse[T](Response[T]):
     media_type = "text/html"
 
 
-class PlainTextResponse(Response):
+class PlainTextResponse[T](Response[T]):
     media_type = "text/plain"
 
 
-class RedirectResponse(Response):
-    def __init__(self, url: str, status_code: int = 307) -> None:
-        super().__init__(status_code=status_code, headers={"location": url})
+class RedirectResponse(Response[bytes]):
+    def __init__(
+        self,
+        url: str,
+        status_code: int = 307,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        merged = {key.lower(): value for key, value in (headers or {}).items()}
+        merged["location"] = url
+        super().__init__(status_code=status_code, headers=merged)
 
 
 _DONE: Any = object()
@@ -254,7 +338,7 @@ async def _run_to_completion(cleanup: Coroutine[Any, Any, None]) -> None:
     task.result()
 
 
-class StreamingResponse(Response):
+class StreamingResponse(Response[AsyncIterable[bytes | str] | Iterable[bytes | str]]):
     """Stream ``content``, an async or sync iterable of ``bytes`` or ``str``.
 
     No ``content-length`` is sent. A client disconnect cancels the producer
@@ -269,16 +353,20 @@ class StreamingResponse(Response):
         media_type: str | None = None,
     ) -> None:
         self.status_code = status_code
-        self.content = content
+        self._content = content
+        self._body = None
         self._init_headers(headers, media_type)
         self.headers.pop("content-length", None)
 
     async def __call__(
         self, receive: Receive, send: Send, *, include_body: bool = True
     ) -> None:
+        bodyless = is_bodyless_status(self.status_code)
+        if bodyless:
+            self.headers.pop("content-length", None)
         await send(self._start_message())
-        if not include_body:
-            # Never touch the content, so a HEAD costs no producer work.
+        if not include_body or bodyless:
+            # Never touch the content, so HEAD and bodyless statuses cost no work.
             await send({"type": "http.response.body", "body": b"", "more_body": False})
             return
         iterator = _async_iterator(self.content)

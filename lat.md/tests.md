@@ -742,7 +742,7 @@ Verify a single project combining HTTP `route.py`, `queue.py`, `schedule.py`, an
 
 ## Representations
 
-Tests for [[src/chano/representation.py#Representation]], [[src/chano/representation.py#JSONRepresentation]], `representation.py` loading, runtime rendering, OpenAPI schemas, and build bundling.
+Tests for [[src/chano/representation.py#Representation]], [[src/chano/representation.py#JSONRepresentation]], [[src/chano/representation.py#StatusRepresentation]], [[src/chano/status.py]], `representation.py` loading, runtime rendering, OpenAPI schemas, and build bundling.
 
 ### Problem JSON subclassing JSONRepresentation
 
@@ -758,7 +758,7 @@ Verify a nested `(v2)/representation.py` replaces an ancestor `representation.py
 
 ### Error boundaries run before representation error
 
-Verify `error.py` handles endpoint and `representation.success` errors before `representation.error`, and that re-raising or replacing an exception in `error.py` passes the latest exception to `representation.error`.
+Verify `error.py` handles endpoint and `representation.render` errors before fallback error rendering, and that re-raising or replacing an exception in `error.py` passes the latest exception to `representation.render`.
 
 ### Invalid representation.py and conflicting paths
 
@@ -766,12 +766,76 @@ Verify missing, non-protocol, class, or malformed `representation.py` exports ra
 
 ### Broken representation error and non-Response fallback
 
-Verify a raising or non-`Response` `representation.error` falls back to `error_response` (500), and a non-`Response` `representation.success` raises `TypeError` naming the representation into the error boundary.
+Verify a raising or non-`Response` error `representation.render` falls back to `error_response` (500), and a non-`Response` handler `representation.render` raises `TypeError` naming the representation into the error boundary.
 
 ### Sync and async representations
 
-Verify both sync and async `Representation` implementations work for success and error responses across both `create_app` and `create_route_app`, and that `JSONRepresentation()` satisfies the runtime-checkable `Representation` protocol.
+Verify both sync and async `Representation` implementations work for return values and exceptions across both `create_app` and `create_route_app`, and that `JSONRepresentation()` satisfies the runtime-checkable `Representation` protocol.
 
 ### Build trace roots and bundling
 
 Verify `plan_build` includes `representation.py` in `trace_roots` only for functions beneath it, built static `openapi.json` reflects the representation, and `build` bundles its imports only into those functions.
+
+### Type-keyed representations and Response passthrough
+
+Verify `response_type` matching routes plain values and matching `Response` subclasses (including tuple `response_type`) through `representation.render`, while non-matching `Response` subclasses pass through untouched.
+
+### Generic JSONResponse and lazy rendering
+
+Verify `JSONResponse[T]` lazily passes `result.content` to a matching `representation.render`, preserves status/headers/cookies without clobbering representation headers, catches non-intercepted encode errors, and unwraps `T` in OpenAPI.
+
+### Annotated Status unions and bodyless statuses
+
+Verify `Status(...)` inside `Annotated`, unions, shared-status unions, Python 3.12 `TypeAliasType`, and bodyless `204`/`304` statuses drive runtime status codes, omit bodyless content, preserve `msgspec.Meta`, and validate arguments.
+
+### Decorator sugar with future annotations
+
+Verify `@status_code`, `@raises`, `@representation`, and direct `Annotated[..., Status(...)]` on handlers, `Depends`, and `dependencies.py` resolve forward references inside `Annotated` under `from __future__ import annotations`.
+
+### Per-method representation overrides and Raw opt-out
+
+Verify methods on one path can inherit `representation.py`, override via `@representation(...)` or `Annotated[T, Rep()]`, or opt out via `None`/`Raw` for runtime returns, errors past `error.py`, and OpenAPI across both factories.
+
+### Bodyless status suppression at wire boundary
+
+Verify `204`, `205`, and `304` suppress payloads and `content-length` in buffered and streaming ASGI sends without invoking `representation.render` or starting producers, and verify `content-length` overwrites on `GET` while preserved on `HEAD`.
+
+### Middleware lazy response error boundary
+
+Verify middleware returning a lazily failing `JSONResponse(object())` produces the default `500` via `error_response` instead of escaping ASGI or invoking endpoint `error_handlers`.
+
+### Shared media collision and untagged struct union
+
+Verify OpenAPI accumulates per-branch schemas under `anyOf` without overwriting matching media types across representation and passthrough branches, and supports untagged `msgspec.Struct` unions.
+
+### Unhashable rep alias and conflicting union reps
+
+Verify generic `TypeAliasType` handles unhashable dataclass representations without hashing metadata, and conflicting `Representation`/`Raw` union branches raise `ValueError`.
+
+### Header merge constructor cookies and post content-type
+
+Verify representation metadata merging preserves `set-cookie` headers passed via constructor `headers` on both responses alongside `set_cookie()`, and preserves post-construction `content-type` changes.
+
+### Decorated partial and nested ForwardRefs in OpenAPI
+
+Verify `@raises`/`@status_code` on `functools.partial` preserves wrapped return types and metadata, and nested `ForwardRef` branches skip only the unresolved schema while preserving sibling branches and metadata.
+
+### Native PEP 649 TYPE_CHECKING return annotations
+
+Verify on Python 3.14+ that native PEP 649 functions with `TYPE_CHECKING`-only return annotations (including nested `Annotated`) preserve return metadata and `annotationlib` formats cleanly.
+
+### StatusRepresentation composition and dispatch
+
+Verify [[src/chano/representation.py#StatusRepresentation]] routes status codes across `int`, `range`, and `Container[int]` keys in insertion order across both factories for runtime rendering and OpenAPI schemas.
+
+### StatusRepresentation defaults and validation
+
+Verify [[src/chano/representation.py#StatusRepresentation]] computes union `response_type`s (defaulting empty mappings to `JSONResponse`), resolves heterogeneous/nested children per status with `default=None`, and validates constructor arguments.
+
+### Unified Status aliases and additive error metadata
+
+Verify [[src/chano/status.py]] aliases, additive `>= 400` `Status` composition (`NotFound[Item]`, `Created[NotFound[Item]]`, `NotFound[NoContent]`), `@raises` sugar parity, and `>= 400`-only propagation from `Depends` and `dependencies.py`.
+
+### Nested aliases None rep ambiguous returns and 205
+
+Verify repeated nested `TypeAliasType` expansion (`NotFound[NotFound[Created[str]]]`), OpenAPI `None` under custom representations, `TypeError` on ambiguous multi-status plain returns, bodyless `205`, and `Status(103)` rejection.

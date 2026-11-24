@@ -18,9 +18,21 @@ from chano.config import WorkflowConfig, normalize_base_path
 from chano.exceptions import HTTPException, RequestValidationError
 from chano.openapi import openapi_info, openapi_schema, swagger_html
 from chano.params import Endpoint
-from chano.representation import Representation, is_representation
+from chano.representation import (
+    Representation,
+    ReturnSpec,
+    is_representation,
+    matches_response_type,
+)
 from chano.requests import Receive, Request, Scope, Send
-from chano.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from chano.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    Response,
+    StreamingResponse,
+    is_bodyless_status,
+)
 
 _PATH_PARAM = re.compile(r"\{(\w+)(:path)?\}")
 
@@ -152,6 +164,123 @@ def _is_async(handler: Callable[..., Any]) -> bool:
     )
 
 
+def _materialize(
+    response: Response[Any], *, preserve_content_length: bool = False
+) -> Response[Any]:
+    """Ensure buffered responses render their body inside the error boundary."""
+    if not isinstance(response, StreamingResponse) and not is_bodyless_status(
+        response.status_code
+    ):
+        body = response.body
+        if preserve_content_length:
+            response.headers.setdefault("content-length", str(len(body)))
+        else:
+            response.headers["content-length"] = str(len(body))
+    return response
+
+
+def _active_representation(
+    endpoint: Endpoint | None,
+    route_representation: Representation | None,
+) -> Representation | None:
+    if endpoint is not None and endpoint.return_spec.has_representation:
+        return endpoint.return_spec.representation
+    return route_representation
+
+
+def _merge_response_metadata(
+    source: Response[Any], target: Response[Any]
+) -> Response[Any]:
+    if target is source:
+        return target
+    target.status_code = source.status_code
+    for key, value in source.headers.items():
+        if key == "content-length":
+            continue
+        if key == "set-cookie":
+            if "set-cookie" in target.headers:
+                target._append_header("set-cookie", value)
+            else:
+                target.headers["set-cookie"] = value
+            continue
+        if (
+            key == "content-type"
+            and value == source._default_content_type
+            and "content-type" in target.headers
+        ):
+            continue
+        target.headers[key] = value
+    target._appended_headers.extend(source._appended_headers)
+    return target
+
+
+def _exception_status_code(exc: Exception) -> int:
+    if isinstance(exc, HTTPException):
+        return exc.status_code
+    if isinstance(exc, RequestValidationError):
+        return 422
+    return 500
+
+
+async def _render_result(
+    request: Request,
+    result: Any,
+    return_spec: ReturnSpec,
+    representation: Representation | None,
+) -> Response[Any]:
+    if isinstance(result, Response):
+        status_code = result.status_code
+        if is_bodyless_status(status_code):
+            result.headers.pop("content-length", None)
+            if (
+                result._default_content_type is not None
+                and result.headers.get("content-type") == result._default_content_type
+            ):
+                result.headers.pop("content-type", None)
+            return result
+        if representation is None or not matches_response_type(
+            representation, type(result), status_code
+        ):
+            return result
+        rendered = representation.render(request, result.content, status_code)
+        if inspect.isawaitable(rendered):
+            rendered = await rendered
+        if not isinstance(rendered, Response):
+            raise TypeError(
+                f"representation {representation!r} render() "
+                f"returned {rendered!r}, not a Response"
+            )
+        return _merge_response_metadata(result, rendered)
+
+    default_status = return_spec.default_status
+    if default_status is None and return_spec.has_ambiguous_status:
+        statuses = ", ".join(
+            str(code) for code in sorted({b.status_code for b in return_spec.branches})
+        )
+        raise TypeError(
+            f"ambiguous return status ({statuses}) for plain return value: "
+            "return an explicit Response (e.g. JSONResponse(..., status_code=...))"
+        )
+    status_code = default_status if default_status is not None else 200
+    if is_bodyless_status(status_code):
+        return Response(b"", status_code=status_code)
+    if representation is None or not matches_response_type(
+        representation, JSONResponse, status_code
+    ):
+        return JSONResponse(result, status_code=status_code)
+    rendered = representation.render(request, result, status_code)
+    if inspect.isawaitable(rendered):
+        rendered = await rendered
+    if not isinstance(rendered, Response):
+        raise TypeError(
+            f"representation {representation!r} render() "
+            f"returned {rendered!r}, not a Response"
+        )
+    if default_status is not None:
+        rendered.status_code = default_status
+    return rendered
+
+
 async def _error_boundary(
     handlers: Sequence[ErrorHandler],
     request: Request,
@@ -160,7 +289,7 @@ async def _error_boundary(
 ) -> Response:
     """Hand ``exc`` to the nearest of ``handlers`` (root to leaf). Whatever
     it raises, including a non-``Response`` result as ``TypeError``, goes
-    to the next ancestor; past the root, ``representation.error`` (when
+    to the next ancestor; past the root, ``representation.render`` (when
     configured) or ``error_response`` maps it.
 
     Async handlers run on the event loop; sync ones in a worker thread. An
@@ -171,15 +300,18 @@ async def _error_boundary(
         if representation is None:
             return error_response(exc)
         try:
-            response = representation.error(request, exc)
+            status_code = _exception_status_code(exc)
+            response = representation.render(request, exc, status_code)
             if inspect.isawaitable(response):
                 response = await response
             if not isinstance(response, Response):
                 raise TypeError(
-                    f"representation {representation!r} error() "
+                    f"representation {representation!r} render() "
                     f"returned {response!r}, not a Response"
                 )
-            return response
+            return _materialize(
+                response, preserve_content_length=request.method == "HEAD"
+            )
         except Exception as raised:
             return error_response(raised)
     *ancestors, handler = handlers
@@ -198,9 +330,9 @@ async def _error_boundary(
                 f"handle_error {handler.__module__}.{name} "
                 f"returned {response!r}, not a Response"
             )
+        return _materialize(response, preserve_content_length=request.method == "HEAD")
     except Exception as raised:
         return await _error_boundary(ancestors, request, raised, representation)
-    return response
 
 
 def _wrap(middleware: Middleware, call_next: CallNext) -> CallNext:
@@ -211,7 +343,7 @@ def _wrap(middleware: Middleware, call_next: CallNext) -> CallNext:
                 f"middleware {middleware.__module__}.{middleware.__qualname__} "
                 f"returned {response!r}, not a Response"
             )
-        return response
+        return _materialize(response, preserve_content_length=request.method == "HEAD")
 
     return call
 
@@ -338,12 +470,15 @@ class Chano:
 
         ``middleware`` wraps every method of ``path``, outermost first.
         ``error_handlers`` (root to leaf) handle its endpoint's errors,
-        nearest first. ``representation``, when set, renders non-``Response``
-        results and fallback errors and describes them in OpenAPI. Each call
-        for one path must pass the same chains and representation.
-        ``dependencies`` holds one group of checks per segment, root to leaf;
-        they run in that order before ``handler``'s arguments, sharing their
-        per-request ``Depends`` cache."""
+        nearest first. ``representation``, when set, renders matching
+        ``Response`` types (and non-``Response`` values as implicit
+        ``JSONResponse``) plus fallback errors, and describes them in OpenAPI;
+        individual handlers may override or opt out via ``@representation(...)``
+        or ``Annotated[..., Rep | Raw]``. Each call for one path must pass the
+        same chains and path-level representation. ``dependencies`` holds one
+        group of checks per segment, root to leaf; they run in that order
+        before ``handler``'s arguments, sharing their per-request ``Depends``
+        cache."""
         if representation is not None and not is_representation(representation):
             raise TypeError(
                 f"invalid representation for route {path!r}: expected a "
@@ -408,7 +543,10 @@ class Chano:
         cancelled = False
         try:
             try:
-                response = await self._handle(request)
+                response = _materialize(
+                    await self._handle(request),
+                    preserve_content_length=request.method == "HEAD",
+                )
             except Exception as exc:  # unmatched paths and middleware errors
                 response = error_response(exc)
             await response(receive, send, include_body=request.method != "HEAD")
@@ -470,28 +608,20 @@ class Chano:
         async def call(request: Request) -> Response:
             method = "GET" if request.method == "HEAD" else request.method
             endpoint = endpoints.get(request.method) or endpoints.get(method)
+            active_rep = _active_representation(endpoint, representation)
             try:
                 if endpoint is None:
                     headers = {"allow": ", ".join(sorted(endpoints))}
                     raise HTTPException(405, "Method Not Allowed", headers)
                 result = await endpoint.call(request)
-                if isinstance(result, Response):
-                    return result
-                if representation is None:
-                    return JSONResponse(result)
-                response = representation.success(request, result)
-                if inspect.isawaitable(response):
-                    response = await response
-                if not isinstance(response, Response):
-                    raise TypeError(
-                        f"representation {representation!r} success() "
-                        f"returned {response!r}, not a Response"
-                    )
-                return response
-            except Exception as exc:
-                return await _error_boundary(
-                    error_handlers, request, exc, representation
+                response = await _render_result(
+                    request, result, endpoint.return_spec, active_rep
                 )
+                return _materialize(
+                    response, preserve_content_length=request.method == "HEAD"
+                )
+            except Exception as exc:
+                return await _error_boundary(error_handlers, request, exc, active_rep)
 
         return call
 
@@ -590,11 +720,16 @@ class EndpointASGIApp:
                     raise HTTPException(405, "Method Not Allowed", headers)
                 result = await self.endpoint.call(request)
                 if isinstance(result, Response):
-                    response = result
+                    response = _materialize(
+                        result, preserve_content_length=request.method == "HEAD"
+                    )
                 elif result is None:
                     response = Response(status_code=200)
                 else:
-                    response = JSONResponse(result)
+                    response = _materialize(
+                        JSONResponse(result),
+                        preserve_content_length=request.method == "HEAD",
+                    )
             except Exception as exc:
                 response = await _error_boundary(self.error_handlers, request, exc)
             await response(receive, send, include_body=request.method != "HEAD")

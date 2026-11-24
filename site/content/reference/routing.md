@@ -104,7 +104,7 @@ Exports `def handle_error(request: Request, exc: Exception) -> Response` or `asy
 
 - Executes **leaf-to-root** (nearest directory first) inside the innermost middleware.
 - Handles `HTTPException`, `RequestValidationError`, `405` method mismatches, and unhandled endpoint exceptions.
-- Re-raising (a bare `raise` or a new exception) passes the exception to the next ancestor `error.py`, then to the route's `representation.error` (when configured) or Chano's default error mapping (`422` for validation, `HTTPException` JSON, or `500` plain text).
+- Re-raising (a bare `raise` or a new exception) passes the exception to the next ancestor `error.py`, then to the route's `representation.render` (when configured) or Chano's default error mapping (`422` for validation, `HTTPException` JSON, or `500` plain text).
 - Exceptions raised by middleware bypass `error.py` and use Chano's default error mapping.
 
 ### `dependencies.py`
@@ -150,9 +150,9 @@ Duplicate logical paths or colliding schedule names raise `ValueError`.
 
 ### `representation.py`
 
-Exports `representation: Representation` (an object implementing the [`Representation`](/reference/requests-and-responses#representation) protocol, such as a [`JSONRepresentation`](/reference/requests-and-responses#representation) subclass):
+Exports `representation: Representation` (an object implementing the [`Representation`](/reference/requests-and-responses#representation) protocol, such as a [`JSONRepresentation`](/reference/requests-and-responses#representation) subclass or [`StatusRepresentation`](/reference/requests-and-responses#statusrepresentation)):
 
-- **Nearest wins**: the closest `representation.py` to a route replaces any ancestor `representation.py`; representations do not chain or merge. Routes with no ancestor `representation.py` keep Chano's default wire format and OpenAPI output unchanged.
-- **Validation and conflicts**: missing `representation` or an object missing required protocol members (or an uninstantiated class) raises `TypeError` naming the file at load time. Two route files mapping to the same URL path with different representations raise `ValueError`.
-- **Order relative to `error.py`**: `error.py` boundaries run first, leaf-to-root. `representation.error` runs only as the final fallback past the root `error.py` (replacing Chano's default `error_response`). If `representation.success` raises, the exception enters `error.py` like any handler error.
+- **Nearest wins and per-method overrides**: the closest `representation.py` to a route replaces any ancestor `representation.py`; representations do not chain or merge. Individual method handlers in `route.py` may override `representation.py` with `@representation(MyRep())` / `Annotated[T, MyRep()]` or opt out with `@representation(None)` / `Annotated[T, Raw]` without conflicting across methods on the same path. Routes with no active representation keep Chano's default wire format and OpenAPI output unchanged.
+- **Validation and conflicts**: missing `representation` or an object missing required protocol members (including `response_type`, `media_type`, `body_type`, `render`, or an uninstantiated class) raises `TypeError` naming the file at load time. Two route files mapping to the same URL path with different `representation.py` exports raise `ValueError`.
+- **Order relative to `error.py`**: `error.py` boundaries run first, leaf-to-root. The handler's active representation's `render(request, exc, status_code)` runs only as the final fallback past the root `error.py` (replacing Chano's default `error_response`); `405` uses `representation.py`. If `representation.render` raises while rendering a normal return, the exception enters `error.py` like any handler error.
 - **Bundling**: `chano build` includes ancestor `representation.py` files in each function's trace roots so their imports are vendored into deployed functions.

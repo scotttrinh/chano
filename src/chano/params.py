@@ -22,6 +22,7 @@ import dataclasses
 import functools
 import inspect
 import re
+import sys
 import threading
 import types
 from collections.abc import Callable, Coroutine, Iterator, Sequence
@@ -37,6 +38,12 @@ from chano._pydantic import (
     validate_python,
 )
 from chano.exceptions import RequestValidationError
+from chano.representation import (
+    ReturnSpec,
+    default_status_description,
+    parse_return,
+)
+from chano.representation import raises as raises
 from chano.requests import Request
 from chano.security import HTTPBearer
 
@@ -56,33 +63,6 @@ class ParamInfo:
 
 def Depends(dependency: Callable[..., Any]) -> DependsInfo:
     return DependsInfo(dependency)
-
-
-_RAISES = "__chano_raises__"
-
-
-def raises[F: Callable[..., Any]](
-    status_code: int, description: str
-) -> Callable[[F], F]:
-    """Document that a handler or dependency may respond with an error.
-
-    ``@raises(401, "Not authenticated")`` adds that response to every
-    operation using the decorated function. Stack it for several statuses.
-    It only documents: raise ``HTTPException`` to send the response. When
-    stacked decorators repeat a status, the outermost one wins.
-    """
-    if not isinstance(status_code, int) or isinstance(status_code, bool):
-        raise TypeError(f"raises() takes an int status code, got {status_code!r}")
-    if not 400 <= status_code <= 599:
-        raise ValueError(f"raises() takes an error status code, got {status_code}")
-
-    def decorate(func: F) -> F:
-        # Decorators apply inner first, so the outer one overwrites.
-        declared = getattr(func, _RAISES, {})
-        setattr(func, _RAISES, {**declared, status_code: description})
-        return func
-
-    return decorate
 
 
 def Query(*, alias: str | None = None) -> ParamInfo:
@@ -298,6 +278,25 @@ class RequestInput:
         return [field.annotation for field in self.fields]
 
 
+def _parameters(func: Callable[..., Any]) -> list[inspect.Parameter]:
+    """Read ``func``'s parameters, tolerating PEP 649 forward refs on ``return``."""
+    try:
+        return list(inspect.signature(func, eval_str=True).parameters.values())
+    except NameError:
+        if sys.version_info >= (3, 14):
+            import annotationlib
+
+            sig = inspect.signature(
+                func, annotation_format=annotationlib.Format.FORWARDREF
+            )
+            params = list(sig.parameters.values())
+            for param in params:
+                if isinstance(param.annotation, annotationlib.ForwardRef):
+                    raise
+            return params
+        raise
+
+
 class Endpoint:
     """A handler (or dependency) plus the plan for building its arguments.
 
@@ -316,9 +315,10 @@ class Endpoint:
         default_source: str = "query",
     ) -> None:
         self.func = func
+        self.return_spec: ReturnSpec = parse_return(func)
         fields = [
             _field(parameter, path_params, default_source=default_source)
-            for parameter in inspect.signature(func, eval_str=True).parameters.values()
+            for parameter in _parameters(func)
         ]
         if sum(field.source == "body" for field in fields) > 1:
             for field in fields:
@@ -393,25 +393,32 @@ class Endpoint:
                 yield endpoint.func
 
     def declared_responses(self) -> dict[int, str]:
-        """Error responses declared with ``raises``, here, in dependencies
-        and in inherited checks.
+        """Error responses (``>= 400``) declared with ``Status`` or ``@raises``,
+        here, in dependencies and in inherited checks.
 
         The first declaration of a status wins, visiting level by level: this
         function; then its direct dependencies in parameter order, followed
         by its inherited checks nearest segment first and in declared order
         within a segment; then their dependencies, and so on. A nearer
-        declaration so beats a deeper one in any branch.
+        declaration so beats a deeper one in any branch; an explicit
+        description fills in an earlier descriptionless ``Status(code)``.
         """
-        declared: dict[int, str] = {}
+        declared: dict[int, str | None] = {}
         level: list[Endpoint] = [self]
         checks = [check for group in reversed(self.check_groups) for check in group]
         while level:
             for endpoint in level:
-                for status, description in getattr(endpoint.func, _RAISES, {}).items():
-                    declared.setdefault(status, description)
+                for status, description in endpoint.return_spec.error_statuses.items():
+                    if status not in declared or (
+                        declared[status] is None and description is not None
+                    ):
+                        declared[status] = description
             level = [f.dependency for e in level for f in e.fields if f.dependency]
             level, checks = [*level, *checks], []
-        return declared
+        return {
+            status: default_status_description(status, description)
+            for status, description in declared.items()
+        }
 
     async def call(self, request: Request) -> Any:
         errors: list[dict[str, Any]] = []

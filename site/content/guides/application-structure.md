@@ -143,6 +143,7 @@ from chano import (
     Request,
     RequestValidationError,
     Response,
+    StatusRepresentation,
 )
 
 
@@ -154,29 +155,30 @@ class ProblemDetail(msgspec.Struct):
 
 
 class ProblemJSON(JSONRepresentation):
-    error_media_type = "application/problem+json"
+    def media_type(self, status_code: int) -> str:
+        return "application/problem+json"
 
-    def error_type(self, status_code: int) -> Any:
+    def body_type(self, status_code: int, returns: Any) -> Any:
         return ProblemDetail
 
-    def error(self, request: Request, exc: Exception) -> Response:
-        if isinstance(exc, HTTPException):
+    def render(self, request: Request, value: Any, status_code: int) -> Response:
+        if isinstance(value, HTTPException):
             status, title, detail, headers = (
-                exc.status_code,
+                value.status_code,
                 "HTTP Error",
-                exc.detail,
-                exc.headers,
+                value.detail,
+                value.headers,
             )
-        elif isinstance(exc, RequestValidationError):
+        elif isinstance(value, RequestValidationError):
             status, title, detail, headers = (
                 422,
                 "Validation Error",
-                exc.errors,
+                value.errors,
                 None,
             )
         else:
             # Unexpected errors keep the default: a logged traceback and a plain 500.
-            return super().error(request, exc)
+            return super().render(request, value, status_code)
         body = ProblemDetail(
             title=title,
             status=status,
@@ -187,14 +189,14 @@ class ProblemJSON(JSONRepresentation):
             msgspec.json.encode(body),
             status_code=status,
             headers=headers,
-            media_type=self.error_media_type,
+            media_type=self.media_type(status),
         )
 
 
-representation = ProblemJSON()
+representation = StatusRepresentation({range(400, 600): ProblemJSON()})
 ```
 
-Subclassing `JSONRepresentation` lets you override only the error half or only the success half (`media_type`, `success_type`, and `success`). The nearest `representation.py` to a route wins (they do not chain or merge), `error.py` boundaries still run first, and any handler that returns a `Response` directly bypasses the representation. See [Representation](/reference/requests-and-responses#representation) and [representation.py](/reference/routing#representation-py) for the full contract.
+`StatusRepresentation` routes status codes to specialized representations (defaulting unmatched statuses to `JSONRepresentation()`), so you can compose an envelope for `range(200, 400)` with Problem JSON for `range(400, 600)` independently. The nearest `representation.py` to a route wins (they do not chain or merge), `error.py` boundaries still run first, and non-matching `Response` subclasses (`RedirectResponse`, `HTMLResponse`, `StreamingResponse`, raw `Response`) pass through untouched while `JSONResponse` still flows through a `JSONResponse`-keyed representation. See [Response annotations](/guides/response-annotations), [Representation](/reference/requests-and-responses#representation), and [representation.py](/reference/routing#representation-py) for the full contract.
 
 ## `lazy()` instead of startup hooks
 

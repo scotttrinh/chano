@@ -42,11 +42,25 @@ Outside Vercel, `x-vercel-*` and `x-forwarded-for` headers are client-supplied a
 
 | Class | Default status | Default `Content-Type` | Notes |
 | --- | --- | --- | --- |
-| `Response(content=b"", status_code=200, headers=None, media_type=None)` | `200` | `media_type` | Base ASGI response (`bytes` or `str`) |
-| `JSONResponse(content, status_code=200, headers=None)` | `200` | `application/json` | Encodes with `msgspec` (and Pydantic `model_dump`) |
-| `HTMLResponse(content, status_code=200, headers=None)` | `200` | `text/html; charset=utf-8` | HTML body |
-| `PlainTextResponse(content, status_code=200, headers=None)` | `200` | `text/plain; charset=utf-8` | Plain text body |
+| `Response[T](content=b"", status_code=200, headers=None, media_type=None)` | `200` | `media_type` | Base generic ASGI response; stores `content` and renders `body` lazily |
+| `JSONResponse[T](content, status_code=200, headers=None)` | `200` | `application/json` | Generic JSON response encoded with `msgspec` (and Pydantic `model_dump`) |
+| `HTMLResponse[T](content, status_code=200, headers=None)` | `200` | `text/html; charset=utf-8` | HTML body |
+| `PlainTextResponse[T](content, status_code=200, headers=None)` | `200` | `text/plain; charset=utf-8` | Plain text body |
 | `RedirectResponse(url, status_code=307, headers=None)` | `307` | None | Sets `location` header |
+
+Generic `JSONResponse[T]` keeps the payload type visible to type checkers and OpenAPI while allowing custom status codes, headers, and cookies:
+
+```python
+from typing import Annotated
+
+from chano import JSONResponse, Status
+
+
+def POST(item: Item) -> Annotated[JSONResponse[Item], Status(201)]:
+    response = JSONResponse(item, status_code=201, headers={"X-Request-Id": "1"})
+    response.set_cookie("session", "abc123")
+    return response
+```
 
 ## Cookies
 
@@ -102,42 +116,71 @@ Schedules a sync or async callable to run after the HTTP response finishes sendi
 ## `Representation`
 
 ```python
-from chano import JSONRepresentation, Representation
+from chano import (
+    JSONRepresentation,
+    Raw,
+    Representation,
+    Status,
+    StatusRepresentation,
+    raises,
+    representation,
+    status_code,
+)
+from chano.status import Created, NoContent, NotFound
 ```
 
-`Representation` is a `typing.Protocol` that pairs runtime response and error rendering with the matching OpenAPI schema transformations for a route subtree (via [`representation.py`](/reference/routing#representation-py)) or a single route (via `Chano.add_route(..., representation=...)`).
+`Representation` is a `typing.Protocol` that pairs status- and type-keyed wire rendering with matching OpenAPI schema transformations for a route subtree (via [`representation.py`](/reference/routing#representation-py)), a single route (via `Chano.add_route(..., representation=...)`), or an individual handler (via `Annotated[T, MyRep()]` / `@representation(MyRep())`).
 
 | Member | Type / Signature | Role |
 | --- | --- | --- |
-| `media_type` | `str` | OpenAPI content key for `200` success responses |
-| `error_media_type` | `str` | OpenAPI content key for `422` and `@raises` error responses |
-| `success_type(returns)` | `(Any) -> Any` | Maps a handler's return annotation to the wire body annotation used for the `200` OpenAPI schema |
-| `success(request, value)` | `(Request, Any) -> Response \| Awaitable[Response]` | Renders a non-`Response` handler return value into a `Response` |
-| `error_type(status_code)` | `(int) -> Any` | Returns the error body annotation for `status_code`, or `None` for a bodyless OpenAPI response |
-| `error(request, exc)` | `(Request, Exception) -> Response \| Awaitable[Response]` | Renders an uncaught endpoint exception into a `Response` |
+| `response_type` | `type[Response] \| tuple[type[Response], ...]` | `Response` subclass(es) handled by this representation |
+| `media_type(status_code)` | `(int) -> str` | OpenAPI content key for responses with `status_code` |
+| `body_type(status_code, returns)` | `(int, Any) -> Any` | Maps an unwrapped payload annotation (for `< 400`) or `None` (for `>= 400`) to the wire body annotation used in OpenAPI, or `None` for a bodyless response |
+| `render(request, value, status_code)` | `(Request, Any, int) -> Response \| Awaitable[Response]` | Renders a matching payload value or uncaught endpoint exception into a `Response` for `status_code` |
 
 ### Sync and async calls
 
-`success` and `error` may be sync or async: Chano calls them directly and awaits the result if it is awaitable. Returning anything other than a `Response` raises `TypeError` naming the representation.
+`render` may be sync or async: Chano calls it directly and awaits the result if it is awaitable. Returning anything other than a `Response` raises `TypeError` naming the representation.
 
-`error` receives every endpoint exception, including unexpected ones. `JSONRepresentation.error` logs their traceback to `stderr`; an `error` that handles them itself must log them, or they are lost.
+When an uncaught endpoint exception reaches the fallback past `error.py`, Chano derives `status_code` (`exc.status_code` for `HTTPException`, `422` for `RequestValidationError`, `500` otherwise) and calls `render(request, exc, status_code)`. `JSONRepresentation.render` logs unexpected exception tracebacks to `stderr`; a custom `render` that handles unexpected exceptions itself must log them, or they are lost.
 
 ### `JSONRepresentation`
 
-`JSONRepresentation` is a concrete default implementation matching Chano's built-in wire format (`JSONResponse` for success, `error_response` for errors) so you can subclass it and override only the success half or only the error half:
+`JSONRepresentation` is a concrete default implementation matching Chano's built-in wire format (`JSONResponse` for payload values, `error_response` for exceptions):
 
-- `media_type` and `error_media_type` are `"application/json"`.
-- `success_type(returns)` returns `returns` unchanged; `success(request, value)` returns `JSONResponse(value)`.
-- `error_type(status_code)` returns `ValidationErrorDetail` (`{"detail": [{"loc": [...], "msg": "..."}]}`) for `422` and `ErrorDetail` (`{"detail": Any}`) for other statuses; `error(request, exc)` delegates to `error_response(exc)`.
+- `response_type` defaults to `JSONResponse`.
+- `media_type(status_code)` returns `"application/json"`.
+- `body_type(status_code, returns)` returns `returns` for `status_code < 400`, `ValidationErrorDetail` (`{"detail": [{"loc": [...], "msg": "..."}]}`) for `422`, and `ErrorDetail` (`{"detail": Any}`) for other `>= 400` statuses.
+- `render(request, value, status_code)` delegates `Exception` values to `error_response(value)` (logging unexpected tracebacks to `stderr`) and returns `JSONResponse(value, status_code=status_code)` for non-exception values.
+
+### `StatusRepresentation`
+
+`StatusRepresentation(routes, *, default=JSONRepresentation())` composes separate representations by HTTP status code without coupling them:
+
+```python
+from chano import StatusRepresentation
+
+representation = StatusRepresentation(
+    {
+        range(200, 400): Envelope(),
+        range(400, 600): ProblemJSON(),
+    }
+)
+```
+
+- Keys in `routes` may be `int`, `range`, or any `Container[int]` (such as `frozenset` or `tuple`), checked in insertion order.
+- `response_type` is the union tuple of all child `response_type`s (or `JSONResponse` if empty); runtime and OpenAPI matching check the resolved child's `response_type` for each `status_code`.
+- Unmatched statuses delegate to `default` (`JSONRepresentation()` by default, or `None` to fall back to Chano's default wire/OpenAPI behavior).
 
 ### Runtime and OpenAPI behavior
 
-- **Explicit `Response` bypass**: if a handler returns a `Response` instance directly, `representation.success` is skipped. In OpenAPI, `200` only uses `media_type` and `success_type(returns)` when the handler has a return annotation that is neither `None` nor a `Response` subclass.
-- **Error order and fallback**: [`error.py`](/reference/routing#error-py) handlers run first, leaf-to-root. `representation.error` replaces `error_response` only as the final fallback past the root `error.py`. Exceptions raised by `representation.success` flow through `error.py` like any handler error. If `representation.error` raises or returns a non-`Response`, Chano falls back to `error_response` for that new exception so a broken representation still produces a response.
-- **OpenAPI error responses**: for routes with a representation, `422` (when the endpoint has request inputs) and every status declared with `@raises` use `error_media_type` and `error_type(status)`, keeping each `@raises` description. Returning `None` from `error_type(status)` leaves that status without a response body.
-- **Unchanged default**: routes without a representation keep the built-in wire format and exact default OpenAPI output.
+- **Type-keyed matching and passthrough**: non-`Response` handler returns are treated as implicit `JSONResponse` (matching any representation whose `response_type` for that status includes `JSONResponse`, or falling back to `JSONResponse` otherwise). When a handler returns an explicit `Response` matching the active representation's `response_type` (for example `JSONResponse(item, status_code=201, headers=...)` with cookies), Chano passes `(request, result.content, result.status_code)` to `representation.render` without eager JSON encoding, preserving `status_code`, custom headers (without clobbering representation-owned `content-length` or default `content-type`), and `set-cookie` headers. Non-matching `Response` subclasses (`RedirectResponse`, `HTMLResponse`, `PlainTextResponse`, `StreamingResponse`, `SSEResponse`, raw `Response`) pass through untouched. In OpenAPI, generic `JSONResponse[T]` / `Response[T]` unwrap `T` before `body_type(status, T)` runs.
+- **Unified `Annotated` return metadata, `chano.status`, and decorators**: `Status(code, *, description=None)`, a `Representation` instance, and the `Raw` opt-out sentinel all live in return `Annotated[T, ...]` annotations—supporting unions (such as `Annotated[Item, Status(201)] | Annotated[Job, Status(202)]`), Python 3.12 `TypeAliasType` aliases from `chano.status` (`OK[T]`, `Created[T]`, `Accepted[T]`, `NoContent`, `NotModified`, redirects, `BadRequest[T]`, `Unauthorized[T]`, `Forbidden[T]`, `NotFound[T]`, `Conflict[T]`, `Gone[T]`, `UnprocessableContent[T]`, `TooManyRequests[T]`, `InternalServerError[T]`, `BadGateway[T]`, `ServiceUnavailable[T]`, etc.), and bodyless statuses (`204`, `205`, `304` with `None`, which omit response bodies and OpenAPI `content`). `Status` requires a final HTTP status code (`200`–`599`, rejecting `1xx`). `Status` with `code < 400` binds to the return branch (an unambiguous single `< 400` `Status` sets the runtime status code for plain non-`Response` returns, while explicit `Response.status_code` overrides still win; returning a plain non-`Response` value when multiple distinct `< 400` statuses are declared raises `TypeError`). `Status` with `code >= 400` is additive error metadata (so `NotFound[Item]` means `200 Item` + `404`, and `Created[NotFound[Item]]` means `201 Item` + `404`), and only `>= 400` statuses propagate from `Depends(...)` callables and `dependencies.py` checks. `@status_code(...)`, `@raises(code, description)` (attaching `Status(code, description=description)`), and `@representation(...)` are thin decorator sugar wrapping the function's return annotation in `Annotated[...]` (with `@representation(None)` or `@representation(Raw)` opting out of `representation.py`).
+- **Error order and fallback**: [`error.py`](/reference/routing#error-py) handlers run first, leaf-to-root. The handler's active representation (`@representation(...)` / `Annotated[..., Rep()]`, or `None` for `Raw`, else `representation.py`) runs `render(request, exc, status_code)` only as the final fallback past the root `error.py`. Exceptions raised by `representation.render` during normal return rendering or body serialization flow through `error.py` like any handler error. If error `representation.render` raises or returns a non-`Response`, Chano falls back to `error_response` for that new exception so a broken representation still produces a response.
+- **OpenAPI error responses**: for routes with an active representation, `422` (when the endpoint has request inputs) and every `>= 400` status declared with `Status` / `chano.status` / `@raises` call `media_type(status)` and `body_type(status, None)`, keeping each description. Returning `None` from `body_type(status, None)` leaves that status without a response body.
+- **Unchanged default**: routes without an active representation keep the built-in wire format and exact default OpenAPI output.
 
 ### Limitations
 
 - Unmatched-path `404` responses and exceptions raised inside `middleware.py` still use Chano's default error mapping rather than a route's representation.
-- `@raises` continues to declare `(status, description)` pairs rather than exception classes, and return-union error types are not modeled.
+- `>= 400` `Status` / `@raises` declare `(status, description)` pairs rather than exception classes.

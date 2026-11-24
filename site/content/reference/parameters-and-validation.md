@@ -210,7 +210,7 @@ def GET(item_id: int):
     raise HTTPException(404, "Item not found")
 ```
 
-- Documents an error response (`400` to `599`) in `openapi.json` for a handler or dependency.
+- Documents an error response (`400` to `599`) in `openapi.json` for a handler or dependency (thin decorator sugar attaching `Status(status_code, description=description)` to the return annotation, equivalent to `Annotated[T, Status(...)]` or `chano.status` aliases like `NotFound[T]`).
 - Documentation-only: runtime code must still raise `HTTPException`.
 - When stacked or inherited from dependencies, handler declarations take precedence over direct dependencies, which take precedence over inherited checks.
 

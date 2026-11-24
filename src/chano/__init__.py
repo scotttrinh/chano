@@ -2,9 +2,18 @@ from chano.app import Chano, after
 from chano.config import ChanoConfig, WorkflowConfig, load_config
 from chano.exceptions import HTTPException, RequestValidationError
 from chano.openapi import openapi
-from chano.params import Body, Cookie, Depends, Header, Query, lazy, raises
+from chano.params import Body, Cookie, Depends, Header, Query, lazy
 from chano.queues import create_queue_app, invoke_queue
-from chano.representation import JSONRepresentation, Representation
+from chano.representation import (
+    JSONRepresentation,
+    Raw,
+    Representation,
+    Status,
+    StatusRepresentation,
+    raises,
+    representation,
+    status_code,
+)
 from chano.requests import Geo, Request
 from chano.responses import (
     HTMLResponse,
@@ -23,19 +32,20 @@ from chano.workflows import create_workflow_flow_app, create_workflow_step_app
 
 __all__ = [
     "Body",
+    "Chano",
+    "ChanoConfig",
     "Cookie",
     "Depends",
     "Geo",
     "HTMLResponse",
     "HTTPBearer",
     "HTTPException",
-    "Chano",
-    "ChanoConfig",
     "Header",
     "JSONRepresentation",
     "JSONResponse",
     "PlainTextResponse",
     "Query",
+    "Raw",
     "RedirectResponse",
     "Representation",
     "Request",
@@ -43,6 +53,8 @@ __all__ = [
     "Response",
     "SSEResponse",
     "ServerSentEvent",
+    "Status",
+    "StatusRepresentation",
     "StreamingResponse",
     "WorkflowConfig",
     "after",
@@ -58,4 +70,6 @@ __all__ = [
     "load_config",
     "openapi",
     "raises",
+    "representation",
+    "status_code",
 ]

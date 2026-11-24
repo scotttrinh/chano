@@ -30,16 +30,22 @@ from chano import (
     Depends,
     Geo,
     Header,
+    HTMLResponse,
     HTTPBearer,
     HTTPException,
     JSONRepresentation,
     JSONResponse,
+    PlainTextResponse,
     Query,
+    Raw,
+    RedirectResponse,
     Representation,
     Request,
     Response,
     ServerSentEvent,
     SSEResponse,
+    Status,
+    StatusRepresentation,
     StreamingResponse,
     create_app,
     create_route_app,
@@ -47,6 +53,8 @@ from chano import (
     load_config,
     openapi,
     raises,
+    representation,
+    status_code,
 )
 from chano import build as build_module
 from chano import params as params_module
@@ -5977,7 +5985,7 @@ def test_pydantic_response_and_sse_serialization():
     }
 
     with pytest.raises(TypeError):
-        JSONResponse(object())
+        _ = JSONResponse(object()).body
 
 
 # @lat: [[tests#Pydantic responses and OpenAPI#Dev and build OpenAPI schemas]]
@@ -6986,36 +6994,46 @@ def test_representation_problem_json(tmp_path, isolated_imports, factory):
                 "    detail: Any = None\n"
                 "    instance: str | None = None\n\n"
                 "class ProblemJSON(JSONRepresentation):\n"
-                "    error_media_type = 'application/problem+json'\n\n"
-                "    def error_type(self, status_code: int) -> Any:\n"
-                "        if status_code == 410:\n"
-                "            return None\n"
-                "        return ProblemDetail\n\n"
-                "    def error(self, request: Request, exc: Exception) -> Response:\n"
-                "        if isinstance(exc, HTTPException):\n"
+                "    def media_type(self, status_code: int) -> str:\n"
+                "        if status_code >= 400:\n"
+                "            return 'application/problem+json'\n"
+                "        return 'application/json'\n\n"
+                "    def body_type(self, status_code: int, returns: Any) -> Any:\n"
+                "        if status_code >= 400:\n"
+                "            if status_code == 410:\n"
+                "                return None\n"
+                "            return ProblemDetail\n"
+                "        return returns\n\n"
+                "    def render(\n"
+                "        self, request: Request, value: Any, status_code: int\n"
+                "    ) -> Response:\n"
+                "        if not isinstance(value, Exception):\n"
+                "            return super().render(request, value, status_code)\n"
+                "        mt = self.media_type(status_code)\n"
+                "        if isinstance(value, HTTPException):\n"
                 "            problem = ProblemDetail(\n"
                 "                title='HTTP Error',\n"
-                "                status=exc.status_code,\n"
-                "                detail=exc.detail,\n"
+                "                status=value.status_code,\n"
+                "                detail=value.detail,\n"
                 "                instance=request.path,\n"
                 "            )\n"
                 "            return Response(\n"
                 "                msgspec.json.encode(problem),\n"
-                "                status_code=exc.status_code,\n"
-                "                headers=exc.headers,\n"
-                "                media_type=self.error_media_type,\n"
+                "                status_code=value.status_code,\n"
+                "                headers=value.headers,\n"
+                "                media_type=mt,\n"
                 "            )\n"
-                "        if isinstance(exc, RequestValidationError):\n"
+                "        if isinstance(value, RequestValidationError):\n"
                 "            problem = ProblemDetail(\n"
                 "                title='Validation Error',\n"
                 "                status=422,\n"
-                "                detail=exc.errors,\n"
+                "                detail=value.errors,\n"
                 "                instance=request.path,\n"
                 "            )\n"
                 "            return Response(\n"
                 "                msgspec.json.encode(problem),\n"
                 "                status_code=422,\n"
-                "                media_type=self.error_media_type,\n"
+                "                media_type=mt,\n"
                 "            )\n"
                 "        problem = ProblemDetail(\n"
                 "            title='Internal Server Error',\n"
@@ -7025,7 +7043,7 @@ def test_representation_problem_json(tmp_path, isolated_imports, factory):
                 "        return Response(\n"
                 "            msgspec.json.encode(problem),\n"
                 "            status_code=500,\n"
-                "            media_type=self.error_media_type,\n"
+                "            media_type=mt,\n"
                 "        )\n\n"
                 "representation = ProblemJSON()\n"
             ),
@@ -7063,7 +7081,7 @@ def test_representation_problem_json(tmp_path, isolated_imports, factory):
     assert ok.headers["content-type"] == "application/json"
     assert ok.json() == {"id": 7, "name": "widget"}
 
-    # Explicit Response bypasses representation.success.
+    # Explicit Response bypasses representation.render.
     deleted = client("DELETE", "/items/7")
     assert deleted.status_code == 200
     assert deleted.headers["content-type"].startswith("text/plain")
@@ -7131,7 +7149,7 @@ def test_representation_problem_json(tmp_path, isolated_imports, factory):
                 }
             },
         }
-        # error_type(410) returned None -> bodyless response keeping @raises text.
+        # body_type(410, None) returned None -> bodyless response keeping @raises text.
         assert get_op["responses"]["410"] == {"description": "Item gone"}
         assert "ProblemDetail" in spec["components"]["schemas"]
 
@@ -7153,13 +7171,23 @@ def test_representation_envelope_generic_struct(tmp_path, isolated_imports, fact
                 "class Document[T](msgspec.Struct):\n"
                 "    data: T\n\n"
                 "class EnvelopeRepresentation(JSONRepresentation):\n"
-                "    media_type = 'application/vnd.api+json'\n\n"
-                "    def success_type(self, returns: Any) -> Any:\n"
-                "        return Document[returns]\n\n"
-                "    def success(self, request: Request, value: Any) -> Response:\n"
+                "    def media_type(self, status_code: int) -> str:\n"
+                "        if status_code < 400:\n"
+                "            return 'application/vnd.api+json'\n"
+                "        return super().media_type(status_code)\n\n"
+                "    def body_type(self, status_code: int, returns: Any) -> Any:\n"
+                "        if status_code < 400:\n"
+                "            return Document[returns]\n"
+                "        return super().body_type(status_code, returns)\n\n"
+                "    def render(\n"
+                "        self, request: Request, value: Any, status_code: int\n"
+                "    ) -> Response:\n"
+                "        if status_code >= 400 or isinstance(value, Exception):\n"
+                "            return super().render(request, value, status_code)\n"
                 "        return Response(\n"
                 "            msgspec.json.encode(Document(data=value)),\n"
-                "            media_type=self.media_type,\n"
+                "            status_code=status_code,\n"
+                "            media_type=self.media_type(status_code),\n"
                 "        )\n\n"
                 "representation = EnvelopeRepresentation()\n"
             ),
@@ -7213,7 +7241,7 @@ def test_representation_envelope_generic_struct(tmp_path, isolated_imports, fact
         assert doc_schema["properties"]["data"] == {"$ref": "#/components/schemas/Item"}
         assert "Item" in spec["components"]["schemas"]
 
-        # Inherited JSONRepresentation.error_type documents 422 and @raises.
+        # Inherited JSONRepresentation.body_type documents 422 and @raises.
         assert get_op["responses"]["422"]["content"] == {
             "application/json": {
                 "schema": {"$ref": "#/components/schemas/ValidationErrorDetail"}
@@ -7246,13 +7274,23 @@ def test_representation_nearest_wins_and_default(tmp_path, isolated_imports, fac
                 "    Response,\n"
                 ")\n\n"
                 "class V1Rep(JSONRepresentation):\n"
-                "    media_type = 'application/vnd.v1+json'\n\n"
-                "    def success_type(self, returns: Any) -> Any:\n"
-                "        return dict[str, Any]\n\n"
-                "    def success(self, request: Request, value: Any) -> Response:\n"
+                "    def media_type(self, status_code: int) -> str:\n"
+                "        if status_code < 400:\n"
+                "            return 'application/vnd.v1+json'\n"
+                "        return super().media_type(status_code)\n\n"
+                "    def body_type(self, status_code: int, returns: Any) -> Any:\n"
+                "        if status_code < 400:\n"
+                "            return dict[str, Any]\n"
+                "        return super().body_type(status_code, returns)\n\n"
+                "    def render(\n"
+                "        self, request: Request, value: Any, status_code: int\n"
+                "    ) -> Response:\n"
+                "        if status_code >= 400 or isinstance(value, Exception):\n"
+                "            return super().render(request, value, status_code)\n"
                 "        return JSONResponse(\n"
                 "            {'version': 'v1', 'payload': value},\n"
-                "            headers={'content-type': self.media_type},\n"
+                "            status_code=status_code,\n"
+                "            headers={'content-type': self.media_type(status_code)},\n"
                 "        )\n\n"
                 "representation = V1Rep()\n"
             ),
@@ -7265,13 +7303,23 @@ def test_representation_nearest_wins_and_default(tmp_path, isolated_imports, fac
                 "    Response,\n"
                 ")\n\n"
                 "class V2Rep(JSONRepresentation):\n"
-                "    media_type = 'application/vnd.v2+json'\n\n"
-                "    def success_type(self, returns: Any) -> Any:\n"
-                "        return dict[str, Any]\n\n"
-                "    def success(self, request: Request, value: Any) -> Response:\n"
+                "    def media_type(self, status_code: int) -> str:\n"
+                "        if status_code < 400:\n"
+                "            return 'application/vnd.v2+json'\n"
+                "        return super().media_type(status_code)\n\n"
+                "    def body_type(self, status_code: int, returns: Any) -> Any:\n"
+                "        if status_code < 400:\n"
+                "            return dict[str, Any]\n"
+                "        return super().body_type(status_code, returns)\n\n"
+                "    def render(\n"
+                "        self, request: Request, value: Any, status_code: int\n"
+                "    ) -> Response:\n"
+                "        if status_code >= 400 or isinstance(value, Exception):\n"
+                "            return super().render(request, value, status_code)\n"
                 "        return JSONResponse(\n"
                 "            {'version': 'v2', 'payload': value},\n"
-                "            headers={'content-type': self.media_type},\n"
+                "            status_code=status_code,\n"
+                "            headers={'content-type': self.media_type(status_code)},\n"
                 "        )\n\n"
                 "representation = V2Rep()\n"
             ),
@@ -7374,21 +7422,30 @@ def test_representation_error_boundary_order(tmp_path, isolated_imports, factory
                 "    Response,\n"
                 ")\n\n"
                 "class Rep(JSONRepresentation):\n"
-                "    error_media_type = 'application/problem+json'\n\n"
-                "    def success(self, request: Request, value):\n"
+                "    def media_type(self, status_code: int) -> str:\n"
+                "        if status_code >= 400:\n"
+                "            return 'application/problem+json'\n"
+                "        return 'application/json'\n\n"
+                "    def render(\n"
+                "        self, request: Request, value, status_code: int\n"
+                "    ) -> Response:\n"
+                "        if isinstance(value, Exception):\n"
+                "            payload = {\n"
+                "                'by': 'representation',\n"
+                "                'type': type(value).__name__,\n"
+                "                'msg': str(value),\n"
+                "            }\n"
+                "            return JSONResponse(\n"
+                "                payload,\n"
+                "                status_code=502,\n"
+                "                headers={\n"
+                "                    'content-type': self.media_type(status_code),\n"
+                "                },\n"
+                "            )\n"
                 "        if value == 'bad-success':\n"
                 "            raise ValueError('success failed')\n"
-                "        return JSONResponse({'ok': value})\n\n"
-                "    def error(self, request: Request, exc: Exception) -> Response:\n"
-                "        payload = {\n"
-                "            'by': 'representation',\n"
-                "            'type': type(exc).__name__,\n"
-                "            'msg': str(exc),\n"
-                "        }\n"
                 "        return JSONResponse(\n"
-                "            payload,\n"
-                "            status_code=502,\n"
-                "            headers={'content-type': self.error_media_type},\n"
+                "            {'ok': value}, status_code=status_code\n"
                 "        )\n\n"
                 "representation = Rep()\n"
             ),
@@ -7431,7 +7488,7 @@ def test_representation_error_boundary_order(tmp_path, isolated_imports, factory
         "msg": "handler failed",
     }
 
-    # Re-raising in error.py falls through to representation.error.
+    # Re-raising in error.py falls through to representation.render.
     reraised = client("GET", "/?mode=boom")
     assert reraised.status_code == 502
     assert reraised.headers["content-type"] == "application/problem+json"
@@ -7441,7 +7498,7 @@ def test_representation_error_boundary_order(tmp_path, isolated_imports, factory
         "msg": "handler failed",
     }
 
-    # Replacing the exception in error.py sends it to representation.error.
+    # Replacing the exception in error.py sends it to representation.render.
     replaced = client("GET", "/?mode=boom&replace=1")
     assert replaced.status_code == 502
     assert replaced.json() == {
@@ -7450,7 +7507,7 @@ def test_representation_error_boundary_order(tmp_path, isolated_imports, factory
         "msg": "409: replaced by error.py",
     }
 
-    # An exception raised by representation.success enters error.py first.
+    # An exception raised by representation.render enters error.py first.
     success_err_caught = client("GET", "/?mode=bad-success&catch=1")
     assert success_err_caught.status_code == 418
     assert success_err_caught.json() == {
@@ -7475,23 +7532,45 @@ def test_representation_error_boundary_order(tmp_path, isolated_imports, factory
         "representation = 123\n",
         "from chano import JSONRepresentation\nrepresentation = JSONRepresentation\n",
         (
+            "from chano import JSONResponse\n"
             "class Bad:\n"
-            "    media_type = 123\n"
-            "    error_media_type = 'application/json'\n"
-            "    def success_type(self, r): return r\n"
-            "    def success(self, req, val): ...\n"
-            "    def error_type(self, code): return None\n"
-            "    def error(self, req, exc): ...\n"
+            "    media_type = 'application/json'\n"
+            "    response_type = JSONResponse\n"
+            "    def body_type(self, code, r): return r\n"
+            "    def render(self, req, val, code): ...\n"
+            "representation = Bad()\n"
+        ),
+        (
+            "from chano import JSONResponse\n"
+            "class Bad:\n"
+            "    response_type = JSONResponse\n"
+            "    def media_type(self, code): return 'application/json'\n"
+            "    body_type = 'not-callable'\n"
+            "    def render(self, req, val, code): ...\n"
             "representation = Bad()\n"
         ),
         (
             "class Bad:\n"
-            "    media_type = 'application/json'\n"
-            "    error_media_type = 'application/json'\n"
-            "    success_type = 'not-callable'\n"
-            "    def success(self, req, val): ...\n"
-            "    def error_type(self, code): return None\n"
-            "    def error(self, req, exc): ...\n"
+            "    def media_type(self, code): return 'application/json'\n"
+            "    def body_type(self, code, r): return r\n"
+            "    def render(self, req, val, code): ...\n"
+            "representation = Bad()\n"
+        ),
+        (
+            "class Bad:\n"
+            "    response_type = int\n"
+            "    def media_type(self, code): return 'application/json'\n"
+            "    def body_type(self, code, r): return r\n"
+            "    def render(self, req, val, code): ...\n"
+            "representation = Bad()\n"
+        ),
+        (
+            "from chano import JSONResponse\n"
+            "class Bad:\n"
+            "    response_type = (JSONResponse, int)\n"
+            "    def media_type(self, code): return 'application/json'\n"
+            "    def body_type(self, code, r): return r\n"
+            "    def render(self, req, val, code): ...\n"
             "representation = Bad()\n"
         ),
     ],
@@ -7538,24 +7617,24 @@ def test_representation_invalid_and_conflicting(tmp_path, isolated_imports, sour
 # @lat: [[tests#Representations#Broken representation error and non-Response fallback]]
 def test_representation_broken_fallback(capsys):
     class RaisingErrorRep(JSONRepresentation):
-        def error(self, request: Request, exc: Exception) -> Response:
-            raise RuntimeError("error renderer crashed")
+        def render(self, request: Request, value: Any, status_code: int) -> Response:
+            if isinstance(value, Exception):
+                raise RuntimeError("error renderer crashed")
+            return super().render(request, value, status_code)
 
     class NonResponseRep(JSONRepresentation):
-        def success(self, request: Request, value: Any) -> Any:
+        def render(self, request: Request, value: Any, status_code: int) -> Any:
+            if isinstance(value, Exception):
+                return "not a response"
             return {"not": "a response"}
 
-        def error(self, request: Request, exc: Exception) -> Any:
-            return "not a response"
-
     class NonResponseSuccessRep(JSONRepresentation):
-        def success(self, request: Request, value: Any) -> Any:
+        def render(self, request: Request, value: Any, status_code: int) -> Any:
+            if isinstance(value, Exception):
+                return JSONResponse(
+                    {"type": type(value).__name__, "msg": str(value)}, status_code=500
+                )
             return 42
-
-        def error(self, request: Request, exc: Exception) -> Response:
-            return JSONResponse(
-                {"type": type(exc).__name__, "msg": str(exc)}, status_code=500
-            )
 
     def fail():
         raise HTTPException(404, "missing")
@@ -7571,22 +7650,22 @@ def test_representation_broken_fallback(capsys):
     )
     client = make_client(app)
 
-    # Raising inside representation.error falls back to error_response (500).
+    # Raising inside error representation.render falls back to error_response (500).
     res1 = client("GET", "/raise")
     assert res1.status_code == 500
     assert res1.text == "Internal Server Error"
     err1 = capsys.readouterr().err
     assert "error renderer crashed" in err1
 
-    # Non-Response from representation.success raises TypeError naming the
-    # representation and passes into representation.error.
+    # Non-Response from normal representation.render raises TypeError naming the
+    # representation and passes into error representation.render.
     res2 = client("GET", "/nonresp-success")
     assert res2.status_code == 500
     body2 = res2.json()
     assert body2["type"] == "TypeError"
     assert "NonResponseSuccessRep" in body2["msg"]
 
-    # Non-Response from representation.error raises TypeError naming the
+    # Non-Response from error representation.render raises TypeError naming the
     # representation and falls back to error_response (500).
     res3 = client("GET", "/nonresp")
     assert res3.status_code == 500
@@ -7608,17 +7687,20 @@ def test_representation_sync_and_async(tmp_path, isolated_imports, factory):
                 "from typing import Any\n"
                 "from chano import JSONResponse, Request, Response\n\n"
                 "class SyncRep:\n"
-                "    media_type = 'application/json'\n"
-                "    error_media_type = 'application/json'\n"
-                "    def success_type(self, returns: Any) -> Any:\n"
-                "        return returns\n"
-                "    def success(self, request: Request, value: Any) -> Response:\n"
-                "        return JSONResponse({'mode': 'sync', 'value': value})\n"
-                "    def error_type(self, status_code: int) -> Any:\n"
-                "        return dict[str, Any]\n"
-                "    def error(self, request: Request, exc: Exception) -> Response:\n"
+                "    response_type = JSONResponse\n"
+                "    def media_type(self, status_code: int) -> str:\n"
+                "        return 'application/json'\n"
+                "    def body_type(self, status_code: int, returns: Any) -> Any:\n"
+                "        return dict[str, Any] if status_code >= 400 else returns\n"
+                "    def render(\n"
+                "        self, request: Request, value: Any, status_code: int\n"
+                "    ) -> Response:\n"
+                "        if isinstance(value, Exception):\n"
+                "            return JSONResponse(\n"
+                "                {'mode': 'sync', 'err': str(value)}, status_code\n"
+                "            )\n"
                 "        return JSONResponse(\n"
-                "            {'mode': 'sync', 'err': str(exc)}, 400\n"
+                "            {'mode': 'sync', 'value': value}, status_code\n"
                 "        )\n\n"
                 "representation = SyncRep()\n"
             ),
@@ -7639,17 +7721,16 @@ def test_representation_sync_and_async(tmp_path, isolated_imports, factory):
                 "    Response,\n"
                 ")\n\n"
                 "class AsyncRep(JSONRepresentation):\n"
-                "    async def success(\n"
-                "        self, request: Request, value: Any\n"
+                "    async def render(\n"
+                "        self, request: Request, value: Any, status_code: int\n"
                 "    ) -> Response:\n"
                 "        await asyncio.sleep(0)\n"
-                "        return JSONResponse({'mode': 'async', 'value': value})\n"
-                "    async def error(\n"
-                "        self, request: Request, exc: Exception\n"
-                "    ) -> Response:\n"
-                "        await asyncio.sleep(0)\n"
+                "        if isinstance(value, Exception):\n"
+                "            return JSONResponse(\n"
+                "                {'mode': 'async', 'err': str(value)}, status_code\n"
+                "            )\n"
                 "        return JSONResponse(\n"
-                "            {'mode': 'async', 'err': str(exc)}, 400\n"
+                "            {'mode': 'async', 'value': value}, status_code\n"
                 "        )\n\n"
                 "representation = AsyncRep()\n"
             ),
@@ -7704,16 +7785,23 @@ def test_representation_build_trace_roots(tmp_path, isolated_imports, monkeypatc
                 "class Problem(msgspec.Struct):\n"
                 "    detail: str\n\n"
                 "class ApiRep(JSONRepresentation):\n"
-                "    error_media_type = 'application/problem+json'\n"
-                "    def error_type(self, status_code: int) -> Any:\n"
-                "        return Problem\n"
-                "    def error(self, request: Request, exc: Exception) -> Response:\n"
-                "        import rep_pkg\n"
-                "        return Response(\n"
-                "            msgspec.json.encode(Problem(detail=str(exc))),\n"
-                "            status_code=500,\n"
-                "            media_type=self.error_media_type,\n"
-                "        )\n\n"
+                "    def media_type(self, status_code: int) -> str:\n"
+                "        if status_code >= 400:\n"
+                "            return 'application/problem+json'\n"
+                "        return 'application/json'\n"
+                "    def body_type(self, status_code: int, returns: Any) -> Any:\n"
+                "        return Problem if status_code >= 400 else returns\n"
+                "    def render(\n"
+                "        self, request: Request, value: Any, status_code: int\n"
+                "    ) -> Response:\n"
+                "        if isinstance(value, Exception):\n"
+                "            import rep_pkg\n"
+                "            return Response(\n"
+                "                msgspec.json.encode(Problem(detail=str(value))),\n"
+                "                status_code=500,\n"
+                "                media_type=self.media_type(status_code),\n"
+                "            )\n"
+                "        return super().render(request, value, status_code)\n\n"
                 "representation = ApiRep()\n"
             ),
             "app/(api)/items/route.py": (
@@ -7756,3 +7844,1965 @@ def test_representation_build_trace_roots(tmp_path, isolated_imports, monkeypatc
 
     assert bundled("items") == {"chano", "vercel-runtime", "rep-pkg"}
     assert bundled("public") == {"chano", "vercel-runtime"}
+
+
+# @lat: [[tests#Representations#Type-keyed representations and Response passthrough]]
+def test_type_keyed_representation_and_passthrough():
+    class Envelope[T](msgspec.Struct):
+        data: T
+
+    class Item(msgspec.Struct):
+        id: int
+
+    class EnvelopeRep(JSONRepresentation):
+        def media_type(self, status_code: int) -> str:
+            if status_code < 400:
+                return "application/vnd.api+json"
+            return super().media_type(status_code)
+
+        def body_type(self, status_code: int, returns: Any) -> Any:
+            if status_code < 400:
+                return Envelope[returns]
+            return super().body_type(status_code, returns)
+
+        def render(
+            self, request: Request, value: Any, status_code: int
+        ) -> Response[Any]:
+            if status_code >= 400 or isinstance(value, Exception):
+                return super().render(request, value, status_code)
+            return Response(
+                msgspec.json.encode(Envelope(data=value)),
+                status_code=status_code,
+                media_type=self.media_type(status_code),
+                headers={"x-rep": "envelope"},
+            )
+
+    class HTMLRep(JSONRepresentation):
+        response_type = HTMLResponse
+
+        def media_type(self, status_code: int) -> str:
+            return "text/html" if status_code < 400 else super().media_type(status_code)
+
+        def body_type(self, status_code: int, returns: Any) -> Any:
+            if status_code < 400:
+                return returns
+            return super().body_type(status_code, returns)
+
+        def render(
+            self, request: Request, value: Any, status_code: int
+        ) -> Response[Any]:
+            if status_code >= 400 or isinstance(value, Exception):
+                return super().render(request, value, status_code)
+            return HTMLResponse(
+                f"<main>{value}</main>",
+                status_code=status_code,
+                headers={"x-rep": "html"},
+            )
+
+    class MultiRep(JSONRepresentation):
+        response_type = (JSONResponse, PlainTextResponse)
+
+        def media_type(self, status_code: int) -> str:
+            if status_code < 400:
+                return "text/plain"
+            return super().media_type(status_code)
+
+        def render(
+            self, request: Request, value: Any, status_code: int
+        ) -> Response[Any]:
+            if status_code >= 400 or isinstance(value, Exception):
+                return super().render(request, value, status_code)
+            return PlainTextResponse(f"wrapped:{value}", status_code=status_code)
+
+    def plain() -> Item:
+        return Item(id=1)
+
+    def redirect() -> RedirectResponse:
+        return RedirectResponse("/dest", status_code=302)
+
+    def html() -> HTMLResponse[str]:
+        return HTMLResponse("<p>hi</p>")
+
+    def text() -> PlainTextResponse[str]:
+        return PlainTextResponse("hello")
+
+    def stream() -> StreamingResponse:
+        return StreamingResponse(iter([b"a", b"b"]), media_type="text/plain")
+
+    def sse() -> SSEResponse:
+        return SSEResponse(["tick"])
+
+    def raw_resp() -> Response[bytes]:
+        return Response(b"raw", media_type="application/octet-stream")
+
+    app = Chano(docs=False)
+    rep = EnvelopeRep()
+    app.add_route("/plain", plain, ["GET"], representation=rep)
+    app.add_route("/redirect", redirect, ["GET"], representation=rep)
+    app.add_route("/html", html, ["GET"], representation=rep)
+    app.add_route("/text", text, ["GET"], representation=rep)
+    app.add_route("/stream", stream, ["GET"], representation=rep)
+    app.add_route("/sse", sse, ["GET"], representation=rep)
+    app.add_route("/raw", raw_resp, ["GET"], representation=rep)
+
+    # HTML-keyed representation: plain returns fall back to JSONResponse;
+    # HTMLResponse matches; JSONResponse passes through untouched.
+    html_rep = HTMLRep()
+    app.add_route("/html-plain", plain, ["GET"], representation=html_rep)
+    app.add_route("/html-page", html, ["GET"], representation=html_rep)
+    app.add_route(
+        "/html-json",
+        lambda: JSONResponse({"raw": True}, status_code=201),
+        ["GET"],
+        representation=html_rep,
+    )
+
+    # Tuple response_type matches both JSONResponse (and plain) and PlainTextResponse.
+    multi_rep = MultiRep()
+    app.add_route("/multi-plain", lambda: "ok", ["GET"], representation=multi_rep)
+    app.add_route("/multi-text", text, ["GET"], representation=multi_rep)
+    app.add_route("/multi-html", html, ["GET"], representation=multi_rep)
+
+    client = make_client(app)
+
+    r_plain = client("GET", "/plain")
+    assert r_plain.status_code == 200
+    assert r_plain.headers["content-type"] == "application/vnd.api+json"
+    assert r_plain.json() == {"data": {"id": 1}}
+
+    r_redirect = client("GET", "/redirect")
+    assert r_redirect.status_code == 302
+    assert r_redirect.headers["location"] == "/dest"
+    assert "x-rep" not in r_redirect.headers
+
+    r_html = client("GET", "/html")
+    assert r_html.status_code == 200
+    assert r_html.headers["content-type"] == "text/html; charset=utf-8"
+    assert r_html.text == "<p>hi</p>"
+
+    r_text = client("GET", "/text")
+    assert r_text.status_code == 200
+    assert r_text.headers["content-type"] == "text/plain; charset=utf-8"
+    assert r_text.text == "hello"
+
+    r_stream = client("GET", "/stream")
+    assert r_stream.status_code == 200
+    assert r_stream.text == "ab"
+
+    r_sse = client("GET", "/sse")
+    assert r_sse.status_code == 200
+    assert r_sse.headers["content-type"] == "text/event-stream"
+    assert "data: tick" in r_sse.text
+
+    r_raw = client("GET", "/raw")
+    assert r_raw.status_code == 200
+    assert r_raw.headers["content-type"] == "application/octet-stream"
+    assert r_raw.content == b"raw"
+
+    r_html_plain = client("GET", "/html-plain")
+    assert r_html_plain.status_code == 200
+    assert r_html_plain.headers["content-type"] == "application/json"
+    assert r_html_plain.json() == {"id": 1}
+
+    r_html_page = client("GET", "/html-page")
+    assert r_html_page.status_code == 200
+    assert r_html_page.headers["x-rep"] == "html"
+    assert r_html_page.text == "<main><p>hi</p></main>"
+
+    r_html_json = client("GET", "/html-json")
+    assert r_html_json.status_code == 201
+    assert r_html_json.json() == {"raw": True}
+    assert "x-rep" not in r_html_json.headers
+
+    assert client("GET", "/multi-plain").text == "wrapped:ok"
+    assert client("GET", "/multi-text").text == "wrapped:hello"
+    assert client("GET", "/multi-html").text == "<p>hi</p>"
+
+    spec = app.openapi()
+    # Non-matching HTMLResponse[str] emits text/html without EnvelopeRep wrapping.
+    assert spec["paths"]["/html"]["get"]["responses"]["200"]["content"] == {
+        "text/html": {"schema": {"type": "string"}}
+    }
+    # Non-matching plain return under HTMLRep falls back to application/json.
+    assert spec["paths"]["/html-plain"]["get"]["responses"]["200"]["content"] == {
+        "application/json": {"schema": {"$ref": "#/components/schemas/Item"}}
+    }
+    # Unparameterized RedirectResponse / StreamingResponse have no content schema.
+    assert "content" not in spec["paths"]["/redirect"]["get"]["responses"]["200"]
+    assert "content" not in spec["paths"]["/stream"]["get"]["responses"]["200"]
+
+
+# @lat: [[tests#Representations#Generic JSONResponse and lazy rendering]]
+def test_generic_json_response_with_representation_and_openapi():
+    class Envelope[T](msgspec.Struct):
+        data: T
+
+    class Item(msgspec.Struct):
+        id: int
+        name: str
+
+    class CustomObject:
+        def __init__(self, label: str) -> None:
+            self.label = label
+
+    class EnvelopeRep(JSONRepresentation):
+        def media_type(self, status_code: int) -> str:
+            if status_code < 400:
+                return "application/vnd.api+json"
+            return super().media_type(status_code)
+
+        def body_type(self, status_code: int, returns: Any) -> Any:
+            if status_code >= 400:
+                return super().body_type(status_code, returns)
+            if returns is CustomObject:
+                return Envelope[dict[str, str]]
+            return Envelope[returns]
+
+        def render(
+            self, request: Request, value: Any, status_code: int
+        ) -> Response[Any]:
+            if status_code >= 400 or isinstance(value, Exception):
+                return super().render(request, value, status_code)
+            payload = (
+                {"label": value.label} if isinstance(value, CustomObject) else value
+            )
+            return Response(
+                msgspec.json.encode(Envelope(data=payload)),
+                status_code=status_code,
+                media_type=self.media_type(status_code),
+                headers={"x-from-rep": "yes", "x-override": "rep"},
+            )
+
+    def create(item: Item) -> Annotated[JSONResponse[Item], Status(201)]:
+        res = JSONResponse(
+            item,
+            status_code=201,
+            headers={"X-Request-Id": "req-1", "X-Override": "handler"},
+        )
+        res.set_cookie("sid", "abc123", max_age=60)
+        res.delete_cookie("old")
+        return res
+
+    def custom_ct() -> JSONResponse[Item]:
+        return JSONResponse(
+            Item(id=2, name="ct"),
+            headers={"Content-Type": "application/vnd.api+json; profile=v2"},
+        )
+
+    def lazy_custom() -> JSONResponse[CustomObject]:
+        # CustomObject is not msgspec-encodable; lazy rendering lets
+        # EnvelopeRep.success handle result.content without failing eagerly.
+        return JSONResponse(CustomObject("ok"), status_code=202)
+
+    def unserializable() -> JSONResponse[Any]:
+        return JSONResponse(object())
+
+    app = Chano(docs=False)
+    rep = EnvelopeRep()
+    app.add_route("/wrapped", create, ["POST"], representation=rep)
+    app.add_route("/custom-ct", custom_ct, ["GET"], representation=rep)
+    app.add_route("/lazy", lazy_custom, ["GET"], representation=rep)
+    app.add_route("/plain", create, ["POST"])
+    app.add_route(
+        "/broken",
+        unserializable,
+        ["GET"],
+        error_handlers=[lambda req, exc: PlainTextResponse(type(exc).__name__, 500)],
+    )
+    client = make_client(app)
+
+    res = client("POST", "/wrapped", json={"id": 1, "name": "widget"})
+    assert res.status_code == 201
+    assert res.headers["content-type"] == "application/vnd.api+json"
+    assert res.headers["content-length"] == str(len(res.content))
+    assert res.headers["x-from-rep"] == "yes"
+    assert res.headers["x-request-id"] == "req-1"
+    assert res.headers["x-override"] == "handler"
+    cookies = res.headers.get_list("set-cookie")
+    assert len(cookies) == 2
+    assert any(c.startswith("sid=abc123;") for c in cookies)
+    assert any(c.startswith('old="";') and "Max-Age=0" in c for c in cookies)
+    assert res.json() == {"data": {"id": 1, "name": "widget"}}
+
+    res_ct = client("GET", "/custom-ct")
+    assert res_ct.status_code == 200
+    assert res_ct.headers["content-type"] == "application/vnd.api+json; profile=v2"
+    assert res_ct.json() == {"data": {"id": 2, "name": "ct"}}
+
+    res_lazy = client("GET", "/lazy")
+    assert res_lazy.status_code == 202
+    assert res_lazy.json() == {"data": {"label": "ok"}}
+
+    # Without representation, JSONResponse[Item] keeps cookies and headers.
+    res_plain = client("POST", "/plain", json={"id": 3, "name": "bare"})
+    assert res_plain.status_code == 201
+    assert res_plain.headers["content-type"] == "application/json"
+    assert res_plain.json() == {"id": 3, "name": "bare"}
+    assert len(res_plain.headers.get_list("set-cookie")) == 2
+
+    # Serialization failure on a non-intercepted JSONResponse hits error boundary.
+    res_broken = client("GET", "/broken")
+    assert res_broken.status_code == 500
+    assert res_broken.text == "TypeError"
+
+    spec = app.openapi()
+    wrapped_201 = spec["paths"]["/wrapped"]["post"]["responses"]["201"]
+    assert wrapped_201["description"] == "Created"
+    assert wrapped_201["content"]["application/vnd.api+json"]["schema"] == {
+        "$ref": "#/components/schemas/Envelope_Item_"
+    }
+    plain_201 = spec["paths"]["/plain"]["post"]["responses"]["201"]
+    assert plain_201["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/Item"
+    }
+
+
+# @lat: [[tests#Representations#Annotated Status unions and bodyless statuses]]
+def test_annotated_status_unions_type_alias_and_bodyless():
+    class Envelope[T](msgspec.Struct):
+        data: T
+
+    class Item(msgspec.Struct):
+        id: int
+
+    class Job(msgspec.Struct):
+        job_id: str
+
+    class AltItem(msgspec.Struct, tag=True):
+        alt: bool
+
+    class TaggedItem(msgspec.Struct, tag=True):
+        id: int
+
+    class EnvelopeRep(JSONRepresentation):
+        def media_type(self, status_code: int) -> str:
+            if status_code < 400:
+                return "application/vnd.api+json"
+            return super().media_type(status_code)
+
+        def body_type(self, status_code: int, returns: Any) -> Any:
+            if status_code < 400:
+                return Envelope[returns]
+            return super().body_type(status_code, returns)
+
+        def render(
+            self, request: Request, value: Any, status_code: int
+        ) -> Response[Any]:
+            if status_code >= 400 or isinstance(value, Exception):
+                return super().render(request, value, status_code)
+            return Response(
+                msgspec.json.encode(Envelope(data=value)),
+                status_code=status_code,
+                media_type=self.media_type(status_code),
+            )
+
+    type Created[T] = Annotated[T, Status(201, description="Resource created")]
+    type NoContent = Annotated[None, Status(204)]
+    type Outcome[T, U] = (
+        Annotated[T, Status(201)] | Annotated[U, Status(202, description="Queued")]
+    )
+
+    def create_plain(override: bool = False) -> Created[Item]:
+        if override:
+            override_resp: Any = JSONResponse(Item(id=9), status_code=200)
+            return override_resp
+        return Item(id=1)
+
+    def create_outcome(
+        async_mode: bool = False,
+    ) -> Outcome[JSONResponse[Item], JSONResponse[Job]]:
+        if async_mode:
+            return JSONResponse(Job(job_id="j1"), status_code=202)
+        return JSONResponse(Item(id=2), status_code=201)
+
+    def create_shared() -> (
+        Annotated[TaggedItem, Status(201)] | Annotated[AltItem, Status(201)]
+    ):
+        return AltItem(alt=True)
+
+    def delete_item() -> NoContent:
+        return None
+
+    def not_modified() -> Annotated[None, Status(304)]:
+        return None
+
+    def constrained() -> Annotated[str, msgspec.Meta(min_length=3), Status(201)]:
+        return "abc"
+
+    @representation(Raw)
+    @status_code(201)
+    def opted_out() -> Item:
+        return Item(id=8)
+
+    app = Chano(docs=False)
+    rep = EnvelopeRep()
+    app.add_route("/created", create_plain, ["POST"], representation=rep)
+    app.add_route("/created-plain", create_plain, ["POST"])
+    app.add_route("/outcome", create_outcome, ["POST"], representation=rep)
+    app.add_route("/shared", create_shared, ["POST"], representation=rep)
+    app.add_route("/delete", delete_item, ["DELETE"], representation=rep)
+    app.add_route("/not-modified", not_modified, ["GET"], representation=rep)
+    app.add_route("/constrained", constrained, ["POST"])
+    app.add_route("/opted-out", opted_out, ["POST"], representation=rep)
+    client = make_client(app)
+
+    # Single unambiguous Status(201) applies to plain return (with and without rep).
+    r1 = client("POST", "/created")
+    assert r1.status_code == 201
+    assert r1.headers["content-type"] == "application/vnd.api+json"
+    assert r1.json() == {"data": {"id": 1}}
+
+    r1_plain = client("POST", "/created-plain")
+    assert r1_plain.status_code == 201
+    assert r1_plain.json() == {"id": 1}
+
+    # Explicit Response.status_code overrides annotated Status(201).
+    r1_override = client("POST", "/created?override=true")
+    assert r1_override.status_code == 200
+    assert r1_override.json() == {"data": {"id": 9}}
+
+    # Union statuses with explicit JSONResponse status codes.
+    r_201 = client("POST", "/outcome")
+    assert r_201.status_code == 201
+    assert r_201.json() == {"data": {"id": 2}}
+    r_202 = client("POST", "/outcome?async_mode=true")
+    assert r_202.status_code == 202
+    assert r_202.json() == {"data": {"job_id": "j1"}}
+
+    # Shared status across union branches is unambiguous at runtime.
+    r_shared = client("POST", "/shared")
+    assert r_shared.status_code == 201
+    assert r_shared.json() == {"data": {"type": "AltItem", "alt": True}}
+
+    # Bodyless 204 and 304 send empty body with no content-type or content-length,
+    # even under an envelope representation.
+    r_del = client("DELETE", "/delete")
+    assert r_del.status_code == 204
+    assert r_del.content == b""
+    assert "content-type" not in r_del.headers
+    assert "content-length" not in r_del.headers
+
+    r_304 = client("GET", "/not-modified")
+    assert r_304.status_code == 304
+    assert r_304.content == b""
+    assert "content-type" not in r_304.headers
+
+    # @representation(Raw) + @status_code(201) opts out while keeping 201.
+    r_raw = client("POST", "/opted-out")
+    assert r_raw.status_code == 201
+    assert r_raw.headers["content-type"] == "application/json"
+    assert r_raw.json() == {"id": 8}
+
+    # OpenAPI checks.
+    spec = app.openapi()
+    created_resps = spec["paths"]["/created"]["post"]["responses"]
+    assert "200" not in created_resps
+    assert created_resps["201"]["description"] == "Resource created"
+    assert created_resps["201"]["content"]["application/vnd.api+json"]["schema"] == {
+        "$ref": "#/components/schemas/Envelope_Item_"
+    }
+
+    outcome_resps = spec["paths"]["/outcome"]["post"]["responses"]
+    assert "200" not in outcome_resps
+    assert set(outcome_resps) == {"201", "202", "422"}
+    assert outcome_resps["201"]["description"] == "Created"
+    assert outcome_resps["201"]["content"]["application/vnd.api+json"]["schema"] == {
+        "$ref": "#/components/schemas/Envelope_Item_"
+    }
+    assert outcome_resps["202"]["description"] == "Queued"
+    assert outcome_resps["202"]["content"]["application/vnd.api+json"]["schema"] == {
+        "$ref": "#/components/schemas/Envelope_Job_"
+    }
+
+    # Shared-status union generates per-branch schemas under anyOf.
+    shared_schema = spec["paths"]["/shared"]["post"]["responses"]["201"]["content"][
+        "application/vnd.api+json"
+    ]["schema"]
+    assert shared_schema == {
+        "anyOf": [
+            {"$ref": "#/components/schemas/Envelope_TaggedItem_"},
+            {"$ref": "#/components/schemas/Envelope_AltItem_"},
+        ]
+    }
+
+    # Bodyless statuses omit content in OpenAPI even under an envelope representation.
+    assert spec["paths"]["/delete"]["delete"]["responses"] == {
+        "204": {"description": "No Content"}
+    }
+    assert spec["paths"]["/not-modified"]["get"]["responses"] == {
+        "304": {"description": "Not Modified"}
+    }
+
+    # Non-Chano Annotated metadata (msgspec.Meta) is preserved.
+    assert spec["paths"]["/constrained"]["post"]["responses"]["201"]["content"] == {
+        "application/json": {"schema": {"type": "string", "minLength": 3}}
+    }
+
+    # Status / raises / representation validation errors.
+    for bad_status in (99, 103, 199, 600):
+        with pytest.raises(ValueError, match="status"):
+            Status(bad_status)
+    bad_types: list[Any] = ["201", True, 201.5, None]
+    for bad_type in bad_types:
+        with pytest.raises(TypeError, match="status"):
+            Status(bad_type)
+    bad_desc: Any = 123
+    with pytest.raises(TypeError, match="description"):
+        Status(201, description=bad_desc)
+    with pytest.raises(TypeError, match="description"):
+        raises(404, bad_desc)
+    bad_rep: Any = "not-a-rep"
+    with pytest.raises(TypeError, match="representation"):
+        representation(bad_rep)
+
+
+# @lat: [[tests#Representations#Decorator sugar with future annotations]]
+def test_decorator_sugar_with_future_annotations(tmp_path, isolated_imports):
+    write_project(
+        tmp_path,
+        {
+            "app/dependencies.py": (
+                "from __future__ import annotations\n"
+                "from typing import Annotated\n"
+                "from chano import Header, HTTPException, Status\n\n"
+                "def require_tenant(\n"
+                "    x_tenant: Annotated[str, Header()],\n"
+                ") -> Annotated[None, Status(403, description='Forbidden tenant')]:\n"
+                "    if x_tenant != 'acme':\n"
+                "        raise HTTPException(403, 'Forbidden')\n\n"
+                "dependencies = [require_tenant]\n"
+            ),
+            "app/items/route.py": (
+                "from __future__ import annotations\n"
+                "from typing import Annotated, Any\n"
+                "import msgspec\n"
+                "from chano import (\n"
+                "    Depends,\n"
+                "    JSONRepresentation,\n"
+                "    JSONResponse,\n"
+                "    Request,\n"
+                "    Response,\n"
+                "    Status,\n"
+                "    openapi,\n"
+                "    raises,\n"
+                "    representation,\n"
+                "    status_code,\n"
+                ")\n\n"
+                "class Envelope[T](msgspec.Struct):\n"
+                "    wrapped: T\n\n"
+                "class WrapRep(JSONRepresentation):\n"
+                "    def body_type(self, status_code: int, returns: Any) -> Any:\n"
+                "        if status_code < 400:\n"
+                "            return Envelope[returns]\n"
+                "        return super().body_type(status_code, returns)\n"
+                "    def render(\n"
+                "        self, request: Request, value: Any, status_code: int\n"
+                "    ) -> Response[Any]:\n"
+                "        if status_code >= 400 or isinstance(value, Exception):\n"
+                "            return super().render(request, value, status_code)\n"
+                "        return JSONResponse(\n"
+                "            Envelope(wrapped=value), status_code=status_code\n"
+                "        )\n\n"
+                "def get_actor() -> Annotated[\n"
+                "    Actor, Status(401, description='Missing actor')\n"
+                "]:\n"
+                "    return Actor(name='ada')\n\n"
+                "@openapi(summary='Create item', tags=['items'])\n"
+                "@raises(409, 'Outer conflict')\n"
+                "@raises(409, 'Inner conflict')\n"
+                "@status_code(201, description='Item created')\n"
+                "@status_code(200)\n"
+                "@representation(WrapRep())\n"
+                "def POST(\n"
+                "    item: Item,\n"
+                "    actor: Annotated[Actor, Depends(get_actor)],\n"
+                ") -> Item:\n"
+                "    return item\n\n"
+                "@status_code(204)\n"
+                "@raises(404, 'Item missing')\n"
+                "def DELETE():\n"
+                "    return None\n\n"
+                "@raises(404, 'Not found')\n"
+                "def GET() -> (\n"
+                "    Annotated[JSONResponse[Item], Status(200)]\n"
+                "    | Annotated[None, Status(204)]\n"
+                "):\n"
+                "    return JSONResponse(Item(id=1, name='first'), status_code=200)\n\n"
+                "class Actor(msgspec.Struct):\n"
+                "    name: str\n\n"
+                "class Item(msgspec.Struct):\n"
+                "    id: int\n"
+                "    name: str\n"
+            ),
+        },
+    )
+    app = create_app(tmp_path / "app")
+    client = make_client(app)
+
+    r_post = client(
+        "POST", "/items", headers={"x-tenant": "acme"}, json={"id": 7, "name": "bolt"}
+    )
+    assert r_post.status_code == 201
+    assert r_post.json() == {"wrapped": {"id": 7, "name": "bolt"}}
+
+    r_del = client("DELETE", "/items", headers={"x-tenant": "acme"})
+    assert r_del.status_code == 204
+    assert r_del.content == b""
+
+    r_get = client("GET", "/items", headers={"x-tenant": "acme"})
+    assert r_get.status_code == 200
+    assert r_get.json() == {"id": 1, "name": "first"}
+
+    spec = app.openapi()
+    post_op = spec["paths"]["/items"]["post"]
+    assert post_op["summary"] == "Create item"
+    assert post_op["tags"] == ["items"]
+    assert set(post_op["responses"]) == {"201", "401", "403", "409", "422"}
+    assert post_op["responses"]["201"]["description"] == "Item created"
+    assert post_op["responses"]["201"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/Envelope_Item_"
+    }
+    assert post_op["responses"]["401"]["description"] == "Missing actor"
+    assert post_op["responses"]["403"]["description"] == "Forbidden tenant"
+    assert post_op["responses"]["409"]["description"] == "Outer conflict"
+
+    del_op = spec["paths"]["/items"]["delete"]
+    assert "content" not in del_op["responses"]["204"]
+    assert del_op["responses"]["204"] == {"description": "No Content"}
+    assert del_op["responses"]["404"]["description"] == "Item missing"
+    assert del_op["responses"]["403"]["description"] == "Forbidden tenant"
+
+    get_op = spec["paths"]["/items"]["get"]
+    assert set(get_op["responses"]) == {"200", "204", "403", "404", "422"}
+    assert get_op["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/Item"
+    }
+    assert "content" not in get_op["responses"]["204"]
+
+
+# @lat: [[tests#Representations#Per-method representation overrides and Raw opt-out]]
+@pytest.mark.parametrize("factory", FACTORIES)
+def test_per_method_representation_overrides_and_raw_opt_out(
+    tmp_path, isolated_imports, factory
+):
+    write_project(
+        tmp_path,
+        {
+            "app/error.py": ("def handle_error(request, exc):\n    raise\n"),
+            "app/representation.py": (
+                "from typing import Any\n"
+                "import msgspec\n"
+                "from chano import (\n"
+                "    HTTPException,\n"
+                "    JSONRepresentation,\n"
+                "    JSONResponse,\n"
+                "    Request,\n"
+                "    Response,\n"
+                ")\n\n"
+                "class DefaultBody[T](msgspec.Struct):\n"
+                "    source: str\n"
+                "    data: T\n\n"
+                "class DefaultErr(msgspec.Struct):\n"
+                "    source: str\n"
+                "    detail: Any\n\n"
+                "class DefaultRep(JSONRepresentation):\n"
+                "    def media_type(self, status_code: int) -> str:\n"
+                "        if status_code >= 400:\n"
+                "            return 'application/vnd.default-err+json'\n"
+                "        return 'application/vnd.default+json'\n"
+                "    def body_type(self, status_code: int, returns: Any) -> Any:\n"
+                "        if status_code >= 400:\n"
+                "            return DefaultErr\n"
+                "        return DefaultBody[returns]\n"
+                "    def render(\n"
+                "        self, request: Request, value: Any, status_code: int\n"
+                "    ) -> Response[Any]:\n"
+                "        if isinstance(value, Exception):\n"
+                "            is_http = isinstance(value, HTTPException)\n"
+                "            status = value.status_code if is_http else 500\n"
+                "            detail = value.detail if is_http else str(value)\n"
+                "            return JSONResponse(\n"
+                "                DefaultErr(source='folder', detail=detail),\n"
+                "                status_code=status,\n"
+                "                media_type=self.media_type(status),\n"
+                "            )\n"
+                "        return JSONResponse(\n"
+                "            DefaultBody(source='folder', data=value),\n"
+                "            status_code=status_code,\n"
+                "            media_type=self.media_type(status_code),\n"
+                "        )\n\n"
+                "representation = DefaultRep()\n"
+            ),
+            "app/items/route.py": (
+                "from typing import Annotated, Any\n"
+                "import msgspec\n"
+                "from chano import (\n"
+                "    HTTPException,\n"
+                "    JSONRepresentation,\n"
+                "    JSONResponse,\n"
+                "    Raw,\n"
+                "    Request,\n"
+                "    Response,\n"
+                "    Status,\n"
+                "    raises,\n"
+                "    representation,\n"
+                "    status_code,\n"
+                ")\n\n"
+                "class Item(msgspec.Struct):\n"
+                "    id: int\n\n"
+                "class CustomBody[T](msgspec.Struct):\n"
+                "    custom: T\n\n"
+                "class CustomErr(msgspec.Struct):\n"
+                "    custom_error: Any\n\n"
+                "class CustomRep(JSONRepresentation):\n"
+                "    def media_type(self, status_code: int) -> str:\n"
+                "        if status_code >= 400:\n"
+                "            return 'application/vnd.custom-err+json'\n"
+                "        return 'application/vnd.custom+json'\n"
+                "    def body_type(self, status_code: int, returns: Any) -> Any:\n"
+                "        if status_code >= 400:\n"
+                "            return CustomErr\n"
+                "        return CustomBody[returns]\n"
+                "    def render(\n"
+                "        self, request: Request, value: Any, status_code: int\n"
+                "    ) -> Response[Any]:\n"
+                "        if isinstance(value, Exception):\n"
+                "            is_http = isinstance(value, HTTPException)\n"
+                "            status = value.status_code if is_http else 500\n"
+                "            detail = value.detail if is_http else str(value)\n"
+                "            return JSONResponse(\n"
+                "                CustomErr(custom_error=detail),\n"
+                "                status_code=status,\n"
+                "                media_type=self.media_type(status),\n"
+                "            )\n"
+                "        return JSONResponse(\n"
+                "            CustomBody(custom=value),\n"
+                "            status_code=status_code,\n"
+                "            media_type=self.media_type(status_code),\n"
+                "        )\n\n"
+                "CUSTOM = CustomRep()\n\n"
+                "@raises(404, 'Missing')\n"
+                "def GET(fail: bool = False) -> Item:\n"
+                "    if fail:\n"
+                "        raise HTTPException(404, 'nope')\n"
+                "    return Item(id=1)\n\n"
+                "@representation(CUSTOM)\n"
+                "@status_code(201)\n"
+                "@raises(409, 'Conflict')\n"
+                "def POST(fail: bool = False) -> Item:\n"
+                "    if fail:\n"
+                "        raise HTTPException(409, 'dup')\n"
+                "    return Item(id=2)\n\n"
+                "def PUT(\n"
+                "    fail: bool = False,\n"
+                ") -> Annotated[Item, CUSTOM, Status(400, description='Bad')]:\n"
+                "    if fail:\n"
+                "        raise HTTPException(400, 'bad')\n"
+                "    return Item(id=3)\n\n"
+                "@representation(None)\n"
+                "@raises(404, 'Missing')\n"
+                "def DELETE(fail: bool = False) -> Item:\n"
+                "    if fail:\n"
+                "        raise HTTPException(404, 'raw-missing')\n"
+                "    return Item(id=4)\n\n"
+                "def PATCH(\n"
+                "    fail: bool = False,\n"
+                ") -> Annotated[Item, Raw, Status(404, description='Missing')]:\n"
+                "    if fail:\n"
+                "        raise HTTPException(404, 'raw-patch')\n"
+                "    return Item(id=5)\n"
+            ),
+        },
+    )
+    app_dir = tmp_path / "app"
+    app = (
+        create_app(app_dir) if factory == "dev" else create_route_app(app_dir, "items")
+    )
+    client = make_client(app)
+
+    # GET inherits folder representation.py.
+    r_get = client("GET", "/items")
+    assert r_get.headers["content-type"] == "application/vnd.default+json"
+    assert r_get.json() == {"source": "folder", "data": {"id": 1}}
+    r_get_err = client("GET", "/items?fail=true")
+    assert r_get_err.status_code == 404
+    assert r_get_err.headers["content-type"] == "application/vnd.default-err+json"
+    assert r_get_err.json() == {"source": "folder", "detail": "nope"}
+
+    # POST uses @representation(CUSTOM) for both success and errors (past error.py).
+    r_post = client("POST", "/items")
+    assert r_post.status_code == 201
+    assert r_post.headers["content-type"] == "application/vnd.custom+json"
+    assert r_post.json() == {"custom": {"id": 2}}
+    r_post_err = client("POST", "/items?fail=true")
+    assert r_post_err.status_code == 409
+    assert r_post_err.headers["content-type"] == "application/vnd.custom-err+json"
+    assert r_post_err.json() == {"custom_error": "dup"}
+
+    # PUT uses direct Annotated[Item, CUSTOM, Status(400, ...)] override.
+    r_put = client("PUT", "/items")
+    assert r_put.headers["content-type"] == "application/vnd.custom+json"
+    assert r_put.json() == {"custom": {"id": 3}}
+    r_put_err = client("PUT", "/items?fail=true")
+    assert r_put_err.status_code == 400
+    assert r_put_err.headers["content-type"] == "application/vnd.custom-err+json"
+    assert r_put_err.json() == {"custom_error": "bad"}
+
+    # DELETE (@representation(None)) and PATCH (Annotated[..., Raw]) opt out
+    # of folder representation.py for both success and errors.
+    r_del = client("DELETE", "/items")
+    assert r_del.headers["content-type"] == "application/json"
+    assert r_del.json() == {"id": 4}
+    r_del_err = client("DELETE", "/items?fail=true")
+    assert r_del_err.status_code == 404
+    assert r_del_err.headers["content-type"] == "application/json"
+    assert r_del_err.json() == {"detail": "raw-missing"}
+
+    r_patch = client("PATCH", "/items")
+    assert r_patch.headers["content-type"] == "application/json"
+    assert r_patch.json() == {"id": 5}
+    r_patch_err = client("PATCH", "/items?fail=true")
+    assert r_patch_err.status_code == 404
+    assert r_patch_err.headers["content-type"] == "application/json"
+    assert r_patch_err.json() == {"detail": "raw-patch"}
+
+    # 405 Method Not Allowed still uses folder representation.py.
+    r_405 = client("OPTIONS", "/items")
+    assert r_405.status_code == 405
+    assert r_405.headers["content-type"] == "application/vnd.default-err+json"
+    assert r_405.json()["source"] == "folder"
+
+    if factory == "dev":
+        ops = app.openapi()["paths"]["/items"]
+        assert (
+            "application/vnd.default+json" in ops["get"]["responses"]["200"]["content"]
+        )
+        assert (
+            "application/vnd.default-err+json"
+            in ops["get"]["responses"]["404"]["content"]
+        )
+        assert (
+            "application/vnd.custom+json" in ops["post"]["responses"]["201"]["content"]
+        )
+        assert (
+            "application/vnd.custom-err+json"
+            in ops["post"]["responses"]["409"]["content"]
+        )
+        assert (
+            "application/vnd.custom+json" in ops["put"]["responses"]["200"]["content"]
+        )
+        assert (
+            "application/vnd.custom-err+json"
+            in ops["put"]["responses"]["400"]["content"]
+        )
+        assert ops["delete"]["responses"]["200"]["content"] == {
+            "application/json": {"schema": {"$ref": "#/components/schemas/Item"}}
+        }
+        assert ops["delete"]["responses"]["404"] == {"description": "Missing"}
+        assert ops["patch"]["responses"]["200"]["content"] == {
+            "application/json": {"schema": {"$ref": "#/components/schemas/Item"}}
+        }
+        assert ops["patch"]["responses"]["404"] == {"description": "Missing"}
+
+
+# @lat: [[tests#Representations#Bodyless status suppression at wire boundary]]
+def test_bodyless_status_suppression_at_wire_boundary():
+    success_calls: list[Any] = []
+
+    class TrackingRep(JSONRepresentation):
+        def render(
+            self, request: Request, value: Any, status_code: int
+        ) -> Response[Any]:
+            if isinstance(value, Exception):
+                return super().render(request, value, status_code)
+            success_calls.append(value)
+            return JSONResponse({"wrapped": value}, status_code=status_code)
+
+    @status_code(204)
+    def plain_payload() -> Any:
+        return "payload"
+
+    def json_204() -> Annotated[JSONResponse[None], Status(204)]:
+        res = JSONResponse(None, status_code=204, headers={"X-Tag": "ok"})
+        res.set_cookie("seen", "1")
+        return res
+
+    started = False
+
+    def stream_204() -> StreamingResponse:
+        def gen():
+            nonlocal started
+            started = True
+            yield b"never-sent"
+
+        return StreamingResponse(gen(), status_code=204, headers={"X-Stream": "yes"})
+
+    def raw_304() -> Response[bytes]:
+        return Response(b"ignored", status_code=304, headers={"ETag": '"v1"'})
+
+    app = Chano(docs=False)
+    rep = TrackingRep()
+    app.add_route("/plain-204", plain_payload, ["DELETE"], representation=rep)
+    app.add_route("/json-204", json_204, ["DELETE"], representation=rep)
+    app.add_route("/stream-204", stream_204, ["GET"])
+    app.add_route("/raw-304", raw_304, ["GET"])
+    client = make_client(app)
+
+    r_plain = client("DELETE", "/plain-204")
+    assert r_plain.status_code == 204
+    assert r_plain.content == b""
+    assert "content-length" not in r_plain.headers
+    assert "content-type" not in r_plain.headers
+
+    r_json = client("DELETE", "/json-204")
+    assert r_json.status_code == 204
+    assert r_json.content == b""
+    assert "content-length" not in r_json.headers
+    assert "content-type" not in r_json.headers
+    assert r_json.headers["x-tag"] == "ok"
+    assert any(c.startswith("seen=1;") for c in r_json.headers.get_list("set-cookie"))
+    assert success_calls == []
+
+    r_stream = client("GET", "/stream-204")
+    assert r_stream.status_code == 204
+    assert r_stream.content == b""
+    assert "content-length" not in r_stream.headers
+    assert r_stream.headers["x-stream"] == "yes"
+    assert not started
+
+    r_304 = client("GET", "/raw-304")
+    assert r_304.status_code == 304
+    assert r_304.content == b""
+    assert "content-length" not in r_304.headers
+    assert r_304.headers["etag"] == '"v1"'
+
+    # Raw ASGI check for bodyless 204/205/304 stripping Content-Length and body.
+    for code in (204, 205, 304):
+        resp = Response(b"body", status_code=code, headers={"Content-Length": "4"})
+        assert resp.body == b"body"
+        sent: list[Any] = []
+
+        async def send(msg: Any, _sent: list[Any] = sent) -> None:
+            _sent.append(msg)
+
+        async def receive() -> dict[str, Any]:
+            return {"type": "http.request", "body": b""}
+
+        asyncio.run(resp(receive, send))
+        start, body_msg = sent[0], sent[1]
+        assert start["status"] == code
+        assert all(k != b"content-length" for k, _ in start["headers"])
+        assert body_msg["body"] == b""
+
+    # Changing status from 204 to 200 in middleware preserves the rendered body.
+    async def promote_to_200(request: Request, call_next: Any) -> Response[Any]:
+        resp = await call_next(request)
+        _ = resp.body
+        resp.status_code = 200
+        return resp
+
+    promote_app = Chano(docs=False)
+    promote_app.add_route(
+        "/promote",
+        lambda: Response(b"kept", status_code=204, media_type="text/plain"),
+        ["GET"],
+        middleware=[promote_to_200],
+    )
+    r_promoted = make_client(promote_app)("GET", "/promote")
+    assert r_promoted.status_code == 200
+    assert r_promoted.text == "kept"
+    assert r_promoted.headers["content-length"] == "4"
+
+    # Explicit Content-Length is preserved on HEAD but overwritten on GET.
+    def head_post() -> Response[bytes]:
+        resp = Response()
+        _ = resp.body
+        resp.headers["content-length"] = "7"
+        return resp
+
+    def head_ctor() -> Response[bytes]:
+        return Response(headers={"Content-Length": "11"})
+
+    def bad_cl_get() -> Response[bytes]:
+        return Response(b"x", headers={"Content-Length": "999"})
+
+    head_app = Chano(docs=False)
+    head_app.add_route("/head-post", head_post, ["HEAD"])
+    head_app.add_route("/head-ctor", head_ctor, ["HEAD"])
+    head_app.add_route("/bad-cl", bad_cl_get, ["GET", "HEAD"])
+    head_client = make_client(head_app)
+
+    r_head_post = head_client("HEAD", "/head-post")
+    assert r_head_post.status_code == 200
+    assert r_head_post.content == b""
+    assert r_head_post.headers["content-length"] == "7"
+
+    r_head_ctor = head_client("HEAD", "/head-ctor")
+    assert r_head_ctor.status_code == 200
+    assert r_head_ctor.content == b""
+    assert r_head_ctor.headers["content-length"] == "11"
+
+    r_get_cl = head_client("GET", "/bad-cl")
+    assert r_get_cl.status_code == 200
+    assert r_get_cl.content == b"x"
+    assert r_get_cl.headers["content-length"] == "1"
+
+    r_head_cl = head_client("HEAD", "/bad-cl")
+    assert r_head_cl.status_code == 200
+    assert r_head_cl.content == b""
+    assert r_head_cl.headers["content-length"] == "999"
+
+
+# @lat: [[tests#Representations#Middleware lazy response error boundary]]
+def test_middleware_lazy_response_error_boundary(capsys):
+    endpoint_error_called = False
+
+    def handle_error(request: Request, exc: Exception) -> Response[Any]:
+        nonlocal endpoint_error_called
+        endpoint_error_called = True
+        return PlainTextResponse("endpoint-error", status_code=418)
+
+    async def bad_middleware(request: Request, call_next: Any) -> Response[Any]:
+        return JSONResponse(object())
+
+    app = Chano(docs=False)
+    app.add_route(
+        "/mw",
+        lambda: {"ok": True},
+        ["GET"],
+        middleware=[bad_middleware],
+        error_handlers=[handle_error],
+    )
+    client = make_client(app)
+
+    res = client("GET", "/mw")
+    assert res.status_code == 500
+    assert res.text == "Internal Server Error"
+    assert not endpoint_error_called
+    assert "TypeError" in capsys.readouterr().err
+
+
+# @lat: [[tests#Representations#Shared media collision and untagged struct union]]
+def test_openapi_shared_media_collision_and_untagged_struct_union():
+    class UntaggedA(msgspec.Struct):
+        a: int
+
+    class UntaggedB(msgspec.Struct):
+        b: str
+
+    class Envelope[T](msgspec.Struct):
+        data: T
+
+    class TextFromJSONRep(JSONRepresentation):
+        def media_type(self, status_code: int) -> str:
+            if status_code < 400:
+                return "text/plain"
+            return super().media_type(status_code)
+
+        def body_type(self, status_code: int, returns: Any) -> Any:
+            if status_code < 400:
+                return str
+            return super().body_type(status_code, returns)
+
+        def render(
+            self, request: Request, value: Any, status_code: int
+        ) -> Response[Any]:
+            if status_code >= 400 or isinstance(value, Exception):
+                return super().render(request, value, status_code)
+            return PlainTextResponse(str(value), status_code=status_code)
+
+    class EnvelopeRep(JSONRepresentation):
+        def media_type(self, status_code: int) -> str:
+            if status_code < 400:
+                return "application/vnd.api+json"
+            return super().media_type(status_code)
+
+        def body_type(self, status_code: int, returns: Any) -> Any:
+            if status_code < 400:
+                return Envelope[returns]
+            return super().body_type(status_code, returns)
+
+        def render(
+            self, request: Request, value: Any, status_code: int
+        ) -> Response[Any]:
+            if status_code >= 400 or isinstance(value, Exception):
+                return super().render(request, value, status_code)
+            return JSONResponse(
+                Envelope(data=value),
+                status_code=status_code,
+                media_type=self.media_type(status_code),
+            )
+
+    def mixed() -> JSONResponse[int] | PlainTextResponse[int]:
+        return PlainTextResponse(1)
+
+    def untagged() -> (
+        Annotated[UntaggedA, Status(201)] | Annotated[UntaggedB, Status(201)]
+    ):
+        return UntaggedA(a=1)
+
+    def dedup() -> (
+        Annotated[UntaggedA, Status(200)] | Annotated[UntaggedA, Status(200)]
+    ):
+        return UntaggedA(a=1)
+
+    app = Chano(docs=False)
+    app.add_route("/mixed", mixed, ["GET"], representation=TextFromJSONRep())
+    app.add_route("/untagged-raw", untagged, ["POST"])
+    app.add_route("/untagged-env", untagged, ["POST"], representation=EnvelopeRep())
+    app.add_route("/dedup", dedup, ["GET"])
+
+    spec = app.openapi()
+    assert spec["paths"]["/mixed"]["get"]["responses"]["200"]["content"] == {
+        "text/plain": {"schema": {"anyOf": [{"type": "string"}, {"type": "integer"}]}}
+    }
+    assert spec["paths"]["/untagged-raw"]["post"]["responses"]["201"]["content"] == {
+        "application/json": {
+            "schema": {
+                "anyOf": [
+                    {"$ref": "#/components/schemas/UntaggedA"},
+                    {"$ref": "#/components/schemas/UntaggedB"},
+                ]
+            }
+        }
+    }
+    assert spec["paths"]["/untagged-env"]["post"]["responses"]["201"]["content"] == {
+        "application/vnd.api+json": {
+            "schema": {
+                "anyOf": [
+                    {"$ref": "#/components/schemas/Envelope_UntaggedA_"},
+                    {"$ref": "#/components/schemas/Envelope_UntaggedB_"},
+                ]
+            }
+        }
+    }
+    assert spec["paths"]["/dedup"]["get"]["responses"]["200"]["content"] == {
+        "application/json": {"schema": {"$ref": "#/components/schemas/UntaggedA"}}
+    }
+
+
+# @lat: [[tests#Representations#Unhashable rep alias and conflicting union reps]]
+def test_unhashable_rep_in_alias_and_conflicting_union_reps():
+    @dataclasses.dataclass
+    class ConfigurableRep(JSONRepresentation):
+        prefix: str = "ok"
+
+        def render(
+            self, request: Request, value: Any, status_code: int
+        ) -> Response[Any]:
+            if status_code >= 400 or isinstance(value, Exception):
+                return super().render(request, value, status_code)
+            return JSONResponse(
+                {"prefix": self.prefix, "value": value}, status_code=status_code
+            )
+
+    class Item(msgspec.Struct):
+        id: int
+
+    rep_a = ConfigurableRep("v1")
+    rep_b = ConfigurableRep("v2")
+    type Wrapped[T] = Annotated[T, Status(201), rep_a]
+
+    def create() -> Wrapped[Item]:
+        return Item(id=4)
+
+    def agreed_a() -> Annotated[int, rep_a] | str:
+        return 1
+
+    def agreed_b() -> str | Annotated[int, rep_a]:
+        return "hi"
+
+    def conflict_raw_1() -> Annotated[int, rep_a] | Annotated[str, Raw]:
+        return 1
+
+    def conflict_raw_2() -> Annotated[str, Raw] | Annotated[int, rep_a]:
+        return "a"
+
+    def conflict_two() -> Annotated[int, rep_a] | Annotated[str, rep_b]:
+        return 1
+
+    app = Chano(docs=False)
+    app.add_route("/wrapped", create, ["POST"])
+    app.add_route("/agreed-a", agreed_a, ["GET"])
+    app.add_route("/agreed-b", agreed_b, ["GET"])
+    client = make_client(app)
+
+    r = client("POST", "/wrapped")
+    assert r.status_code == 201
+    assert r.json() == {"prefix": "v1", "value": {"id": 4}}
+    assert client("GET", "/agreed-a").json() == {"prefix": "v1", "value": 1}
+    assert client("GET", "/agreed-b").json() == {"prefix": "v1", "value": "hi"}
+
+    for bad_handler in (conflict_raw_1, conflict_raw_2, conflict_two):
+        with pytest.raises(ValueError, match="conflicting representations"):
+            app.add_route("/bad", bad_handler, ["GET"])
+
+
+# @lat: [[tests#Representations#Header merge constructor cookies and post content-type]]
+def test_header_merge_constructor_cookies_and_post_content_type():
+    class CookieRep(JSONRepresentation):
+        def media_type(self, status_code: int) -> str:
+            if status_code < 400:
+                return "application/vnd.api+json"
+            return super().media_type(status_code)
+
+        def render(
+            self, request: Request, value: Any, status_code: int
+        ) -> Response[Any]:
+            if status_code >= 400 or isinstance(value, Exception):
+                return super().render(request, value, status_code)
+            return Response(
+                msgspec.json.encode({"data": value}),
+                status_code=status_code,
+                media_type=self.media_type(status_code),
+                headers={"Set-Cookie": "from_rep=1; Path=/"},
+            )
+
+    def with_cookies() -> JSONResponse[dict[str, int]]:
+        res = JSONResponse(
+            {"x": 1},
+            status_code=201,
+            headers={"Set-Cookie": "from_handler=2; Path=/"},
+        )
+        res.set_cookie("extra", "3")
+        return res
+
+    def post_ct() -> JSONResponse[dict[str, int]]:
+        res = JSONResponse({"x": 2})
+        res.headers["content-type"] = "application/vnd.post+json"
+        return res
+
+    app = Chano(docs=False)
+    rep = CookieRep()
+    app.add_route("/cookies", with_cookies, ["POST"], representation=rep)
+    app.add_route("/post-ct", post_ct, ["GET"], representation=rep)
+    client = make_client(app)
+
+    r_cookies = client("POST", "/cookies")
+    assert r_cookies.status_code == 201
+    assert r_cookies.headers["content-type"] == "application/vnd.api+json"
+    assert r_cookies.json() == {"data": {"x": 1}}
+    cookies = r_cookies.headers.get_list("set-cookie")
+    assert len(cookies) == 3
+    assert "from_rep=1; Path=/" in cookies
+    assert "from_handler=2; Path=/" in cookies
+    assert any(c.startswith("extra=3;") for c in cookies)
+
+    r_ct = client("GET", "/post-ct")
+    assert r_ct.status_code == 200
+    assert r_ct.headers["content-type"] == "application/vnd.post+json"
+    assert r_ct.json() == {"data": {"x": 2}}
+
+    # Constructor set-cookie stays in response.headers so callers can pop it.
+    plain = Response("ok", headers={"Set-Cookie": "temp=1"})
+    assert plain.headers.pop("set-cookie", None) == "temp=1"
+    assert "set-cookie" not in plain.headers
+
+
+# @lat: [[tests#Representations#Decorated partial and nested ForwardRefs in OpenAPI]]
+def test_decorated_partial_and_nested_forward_refs(tmp_path, isolated_imports):
+    class Item(msgspec.Struct):
+        id: int
+
+    @raises(409, "Conflict")
+    @status_code(201, description="Created item")
+    def base(item_id: int) -> Item:
+        return Item(id=item_id)
+
+    bound = raises(410, "Gone")(functools.partial(base, 42))
+
+    app = Chano(docs=False)
+    app.add_route("/partial", bound, ["POST"])
+    client = make_client(app)
+
+    res = client("POST", "/partial")
+    assert res.status_code == 201
+    assert res.json() == {"id": 42}
+
+    resps = app.openapi()["paths"]["/partial"]["post"]["responses"]
+    assert resps["201"] == {
+        "description": "Created item",
+        "content": {
+            "application/json": {"schema": {"$ref": "#/components/schemas/Item"}}
+        },
+    }
+    assert resps["409"] == {"description": "Conflict"}
+    assert resps["410"] == {"description": "Gone"}
+
+    # Nested ForwardRefs inside Annotated / unions skip only the unresolved
+    # branch while preserving return metadata and resolved sibling branches.
+    from typing import ForwardRef
+
+    hidden_ref: Any = ForwardRef("Hidden")
+
+    def only_hidden():
+        return {"ok": True}
+
+    only_hidden.__annotations__["return"] = Annotated[
+        hidden_ref, "example", Status(201), Status(404, description="Missing")
+    ]
+
+    def mixed_hidden():
+        return Item(id=7)
+
+    mixed_hidden.__annotations__["return"] = (
+        Annotated[hidden_ref, "example", Status(201)]
+        | Annotated[list[hidden_ref], Status(201)]
+        | Annotated[Item, Status(201)]
+    )
+
+    fwd_app = Chano(docs=False)
+    fwd_app.add_route("/hidden", only_hidden, ["POST"])
+    fwd_app.add_route("/mixed-hidden", mixed_hidden, ["POST"])
+    fwd_spec = fwd_app.openapi()
+    assert fwd_spec["paths"]["/hidden"]["post"]["responses"] == {
+        "201": {"description": "Created"},
+        "404": {"description": "Missing"},
+    }
+    assert fwd_spec["paths"]["/mixed-hidden"]["post"]["responses"]["201"] == {
+        "description": "Created",
+        "content": {
+            "application/json": {"schema": {"$ref": "#/components/schemas/Item"}}
+        },
+    }
+
+
+# @lat: [[tests#Representations#Native PEP 649 TYPE_CHECKING return annotations]]
+@pytest.mark.skipif(
+    sys.version_info < (3, 14),
+    reason="PEP 649 deferred annotations require Python 3.14+",
+)
+def test_pep649_type_checking_refs(tmp_path, isolated_imports):
+    write_project(
+        tmp_path,
+        {
+            "app/tc/route.py": (
+                "from typing import Annotated, Any, TYPE_CHECKING\n"
+                "from chano import Depends, raises, status_code\n\n"
+                "if TYPE_CHECKING:\n"
+                "    class OnlyAtTypeCheck:\n"
+                "        pass\n\n"
+                "@raises(401, 'Unauthorized')\n"
+                "def auth(token: str = 'ok') -> OnlyAtTypeCheck:\n"
+                "    return token  # type: ignore[return-value]\n\n"
+                "@status_code(201)\n"
+                "@raises(404, 'Not found')\n"
+                "def POST(\n"
+                "    actor: Annotated[Any, Depends(auth)],\n"
+                ") -> Annotated[OnlyAtTypeCheck, 'example']:\n"
+                "    return {'actor': actor}  # type: ignore[return-value]\n"
+            )
+        },
+    )
+    tc_app = create_app(tmp_path / "app")
+    tc_client = make_client(tc_app)
+    r_tc = tc_client("POST", "/tc?token=ada")
+    assert r_tc.status_code == 201
+    assert r_tc.json() == {"actor": "ada"}
+
+    tc_spec = tc_app.openapi()
+    tc_resps = tc_spec["paths"]["/tc"]["post"]["responses"]
+    assert tc_resps["201"] == {"description": "Created"}
+    assert tc_resps["401"] == {"description": "Unauthorized"}
+    assert tc_resps["404"] == {"description": "Not found"}
+    assert "422" in tc_resps
+
+    assert sys.version_info >= (3, 14)
+    if sys.version_info >= (3, 14):
+        import annotationlib
+
+        mod = load_module(tmp_path / "app" / "tc" / "route.py")
+        fwd = annotationlib.get_annotations(
+            mod.POST, format=annotationlib.Format.FORWARDREF
+        )
+        assert "return" in fwd
+        strs = annotationlib.get_annotations(
+            mod.POST, format=annotationlib.Format.STRING
+        )
+        assert "OnlyAtTypeCheck" in strs["return"]
+
+
+# @lat: [[tests#Representations#StatusRepresentation composition and dispatch]]
+@pytest.mark.parametrize("factory", FACTORIES)
+def test_status_representation_composition_and_dispatch(
+    tmp_path, isolated_imports, factory
+):
+    write_project(
+        tmp_path,
+        {
+            "app/representation.py": (
+                "from typing import Any\n"
+                "import msgspec\n"
+                "from chano import (\n"
+                "    HTTPException,\n"
+                "    JSONResponse,\n"
+                "    Request,\n"
+                "    RequestValidationError,\n"
+                "    Response,\n"
+                "    StatusRepresentation,\n"
+                ")\n\n"
+                "class Envelope[T](msgspec.Struct):\n"
+                "    data: T\n\n"
+                "class Problem(msgspec.Struct):\n"
+                "    title: str\n"
+                "    status: int\n"
+                "    detail: Any = None\n\n"
+                "class EnvelopeRep:\n"
+                "    response_type = JSONResponse\n"
+                "    def media_type(self, status_code: int) -> str:\n"
+                "        return 'application/vnd.api+json'\n"
+                "    def body_type(self, status_code: int, returns: Any) -> Any:\n"
+                "        return Envelope[returns]\n"
+                "    def render(\n"
+                "        self, request: Request, value: Any, status_code: int\n"
+                "    ) -> Response[Any]:\n"
+                "        return JSONResponse(\n"
+                "            Envelope(data=value),\n"
+                "            status_code=status_code,\n"
+                "            media_type=self.media_type(status_code),\n"
+                "        )\n\n"
+                "class ProblemRep:\n"
+                "    response_type = JSONResponse\n"
+                "    def media_type(self, status_code: int) -> str:\n"
+                "        return 'application/problem+json'\n"
+                "    def body_type(self, status_code: int, returns: Any) -> Any:\n"
+                "        return Problem\n"
+                "    def render(\n"
+                "        self, request: Request, value: Any, status_code: int\n"
+                "    ) -> Response[Any]:\n"
+                "        if isinstance(value, HTTPException):\n"
+                "            detail = value.detail\n"
+                "            headers = value.headers\n"
+                "        elif isinstance(value, RequestValidationError):\n"
+                "            detail = value.errors\n"
+                "            headers = None\n"
+                "        else:\n"
+                "            detail = str(value)\n"
+                "            headers = None\n"
+                "        problem = Problem(\n"
+                "            title='Error', status=status_code, detail=detail\n"
+                "        )\n"
+                "        return JSONResponse(\n"
+                "            problem,\n"
+                "            status_code=status_code,\n"
+                "            headers=headers,\n"
+                "            media_type=self.media_type(status_code),\n"
+                "        )\n\n"
+                "class ConflictRep:\n"
+                "    response_type = JSONResponse\n"
+                "    def media_type(self, status_code: int) -> str:\n"
+                "        return 'application/vnd.conflict+json'\n"
+                "    def body_type(self, status_code: int, returns: Any) -> Any:\n"
+                "        return dict[str, Any]\n"
+                "    def render(\n"
+                "        self, request: Request, value: Any, status_code: int\n"
+                "    ) -> Response[Any]:\n"
+                "        return JSONResponse(\n"
+                "            {'conflict': True, 'status': status_code},\n"
+                "            status_code=status_code,\n"
+                "            media_type=self.media_type(status_code),\n"
+                "        )\n\n"
+                "representation = StatusRepresentation(\n"
+                "    {\n"
+                "        409: ConflictRep(),\n"
+                "        frozenset({200, 201}): EnvelopeRep(),\n"
+                "        range(400, 600): ProblemRep(),\n"
+                "    }\n"
+                ")\n"
+            ),
+            "app/items/route.py": (
+                "import msgspec\n"
+                "from chano import HTTPException\n"
+                "from chano.status import Conflict, Created, NotFound\n\n"
+                "class Item(msgspec.Struct):\n"
+                "    id: int\n\n"
+                "def POST(item_id: int) -> Created[Conflict[NotFound[Item]]]:\n"
+                "    if item_id == 0:\n"
+                "        raise HTTPException(404, 'missing')\n"
+                "    if item_id == -1:\n"
+                "        raise HTTPException(409, 'dup')\n"
+                "    return Item(id=item_id)\n"
+            ),
+        },
+    )
+    app_dir = tmp_path / "app"
+    app = (
+        create_app(app_dir) if factory == "dev" else create_route_app(app_dir, "items")
+    )
+    client = make_client(app)
+
+    ok = client("POST", "/items?item_id=7")
+    assert ok.status_code == 201
+    assert ok.headers["content-type"] == "application/vnd.api+json"
+    assert ok.json() == {"data": {"id": 7}}
+
+    not_found = client("POST", "/items?item_id=0")
+    assert not_found.status_code == 404
+    assert not_found.headers["content-type"] == "application/problem+json"
+    assert not_found.json() == {"title": "Error", "status": 404, "detail": "missing"}
+
+    conflict = client("POST", "/items?item_id=-1")
+    assert conflict.status_code == 409
+    assert conflict.headers["content-type"] == "application/vnd.conflict+json"
+    assert conflict.json() == {"conflict": True, "status": 409}
+
+    bad = client("POST", "/items?item_id=abc")
+    assert bad.status_code == 422
+    assert bad.headers["content-type"] == "application/problem+json"
+    assert bad.json()["status"] == 422
+
+    if factory == "dev":
+        resps = app.openapi()["paths"]["/items"]["post"]["responses"]
+        assert set(resps) == {"201", "404", "409", "422"}
+        assert "application/vnd.api+json" in resps["201"]["content"]
+        assert "application/problem+json" in resps["404"]["content"]
+        assert "application/vnd.conflict+json" in resps["409"]["content"]
+        assert "application/problem+json" in resps["422"]["content"]
+
+
+# @lat: [[tests#Representations#StatusRepresentation defaults and validation]]
+def test_status_representation_defaults_response_types_and_validation():
+    class HTMLOnlyRep:
+        response_type = HTMLResponse
+
+        def media_type(self, status_code: int) -> str:
+            return "text/html"
+
+        def body_type(self, status_code: int, returns: Any) -> Any:
+            return returns
+
+        def render(
+            self, request: Request, value: Any, status_code: int
+        ) -> Response[Any]:
+            return HTMLResponse(f"<p>{value}</p>", status_code=status_code)
+
+    class ErrOnlyRep(JSONRepresentation):
+        def media_type(self, status_code: int) -> str:
+            return "application/problem+json"
+
+        def body_type(self, status_code: int, returns: Any) -> Any:
+            return dict[str, str]
+
+        def render(
+            self, request: Request, value: Any, status_code: int
+        ) -> Response[Any]:
+            return JSONResponse(
+                {"err": str(value)},
+                status_code=status_code,
+                media_type=self.media_type(status_code),
+            )
+
+    # Empty StatusRepresentation with default=None falls back to JSONResponse.
+    empty_rep = StatusRepresentation({}, default=None)
+    assert isinstance(empty_rep, Representation)
+    assert empty_rep.response_type is JSONResponse
+    assert empty_rep.media_type(200) == "application/json"
+    assert empty_rep.body_type(200, int) is int
+    assert empty_rep.body_type(404, None) is None
+
+    # Heterogeneous response_types: 200 matches HTMLResponse only; 4xx matches JSON.
+    mixed = StatusRepresentation(
+        {range(200, 400): HTMLOnlyRep(), range(400, 600): ErrOnlyRep()},
+        default=None,
+    )
+    assert mixed.response_type == (HTMLResponse, JSONResponse)
+
+    # Nested StatusRepresentation with default=None leaves unmatched 4xx on default.
+    nested = StatusRepresentation(
+        {range(200, 400): StatusRepresentation({200: HTMLOnlyRep()}, default=None)},
+        default=None,
+    )
+
+    def plain_item(q: int = 1) -> dict[str, int]:
+        if q == 0:
+            raise HTTPException(404, "missing")
+        return {"q": q}
+
+    def html_page() -> HTMLResponse[str]:
+        return HTMLResponse("hello")
+
+    def html_err() -> HTMLResponse[str]:
+        return HTMLResponse("nope", status_code=400)
+
+    @raises(404, "Missing")
+    def nested_plain(q: int = 1) -> dict[str, int]:
+        if q == 0:
+            raise HTTPException(404, "x")
+        return {"q": q}
+
+    app = Chano(docs=False)
+    app.add_route("/plain", plain_item, ["GET"], representation=mixed)
+    app.add_route("/html", html_page, ["GET"], representation=mixed)
+    app.add_route("/html-err", html_err, ["GET"], representation=mixed)
+    app.add_route("/nested-html", html_page, ["GET"], representation=nested)
+    app.add_route("/nested-plain", nested_plain, ["GET"], representation=nested)
+    client = make_client(app)
+
+    # Plain JSON return on 200 does not match HTMLOnlyRep -> falls back to JSONResponse.
+    r_plain = client("GET", "/plain")
+    assert r_plain.status_code == 200
+    assert r_plain.headers["content-type"] == "application/json"
+    assert r_plain.json() == {"q": 1}
+
+    # HTMLResponse on 200 matches HTMLOnlyRep.
+    r_html = client("GET", "/html")
+    assert r_html.status_code == 200
+    assert r_html.text == "<p>hello</p>"
+
+    # HTMLResponse on 400 resolves to ErrOnlyRep (JSON) -> passes through untouched.
+    r_html_err = client("GET", "/html-err")
+    assert r_html_err.status_code == 400
+    assert r_html_err.text == "nope"
+
+    # Exception on /plain resolves to ErrOnlyRep.
+    r_err = client("GET", "/plain?q=0")
+    assert r_err.status_code == 404
+    assert r_err.headers["content-type"] == "application/problem+json"
+
+    # Nested StatusRepresentation resolves 200 -> HTMLOnlyRep and 404 -> default.
+    assert client("GET", "/nested-html").text == "<p>hello</p>"
+    r_nested_404 = client("GET", "/nested-plain?q=0")
+    assert r_nested_404.status_code == 404
+    assert r_nested_404.headers["content-type"] == "application/json"
+    assert r_nested_404.json() == {"detail": "x"}
+
+    # OpenAPI reflects per-status response_type matching and default=None fallback.
+    spec = app.openapi()
+    assert spec["paths"]["/plain"]["get"]["responses"]["200"]["content"] == {
+        "application/json": {
+            "schema": {"type": "object", "additionalProperties": {"type": "integer"}}
+        }
+    }
+    assert (
+        "application/problem+json"
+        in (spec["paths"]["/plain"]["get"]["responses"]["422"]["content"])
+    )
+    assert spec["paths"]["/nested-plain"]["get"]["responses"]["404"] == {
+        "description": "Missing"
+    }
+    assert (
+        "application/json"
+        in (spec["paths"]["/nested-plain"]["get"]["responses"]["422"]["content"])
+    )
+
+    # Validation errors on StatusRepresentation arguments.
+    bad_routes: Any = "not-a-mapping"
+    with pytest.raises(TypeError, match="mapping"):
+        StatusRepresentation(bad_routes)
+    bad_key: Any = "200"
+    with pytest.raises(TypeError, match="keys"):
+        StatusRepresentation({bad_key: JSONRepresentation()})
+    bad_bool_key: Any = True
+    with pytest.raises(TypeError, match="keys"):
+        StatusRepresentation({bad_bool_key: JSONRepresentation()})
+    bad_val: Any = "not-a-rep"
+    with pytest.raises(TypeError, match="values"):
+        StatusRepresentation({200: bad_val})
+    with pytest.raises(TypeError, match="default"):
+        StatusRepresentation({}, default=bad_val)
+
+
+# @lat: [[tests#Representations#Unified Status aliases and additive error metadata]]
+def test_unified_status_aliases_and_additive_error_metadata():
+    from chano import status as status_mod
+    from chano.representation import parse_return
+    from chano.status import (
+        OK,
+        Accepted,
+        BadGateway,
+        BadRequest,
+        Conflict,
+        Created,
+        Forbidden,
+        Found,
+        Gone,
+        InternalServerError,
+        MovedPermanently,
+        NoContent,
+        NotFound,
+        NotModified,
+        PermanentRedirect,
+        SeeOther,
+        ServiceUnavailable,
+        TemporaryRedirect,
+        TooManyRequests,
+        Unauthorized,
+        UnprocessableContent,
+    )
+
+    class Item(msgspec.Struct):
+        id: int
+
+    class User(msgspec.Struct):
+        name: str
+
+    # Every alias in chano.status expands to Annotated[..., Status(code)].
+    expected_codes = {
+        OK: 200,
+        Created: 201,
+        Accepted: 202,
+        MovedPermanently: 301,
+        Found: 302,
+        SeeOther: 303,
+        TemporaryRedirect: 307,
+        PermanentRedirect: 308,
+        BadRequest: 400,
+        Unauthorized: 401,
+        Forbidden: 403,
+        NotFound: 404,
+        Conflict: 409,
+        Gone: 410,
+        UnprocessableContent: 422,
+        TooManyRequests: 429,
+        InternalServerError: 500,
+        BadGateway: 502,
+        ServiceUnavailable: 503,
+    }
+    for alias, code in expected_codes.items():
+
+        def _probe() -> Any:
+            return None
+
+        _probe.__annotations__["return"] = alias[Item]
+        spec = parse_return(_probe)
+        if code < 400:
+            assert spec.default_status == code
+            assert spec.error_statuses == {}
+        else:
+            assert spec.default_status is None
+            assert spec.branches[0].status_code == 200
+            assert code in spec.error_statuses
+
+    assert set(status_mod.__all__) >= {
+        "OK",
+        "Created",
+        "Accepted",
+        "NoContent",
+        "NotModified",
+        "NotFound",
+        "Unauthorized",
+        "Forbidden",
+        "Conflict",
+        "UnprocessableContent",
+    }
+
+    # Dependency with < 400 (Created) and >= 400 (Unauthorized) only propagates 401.
+    def require_user() -> Created[Unauthorized[User]]:
+        return User(name="ada")
+
+    # Inherited check with both < 400 and >= 400 only propagates 403.
+    def require_admin() -> Accepted[Forbidden[None]]:
+        return None
+
+    # NotFound[Item] -> 200 Item + 404 Not Found.
+    def get_item(user: Annotated[User, Depends(require_user)]) -> NotFound[Item]:
+        return Item(id=1)
+
+    # Created[NotFound[Item]] and NotFound[Created[Item]] -> 201 Item + 404 Not Found.
+    def create_a() -> Created[NotFound[Item]]:
+        return Item(id=2)
+
+    def create_b() -> NotFound[Created[Item]]:
+        return Item(id=3)
+
+    # NotFound[NoContent] -> 204 bodyless + 404 Not Found.
+    def delete_item() -> NotFound[NoContent]:
+        return None
+
+    # NotModified -> 304 bodyless.
+    def check_cache() -> NotModified:
+        return None
+
+    # @raises sugar produces the same Status metadata as Annotated[..., Status(...)].
+    @raises(409, "Already exists")
+    def with_sugar() -> Created[Item]:
+        return Item(id=4)
+
+    def with_direct() -> Annotated[
+        Created[Item], Status(409, description="Already exists")
+    ]:
+        return Item(id=4)
+
+    assert parse_return(with_sugar) == parse_return(with_direct)
+
+    # Explicit description in dependency fills in descriptionless NotFound[Item].
+    @raises(404, "Detailed missing item")
+    def find_item() -> Item:
+        return Item(id=5)
+
+    def get_with_dep_desc(item: Annotated[Item, Depends(find_item)]) -> NotFound[Item]:
+        return item
+
+    app = Chano(docs=False)
+    app.add_route("/get", get_item, ["GET"], dependencies=[[require_admin]])
+    app.add_route("/create-a", create_a, ["POST"])
+    app.add_route("/create-b", create_b, ["POST"])
+    app.add_route("/delete", delete_item, ["DELETE"])
+    app.add_route("/cache", check_cache, ["GET"])
+    app.add_route("/dep-desc", get_with_dep_desc, ["GET"])
+    client = make_client(app)
+
+    # Runtime statuses: NotFound[Item] stays 200; Created[NotFound[Item]] is 201.
+    r_get = client("GET", "/get")
+    assert r_get.status_code == 200
+    assert r_get.json() == {"id": 1}
+
+    assert client("POST", "/create-a").status_code == 201
+    assert client("POST", "/create-b").status_code == 201
+    assert client("DELETE", "/delete").status_code == 204
+    assert client("GET", "/cache").status_code == 304
+
+    openapi = app.openapi()
+    get_resps = openapi["paths"]["/get"]["get"]["responses"]
+    # Neither Created (201) nor Accepted (202) leaked from deps/checks.
+    assert set(get_resps) == {"200", "401", "403", "404"}
+    assert get_resps["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/Item"
+    }
+    assert get_resps["401"] == {"description": "Unauthorized"}
+    assert get_resps["403"] == {"description": "Forbidden"}
+    assert get_resps["404"] == {"description": "Not Found"}
+
+    for path in ("/create-a", "/create-b"):
+        resps = openapi["paths"][path]["post"]["responses"]
+        assert set(resps) == {"201", "404"}
+        assert resps["201"]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/Item"
+        }
+        assert resps["404"] == {"description": "Not Found"}
+
+    assert openapi["paths"]["/delete"]["delete"]["responses"] == {
+        "204": {"description": "No Content"},
+        "404": {"description": "Not Found"},
+    }
+    assert openapi["paths"]["/cache"]["get"]["responses"] == {
+        "304": {"description": "Not Modified"}
+    }
+    assert openapi["paths"]["/dep-desc"]["get"]["responses"]["404"] == {
+        "description": "Detailed missing item"
+    }
+
+
+# @lat: [[tests#Representations#Nested aliases None rep ambiguous returns and 205]]
+def test_nested_alias_none_representation_ambiguous_and_205(capsys):
+    from chano.representation import parse_return
+    from chano.status import Accepted, Created, NotFound, ResetContent
+
+    class Envelope[T](msgspec.Struct):
+        data: T
+
+    class EnvelopeRep(JSONRepresentation):
+        def body_type(self, status_code: int, returns: Any) -> Any:
+            if status_code < 400:
+                return Envelope[returns]
+            return super().body_type(status_code, returns)
+
+        def render(
+            self, request: Request, value: Any, status_code: int
+        ) -> Response[Any]:
+            if status_code >= 400 or isinstance(value, Exception):
+                return super().render(request, value, status_code)
+            return JSONResponse(Envelope(data=value), status_code=status_code)
+
+    # 1. Nested repeated TypeAliasType expands completely; cycles still terminate.
+    def nested_alias() -> NotFound[NotFound[Created[str]]]:
+        return "created"
+
+    spec_nested = parse_return(nested_alias)
+    assert spec_nested.default_status == 201
+    assert spec_nested.branches[0].payload_type is str
+    assert spec_nested.error_statuses == {404: None}
+
+    type RecLoop[T] = Annotated[  # ty: ignore[cyclic-type-alias-definition]
+        RecLoop[T], Status(201)
+    ]
+
+    def recursive_alias() -> RecLoop[str]:
+        return "ok"  # type: ignore[return-value]
+
+    spec_rec = parse_return(recursive_alias)
+    assert spec_rec.default_status == 201
+
+    # 2. OpenAPI None with active representation vs JSONRepresentation vs bodyless 205.
+    env_rep = EnvelopeRep()
+
+    def none_enveloped() -> Annotated[None, env_rep]:
+        return None
+
+    def none_json_rep() -> Annotated[None, JSONRepresentation()]:
+        return None
+
+    def reset_plain() -> ResetContent:
+        return None
+
+    def reset_enveloped() -> Annotated[ResetContent, env_rep]:
+        return None
+
+    # 4. Ambiguous multi-status union rejects plain return with TypeError.
+    def ambiguous(explicit: bool = False) -> Created[str] | Accepted[str]:
+        if explicit:
+            resp: Any = JSONResponse("ok", status_code=201)
+            return resp
+        return "plain"
+
+    # 5. Status(103) is rejected with ValueError.
+    with pytest.raises(ValueError, match="status"):
+        Status(103)
+
+    app = Chano(docs=False)
+    app.add_route("/nested", nested_alias, ["POST"])
+    app.add_route("/none-env", none_enveloped, ["GET"])
+    app.add_route("/none-json", none_json_rep, ["GET"])
+    app.add_route("/reset", reset_plain, ["POST"])
+    app.add_route("/reset-env", reset_enveloped, ["POST"])
+    app.add_route("/ambiguous", ambiguous, ["POST"])
+    client = make_client(app)
+
+    r_nested = client("POST", "/nested")
+    assert r_nested.status_code == 201
+    assert r_nested.json() == "created"
+
+    r_none_env = client("GET", "/none-env")
+    assert r_none_env.status_code == 200
+    assert r_none_env.json() == {"data": None}
+
+    for path in ("/reset", "/reset-env"):
+        r_reset = client("POST", path)
+        assert r_reset.status_code == 205
+        assert r_reset.content == b""
+        assert "content-length" not in r_reset.headers
+        assert "content-type" not in r_reset.headers
+
+    r_ambig_plain = client("POST", "/ambiguous")
+    assert r_ambig_plain.status_code == 500
+    err_out = capsys.readouterr().err
+    assert "TypeError" in err_out
+    assert "201, 202" in err_out
+    assert "explicit Response" in err_out
+
+    r_ambig_explicit = client("POST", "/ambiguous?explicit=true")
+    assert r_ambig_explicit.status_code == 201
+    assert r_ambig_explicit.json() == "ok"
+
+    schema = app.openapi()
+    nested_resps = schema["paths"]["/nested"]["post"]["responses"]
+    assert set(nested_resps) == {"201", "404"}
+    assert nested_resps["201"]["content"] == {
+        "application/json": {"schema": {"type": "string"}}
+    }
+
+    none_env_200 = schema["paths"]["/none-env"]["get"]["responses"]["200"]
+    assert "content" in none_env_200
+    env_ref = none_env_200["content"]["application/json"]["schema"]["$ref"]
+    env_name = env_ref.removeprefix("#/components/schemas/")
+    assert schema["components"]["schemas"][env_name]["properties"]["data"] == {
+        "type": "null"
+    }
+
+    assert "content" not in schema["paths"]["/none-json"]["get"]["responses"]["200"]
+    assert schema["paths"]["/reset"]["post"]["responses"] == {
+        "205": {"description": "Reset Content"}
+    }
+    assert schema["paths"]["/reset-env"]["post"]["responses"] == {
+        "205": {"description": "Reset Content"}
+    }
