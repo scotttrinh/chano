@@ -1,7 +1,7 @@
 ---
 title: Routing and special files
 description: File-system routing conventions, HTTP method exports, match precedence, folder-scoped hooks, and route-level options.
-lede: Folders under app/ define URLs, route.py exports HTTP handlers, and sibling special files scope middleware, errors, and dependencies to a subtree.
+lede: Folders under app/ define URLs, route.py exports HTTP handlers, and sibling special files scope middleware, errors, dependencies, and representations to a subtree.
 section: reference
 order: 1
 nav_title: Routing and special files
@@ -104,7 +104,7 @@ Exports `def handle_error(request: Request, exc: Exception) -> Response` or `asy
 
 - Executes **leaf-to-root** (nearest directory first) inside the innermost middleware.
 - Handles `HTTPException`, `RequestValidationError`, `405` method mismatches, and unhandled endpoint exceptions.
-- Re-raising (a bare `raise` or a new exception) passes the exception to the next ancestor `error.py`, then to Chano's default error mapping (`422` for validation, `HTTPException` JSON, or `500` plain text).
+- Re-raising (a bare `raise` or a new exception) passes the exception to the next ancestor `error.py`, then to the route's `representation.error` (when configured) or Chano's default error mapping (`422` for validation, `HTTPException` JSON, or `500` plain text).
 - Exceptions raised by middleware bypass `error.py` and use Chano's default error mapping.
 
 ### `dependencies.py`
@@ -147,3 +147,12 @@ Each `app/**/schedule.py` compiles to `functions/_schedules/<path>.func/` (`app/
 | `name` | `str` | Path with `/` -> `-` | Schedule key (`1`–`256` chars, alnum start, `[A-Za-z0-9._-]`) |
 
 Duplicate logical paths or colliding schedule names raise `ValueError`.
+
+### `representation.py`
+
+Exports `representation: Representation` (an object implementing the [`Representation`](/reference/requests-and-responses#representation) protocol, such as a [`JSONRepresentation`](/reference/requests-and-responses#representation) subclass):
+
+- **Nearest wins**: the closest `representation.py` to a route replaces any ancestor `representation.py`; representations do not chain or merge. Routes with no ancestor `representation.py` keep Chano's default wire format and OpenAPI output unchanged.
+- **Validation and conflicts**: missing `representation` or an object missing required protocol members (or an uninstantiated class) raises `TypeError` naming the file at load time. Two route files mapping to the same URL path with different representations raise `ValueError`.
+- **Order relative to `error.py`**: `error.py` boundaries run first, leaf-to-root. `representation.error` runs only as the final fallback past the root `error.py` (replacing Chano's default `error_response`). If `representation.success` raises, the exception enters `error.py` like any handler error.
+- **Bundling**: `chano build` includes ancestor `representation.py` files in each function's trace roots so their imports are vendored into deployed functions.

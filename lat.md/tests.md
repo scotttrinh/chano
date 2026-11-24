@@ -739,3 +739,39 @@ Verify multi-namespace `Workflows` registries mount `/.well-known/workflow/v1/fl
 ## Combined Vercel primitives
 
 Verify a single project combining HTTP `route.py`, `queue.py`, `schedule.py`, and `[[tool.vercel.workflows]]` builds cleanly with all functions, `config.json` sections, and isolated OpenAPI output.
+
+## Representations
+
+Tests for [[src/chano/representation.py#Representation]], [[src/chano/representation.py#JSONRepresentation]], `representation.py` loading, runtime rendering, OpenAPI schemas, and build bundling.
+
+### Problem JSON subclassing JSONRepresentation
+
+Verify a Problem JSON subclass renders `HTTPException`, `422` validation failures, `405` method mismatches, and `500`s as `application/problem+json` across both factories, while OpenAPI documents `422` and `@raises` bodies (leaving `None` bodyless).
+
+### Generic Struct envelope representation
+
+Verify a generic `msgspec.Struct` (`Document[T]`) envelope wraps handler return values with a custom media type across both factories, lets explicit `Response` bypass it, and documents the wrapped `200` schema and default error shapes in OpenAPI.
+
+### Nearest wins and no-representation unchanged
+
+Verify a nested `(v2)/representation.py` replaces an ancestor `representation.py` without chaining, routes outside any representation keep default output and OpenAPI schemas, and unmatched `404`s stay on default error mapping.
+
+### Error boundaries run before representation error
+
+Verify `error.py` handles endpoint and `representation.success` errors before `representation.error`, and that re-raising or replacing an exception in `error.py` passes the latest exception to `representation.error`.
+
+### Invalid representation.py and conflicting paths
+
+Verify missing, non-protocol, class, or malformed `representation.py` exports raise `TypeError` naming the file in both factories, `add_route` rejects invalid representations, and conflicting path representations raise `ValueError`.
+
+### Broken representation error and non-Response fallback
+
+Verify a raising or non-`Response` `representation.error` falls back to `error_response` (500), and a non-`Response` `representation.success` raises `TypeError` naming the representation into the error boundary.
+
+### Sync and async representations
+
+Verify both sync and async `Representation` implementations work for success and error responses across both `create_app` and `create_route_app`, and that `JSONRepresentation()` satisfies the runtime-checkable `Representation` protocol.
+
+### Build trace roots and bundling
+
+Verify `plan_build` includes `representation.py` in `trace_roots` only for functions beneath it, built static `openapi.json` reflects the representation, and `build` bundles its imports only into those functions.

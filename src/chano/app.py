@@ -18,6 +18,7 @@ from chano.config import WorkflowConfig, normalize_base_path
 from chano.exceptions import HTTPException, RequestValidationError
 from chano.openapi import openapi_info, openapi_schema, swagger_html
 from chano.params import Endpoint
+from chano.representation import Representation, is_representation
 from chano.requests import Receive, Request, Scope, Send
 from chano.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 
@@ -152,18 +153,35 @@ def _is_async(handler: Callable[..., Any]) -> bool:
 
 
 async def _error_boundary(
-    handlers: Sequence[ErrorHandler], request: Request, exc: Exception
+    handlers: Sequence[ErrorHandler],
+    request: Request,
+    exc: Exception,
+    representation: Representation | None = None,
 ) -> Response:
     """Hand ``exc`` to the nearest of ``handlers`` (root to leaf). Whatever
     it raises, including a non-``Response`` result as ``TypeError``, goes
-    to the next ancestor; past the root, ``error_response`` maps it.
+    to the next ancestor; past the root, ``representation.error`` (when
+    configured) or ``error_response`` maps it.
 
     Async handlers run on the event loop; sync ones in a worker thread. An
     awaitable result, such as a sync wrapper's coroutine, is awaited before
     the ``Response`` check. Each ancestor runs inside the ``except`` of the
     one below it, so a bare ``raise`` there re-raises the latest exception."""
     if not handlers:
-        return error_response(exc)
+        if representation is None:
+            return error_response(exc)
+        try:
+            response = representation.error(request, exc)
+            if inspect.isawaitable(response):
+                response = await response
+            if not isinstance(response, Response):
+                raise TypeError(
+                    f"representation {representation!r} error() "
+                    f"returned {response!r}, not a Response"
+                )
+            return response
+        except Exception as raised:
+            return error_response(raised)
     *ancestors, handler = handlers
     try:
         if _is_async(handler):
@@ -181,7 +199,7 @@ async def _error_boundary(
                 f"returned {response!r}, not a Response"
             )
     except Exception as raised:
-        return await _error_boundary(ancestors, request, raised)
+        return await _error_boundary(ancestors, request, raised, representation)
     return response
 
 
@@ -259,6 +277,8 @@ class Chano:
         self._schedule_runner: Callable[..., Awaitable[Any]] | None = None
         self._startup_hooks: list[Callable[[], Awaitable[None]]] = []
         self._shutdown_hooks: list[Callable[[], Awaitable[None]]] = []
+        self.representations: dict[str, Representation | None] = {}
+        """Each path's representation, if any."""
 
     def on_startup(self, hook: Callable[[], Awaitable[None]]) -> None:
         """Register an async hook invoked on ASGI ``lifespan.startup``."""
@@ -310,6 +330,7 @@ class Chano:
         middleware: Sequence[Middleware] = (),
         error_handlers: Sequence[ErrorHandler] = (),
         dependencies: Sequence[Sequence[Callable[..., Any]]] = (),
+        representation: Representation | None = None,
     ) -> None:
         """Register ``handler`` for ``path``; ``include_in_schema=False``
         (or ``@openapi(include_in_schema=False)`` on ``handler``) serves it
@@ -317,10 +338,17 @@ class Chano:
 
         ``middleware`` wraps every method of ``path``, outermost first.
         ``error_handlers`` (root to leaf) handle its endpoint's errors,
-        nearest first. Each call for one path must pass the same chains.
+        nearest first. ``representation``, when set, renders non-``Response``
+        results and fallback errors and describes them in OpenAPI. Each call
+        for one path must pass the same chains and representation.
         ``dependencies`` holds one group of checks per segment, root to leaf;
         they run in that order before ``handler``'s arguments, sharing their
         per-request ``Depends`` cache."""
+        if representation is not None and not is_representation(representation):
+            raise TypeError(
+                f"invalid representation for route {path!r}: expected a "
+                f"Representation, got {representation!r}"
+            )
         if include_in_schema is None:
             info = openapi_info(handler)
             include_in_schema = (
@@ -337,10 +365,13 @@ class Chano:
             self.routes.append((path, _compile_path(path), endpoints))
             self.middleware[path] = chain
             self.error_handlers[path] = handlers
+            self.representations[path] = representation
         elif self.middleware[path] != chain:
             raise ValueError(f"conflicting middleware for route {path!r}")
         elif self.error_handlers[path] != handlers:
             raise ValueError(f"conflicting error handlers for route {path!r}")
+        elif self.representations[path] != representation:
+            raise ValueError(f"conflicting representation for route {path!r}")
         for method in map(str.upper, methods):
             endpoints[method] = endpoint
             if include_in_schema:
@@ -420,7 +451,11 @@ class Chano:
         for path, pattern, endpoints in routes:
             if match := pattern.fullmatch(request.path):
                 request.path_params = match.groupdict()
-                call = self._endpoint_call(endpoints, self.error_handlers.get(path, ()))
+                call = self._endpoint_call(
+                    endpoints,
+                    self.error_handlers.get(path, ()),
+                    self.representations.get(path),
+                )
                 for middleware in reversed(self.middleware.get(path, ())):
                     call = _wrap(middleware, call)
                 return await call(request)
@@ -428,7 +463,9 @@ class Chano:
 
     @staticmethod
     def _endpoint_call(
-        endpoints: dict[str, Endpoint], error_handlers: Sequence[ErrorHandler]
+        endpoints: dict[str, Endpoint],
+        error_handlers: Sequence[ErrorHandler],
+        representation: Representation | None = None,
     ) -> CallNext:
         async def call(request: Request) -> Response:
             method = "GET" if request.method == "HEAD" else request.method
@@ -440,9 +477,21 @@ class Chano:
                 result = await endpoint.call(request)
                 if isinstance(result, Response):
                     return result
-                return JSONResponse(result)
+                if representation is None:
+                    return JSONResponse(result)
+                response = representation.success(request, result)
+                if inspect.isawaitable(response):
+                    response = await response
+                if not isinstance(response, Response):
+                    raise TypeError(
+                        f"representation {representation!r} success() "
+                        f"returned {response!r}, not a Response"
+                    )
+                return response
             except Exception as exc:
-                return await _error_boundary(error_handlers, request, exc)
+                return await _error_boundary(
+                    error_handlers, request, exc, representation
+                )
 
         return call
 

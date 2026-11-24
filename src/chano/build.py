@@ -57,6 +57,7 @@ from chano.routing import (
     DEPENDENCIES_FILE,
     ERROR_FILE,
     MIDDLEWARE_FILE,
+    REPRESENTATION_FILE,
     Route,
     create_app,
     discover_routes,
@@ -577,7 +578,12 @@ def _plan_function(route: Route, python: str, base_path: str) -> FunctionSpec:
         vc_config=config,
         trace_roots=(
             route.file,
-            *route.segment_files(MIDDLEWARE_FILE, ERROR_FILE, DEPENDENCIES_FILE),
+            *route.segment_files(
+                MIDDLEWARE_FILE,
+                ERROR_FILE,
+                DEPENDENCIES_FILE,
+                REPRESENTATION_FILE,
+            ),
         ),
         include=_read_module_include(module, route.file),
         source_file=route.file,

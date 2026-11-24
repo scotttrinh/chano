@@ -1,7 +1,7 @@
 ---
 title: Requests, responses, and background work
-description: Reference for Request, Geo, Response classes, cookies, StreamingResponse, SSEResponse, and after().
-lede: Inspect incoming HTTP requests and Vercel edge metadata, return buffered or streaming responses, manage cookies, and schedule post-response tasks.
+description: Reference for Request, Geo, Response classes, Representation, cookies, StreamingResponse, SSEResponse, and after().
+lede: Inspect incoming HTTP requests and Vercel edge metadata, return buffered or streaming responses, customize representations, manage cookies, and schedule post-response tasks.
 section: reference
 order: 3
 nav_title: Requests and responses
@@ -98,3 +98,46 @@ Schedules a sync or async callable to run after the HTTP response finishes sendi
 - Sync callbacks run via `asyncio.to_thread`; async callbacks are awaited on the event loop.
 - Exceptions raised inside callbacks are logged to `stderr` without affecting the HTTP response or other queued callbacks.
 - In `chano dev` and tests, callbacks drain in the request's `finally` block. In built Vercel functions, Chano delegates to `vercel.functions.wait_until`.
+
+## `Representation`
+
+```python
+from chano import JSONRepresentation, Representation
+```
+
+`Representation` is a `typing.Protocol` that pairs runtime response and error rendering with the matching OpenAPI schema transformations for a route subtree (via [`representation.py`](/reference/routing#representation-py)) or a single route (via `Chano.add_route(..., representation=...)`).
+
+| Member | Type / Signature | Role |
+| --- | --- | --- |
+| `media_type` | `str` | OpenAPI content key for `200` success responses |
+| `error_media_type` | `str` | OpenAPI content key for `422` and `@raises` error responses |
+| `success_type(returns)` | `(Any) -> Any` | Maps a handler's return annotation to the wire body annotation used for the `200` OpenAPI schema |
+| `success(request, value)` | `(Request, Any) -> Response \| Awaitable[Response]` | Renders a non-`Response` handler return value into a `Response` |
+| `error_type(status_code)` | `(int) -> Any` | Returns the error body annotation for `status_code`, or `None` for a bodyless OpenAPI response |
+| `error(request, exc)` | `(Request, Exception) -> Response \| Awaitable[Response]` | Renders an uncaught endpoint exception into a `Response` |
+
+### Sync and async calls
+
+`success` and `error` may be sync or async: Chano calls them directly and awaits the result if it is awaitable. Returning anything other than a `Response` raises `TypeError` naming the representation.
+
+`error` receives every endpoint exception, including unexpected ones. `JSONRepresentation.error` logs their traceback to `stderr`; an `error` that handles them itself must log them, or they are lost.
+
+### `JSONRepresentation`
+
+`JSONRepresentation` is a concrete default implementation matching Chano's built-in wire format (`JSONResponse` for success, `error_response` for errors) so you can subclass it and override only the success half or only the error half:
+
+- `media_type` and `error_media_type` are `"application/json"`.
+- `success_type(returns)` returns `returns` unchanged; `success(request, value)` returns `JSONResponse(value)`.
+- `error_type(status_code)` returns `ValidationErrorDetail` (`{"detail": [{"loc": [...], "msg": "..."}]}`) for `422` and `ErrorDetail` (`{"detail": Any}`) for other statuses; `error(request, exc)` delegates to `error_response(exc)`.
+
+### Runtime and OpenAPI behavior
+
+- **Explicit `Response` bypass**: if a handler returns a `Response` instance directly, `representation.success` is skipped. In OpenAPI, `200` only uses `media_type` and `success_type(returns)` when the handler has a return annotation that is neither `None` nor a `Response` subclass.
+- **Error order and fallback**: [`error.py`](/reference/routing#error-py) handlers run first, leaf-to-root. `representation.error` replaces `error_response` only as the final fallback past the root `error.py`. Exceptions raised by `representation.success` flow through `error.py` like any handler error. If `representation.error` raises or returns a non-`Response`, Chano falls back to `error_response` for that new exception so a broken representation still produces a response.
+- **OpenAPI error responses**: for routes with a representation, `422` (when the endpoint has request inputs) and every status declared with `@raises` use `error_media_type` and `error_type(status)`, keeping each `@raises` description. Returning `None` from `error_type(status)` leaves that status without a response body.
+- **Unchanged default**: routes without a representation keep the built-in wire format and exact default OpenAPI output.
+
+### Limitations
+
+- Unmatched-path `404` responses and exceptions raised inside `middleware.py` still use Chano's default error mapping rather than a route's representation.
+- `@raises` continues to declare `(status, description)` pairs rather than exception classes, and return-union error types are not modeled.

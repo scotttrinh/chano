@@ -32,8 +32,10 @@ from chano import (
     Header,
     HTTPBearer,
     HTTPException,
+    JSONRepresentation,
     JSONResponse,
     Query,
+    Representation,
     Request,
     Response,
     ServerSentEvent,
@@ -6960,3 +6962,797 @@ def test_annotated_query_meta_with_default():
     assert client("GET", "/items").json() == {"limit": 10}
     assert client("GET", "/items?limit=42").json() == {"limit": 42}
     assert client("GET", "/items?limit=100").status_code == 422
+
+
+# @lat: [[tests#Representations#Problem JSON subclassing JSONRepresentation]]
+@pytest.mark.parametrize("factory", FACTORIES)
+def test_representation_problem_json(tmp_path, isolated_imports, factory):
+    write_project(
+        tmp_path,
+        {
+            "app/representation.py": (
+                "from typing import Any\n"
+                "import msgspec\n"
+                "from chano import (\n"
+                "    HTTPException,\n"
+                "    JSONRepresentation,\n"
+                "    Request,\n"
+                "    RequestValidationError,\n"
+                "    Response,\n"
+                ")\n\n"
+                "class ProblemDetail(msgspec.Struct):\n"
+                "    title: str\n"
+                "    status: int\n"
+                "    detail: Any = None\n"
+                "    instance: str | None = None\n\n"
+                "class ProblemJSON(JSONRepresentation):\n"
+                "    error_media_type = 'application/problem+json'\n\n"
+                "    def error_type(self, status_code: int) -> Any:\n"
+                "        if status_code == 410:\n"
+                "            return None\n"
+                "        return ProblemDetail\n\n"
+                "    def error(self, request: Request, exc: Exception) -> Response:\n"
+                "        if isinstance(exc, HTTPException):\n"
+                "            problem = ProblemDetail(\n"
+                "                title='HTTP Error',\n"
+                "                status=exc.status_code,\n"
+                "                detail=exc.detail,\n"
+                "                instance=request.path,\n"
+                "            )\n"
+                "            return Response(\n"
+                "                msgspec.json.encode(problem),\n"
+                "                status_code=exc.status_code,\n"
+                "                headers=exc.headers,\n"
+                "                media_type=self.error_media_type,\n"
+                "            )\n"
+                "        if isinstance(exc, RequestValidationError):\n"
+                "            problem = ProblemDetail(\n"
+                "                title='Validation Error',\n"
+                "                status=422,\n"
+                "                detail=exc.errors,\n"
+                "                instance=request.path,\n"
+                "            )\n"
+                "            return Response(\n"
+                "                msgspec.json.encode(problem),\n"
+                "                status_code=422,\n"
+                "                media_type=self.error_media_type,\n"
+                "            )\n"
+                "        problem = ProblemDetail(\n"
+                "            title='Internal Server Error',\n"
+                "            status=500,\n"
+                "            instance=request.path,\n"
+                "        )\n"
+                "        return Response(\n"
+                "            msgspec.json.encode(problem),\n"
+                "            status_code=500,\n"
+                "            media_type=self.error_media_type,\n"
+                "        )\n\n"
+                "representation = ProblemJSON()\n"
+            ),
+            "app/items/[item_id]/route.py": (
+                "import msgspec\n"
+                "from chano import HTTPException, PlainTextResponse, raises\n\n"
+                "class Item(msgspec.Struct):\n"
+                "    id: int\n"
+                "    name: str\n\n"
+                "@raises(404, 'Item missing')\n"
+                "@raises(410, 'Item gone')\n"
+                "def GET(item_id: int) -> Item:\n"
+                "    if item_id == 0:\n"
+                "        raise HTTPException(\n"
+                "            404, 'No such item', {'x-reason': 'zero'}\n"
+                "        )\n"
+                "    if item_id < 0:\n"
+                "        raise RuntimeError('negative id')\n"
+                "    return Item(id=item_id, name='widget')\n\n"
+                "def DELETE(item_id: int) -> PlainTextResponse:\n"
+                "    return PlainTextResponse('deleted')\n"
+            ),
+        },
+    )
+    app_dir = tmp_path / "app"
+    app = (
+        create_app(app_dir)
+        if factory == "dev"
+        else create_route_app(app_dir, "items/[item_id]")
+    )
+    client = make_client(app)
+
+    ok = client("GET", "/items/7")
+    assert ok.status_code == 200
+    assert ok.headers["content-type"] == "application/json"
+    assert ok.json() == {"id": 7, "name": "widget"}
+
+    # Explicit Response bypasses representation.success.
+    deleted = client("DELETE", "/items/7")
+    assert deleted.status_code == 200
+    assert deleted.headers["content-type"].startswith("text/plain")
+    assert deleted.text == "deleted"
+
+    # HTTPException -> application/problem+json preserving headers.
+    missing = client("GET", "/items/0")
+    assert missing.status_code == 404
+    assert missing.headers["content-type"] == "application/problem+json"
+    assert missing.headers["x-reason"] == "zero"
+    assert missing.json() == {
+        "title": "HTTP Error",
+        "status": 404,
+        "detail": "No such item",
+        "instance": "/items/0",
+    }
+
+    # RequestValidationError -> application/problem+json.
+    bad = client("GET", "/items/not-an-int")
+    assert bad.status_code == 422
+    assert bad.headers["content-type"] == "application/problem+json"
+    body = bad.json()
+    assert body["title"] == "Validation Error"
+    assert body["status"] == 422
+    assert body["instance"] == "/items/not-an-int"
+    assert body["detail"][0]["loc"] == ["path", "item_id"]
+
+    # Method mismatch 405 -> application/problem+json with Allow header.
+    wrong_method = client("POST", "/items/7")
+    assert wrong_method.status_code == 405
+    assert wrong_method.headers["content-type"] == "application/problem+json"
+    assert wrong_method.headers["allow"] == "DELETE, GET"
+    assert wrong_method.json() == {
+        "title": "HTTP Error",
+        "status": 405,
+        "detail": "Method Not Allowed",
+        "instance": "/items/7",
+    }
+
+    # Unhandled exception -> application/problem+json 500.
+    boom = client("GET", "/items/-1")
+    assert boom.status_code == 500
+    assert boom.headers["content-type"] == "application/problem+json"
+    assert boom.json()["title"] == "Internal Server Error"
+
+    if factory == "dev":
+        spec = app.openapi()
+        get_op = spec["paths"]["/items/{item_id}"]["get"]
+        assert get_op["responses"]["200"]["content"] == {
+            "application/json": {"schema": {"$ref": "#/components/schemas/Item"}}
+        }
+        assert get_op["responses"]["422"] == {
+            "description": "Validation Error",
+            "content": {
+                "application/problem+json": {
+                    "schema": {"$ref": "#/components/schemas/ProblemDetail"}
+                }
+            },
+        }
+        assert get_op["responses"]["404"] == {
+            "description": "Item missing",
+            "content": {
+                "application/problem+json": {
+                    "schema": {"$ref": "#/components/schemas/ProblemDetail"}
+                }
+            },
+        }
+        # error_type(410) returned None -> bodyless response keeping @raises text.
+        assert get_op["responses"]["410"] == {"description": "Item gone"}
+        assert "ProblemDetail" in spec["components"]["schemas"]
+
+        # Response subclass return annotation keeps 200 bodyless.
+        del_op = spec["paths"]["/items/{item_id}"]["delete"]
+        assert "content" not in del_op["responses"]["200"]
+
+
+# @lat: [[tests#Representations#Generic Struct envelope representation]]
+@pytest.mark.parametrize("factory", FACTORIES)
+def test_representation_envelope_generic_struct(tmp_path, isolated_imports, factory):
+    write_project(
+        tmp_path,
+        {
+            "app/representation.py": (
+                "from typing import Any\n"
+                "import msgspec\n"
+                "from chano import JSONRepresentation, Request, Response\n\n"
+                "class Document[T](msgspec.Struct):\n"
+                "    data: T\n\n"
+                "class EnvelopeRepresentation(JSONRepresentation):\n"
+                "    media_type = 'application/vnd.api+json'\n\n"
+                "    def success_type(self, returns: Any) -> Any:\n"
+                "        return Document[returns]\n\n"
+                "    def success(self, request: Request, value: Any) -> Response:\n"
+                "        return Response(\n"
+                "            msgspec.json.encode(Document(data=value)),\n"
+                "            media_type=self.media_type,\n"
+                "        )\n\n"
+                "representation = EnvelopeRepresentation()\n"
+            ),
+            "app/items/route.py": (
+                "import msgspec\n"
+                "from chano import HTTPException, Response, raises\n\n"
+                "class Item(msgspec.Struct):\n"
+                "    id: int\n"
+                "    name: str\n\n"
+                "@raises(404, 'Not found')\n"
+                "def GET(item_id: int) -> Item:\n"
+                "    if item_id == 0:\n"
+                "        raise HTTPException(404, 'missing')\n"
+                "    return Item(id=item_id, name='bolt')\n\n"
+                "def POST() -> Response:\n"
+                "    return Response(b'raw', media_type='text/plain')\n"
+            ),
+        },
+    )
+    app_dir = tmp_path / "app"
+    app = (
+        create_app(app_dir) if factory == "dev" else create_route_app(app_dir, "items")
+    )
+    client = make_client(app)
+
+    res = client("GET", "/items?item_id=3")
+    assert res.status_code == 200
+    assert res.headers["content-type"] == "application/vnd.api+json"
+    assert res.json() == {"data": {"id": 3, "name": "bolt"}}
+
+    # Default JSONRepresentation error handling still runs for errors.
+    err = client("GET", "/items?item_id=0")
+    assert err.status_code == 404
+    assert err.headers["content-type"] == "application/json"
+    assert err.json() == {"detail": "missing"}
+
+    # Explicit Response bypasses envelope.
+    raw = client("POST", "/items")
+    assert raw.status_code == 200
+    assert raw.headers["content-type"].startswith("text/plain")
+    assert raw.text == "raw"
+
+    if factory == "dev":
+        spec = app.openapi()
+        get_op = spec["paths"]["/items"]["get"]
+        content = get_op["responses"]["200"]["content"]
+        assert list(content) == ["application/vnd.api+json"]
+        ref = content["application/vnd.api+json"]["schema"]["$ref"]
+        doc_name = ref.removeprefix("#/components/schemas/")
+        doc_schema = spec["components"]["schemas"][doc_name]
+        assert doc_schema["properties"]["data"] == {"$ref": "#/components/schemas/Item"}
+        assert "Item" in spec["components"]["schemas"]
+
+        # Inherited JSONRepresentation.error_type documents 422 and @raises.
+        assert get_op["responses"]["422"]["content"] == {
+            "application/json": {
+                "schema": {"$ref": "#/components/schemas/ValidationErrorDetail"}
+            }
+        }
+        assert get_op["responses"]["404"] == {
+            "description": "Not found",
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/ErrorDetail"}
+                }
+            },
+        }
+        val_item = spec["components"]["schemas"]["ValidationErrorItem"]
+        assert set(val_item["properties"]) == {"loc", "msg"}
+
+
+# @lat: [[tests#Representations#Nearest wins and no-representation unchanged]]
+@pytest.mark.parametrize("factory", FACTORIES)
+def test_representation_nearest_wins_and_default(tmp_path, isolated_imports, factory):
+    write_project(
+        tmp_path,
+        {
+            "app/api/representation.py": (
+                "from typing import Any\n"
+                "from chano import (\n"
+                "    JSONRepresentation,\n"
+                "    JSONResponse,\n"
+                "    Request,\n"
+                "    Response,\n"
+                ")\n\n"
+                "class V1Rep(JSONRepresentation):\n"
+                "    media_type = 'application/vnd.v1+json'\n\n"
+                "    def success_type(self, returns: Any) -> Any:\n"
+                "        return dict[str, Any]\n\n"
+                "    def success(self, request: Request, value: Any) -> Response:\n"
+                "        return JSONResponse(\n"
+                "            {'version': 'v1', 'payload': value},\n"
+                "            headers={'content-type': self.media_type},\n"
+                "        )\n\n"
+                "representation = V1Rep()\n"
+            ),
+            "app/api/(v2)/representation.py": (
+                "from typing import Any\n"
+                "from chano import (\n"
+                "    JSONRepresentation,\n"
+                "    JSONResponse,\n"
+                "    Request,\n"
+                "    Response,\n"
+                ")\n\n"
+                "class V2Rep(JSONRepresentation):\n"
+                "    media_type = 'application/vnd.v2+json'\n\n"
+                "    def success_type(self, returns: Any) -> Any:\n"
+                "        return dict[str, Any]\n\n"
+                "    def success(self, request: Request, value: Any) -> Response:\n"
+                "        return JSONResponse(\n"
+                "            {'version': 'v2', 'payload': value},\n"
+                "            headers={'content-type': self.media_type},\n"
+                "        )\n\n"
+                "representation = V2Rep()\n"
+            ),
+            "app/api/items/route.py": (
+                "def GET() -> dict[str, int]:\n    return {'n': 1}\n"
+            ),
+            "app/api/(v2)/nested/route.py": (
+                "def GET() -> dict[str, int]:\n    return {'n': 2}\n"
+            ),
+            "app/plain/route.py": (
+                "from chano import HTTPException, raises\n\n"
+                "@raises(404, 'Missing')\n"
+                "def GET(n: int) -> dict[str, int]:\n"
+                "    if n == 0:\n"
+                "        raise HTTPException(404, 'nope')\n"
+                "    return {'n': n}\n"
+            ),
+        },
+    )
+    app_dir = tmp_path / "app"
+
+    def serve(path: str, function: str) -> httpx.Response:
+        app = (
+            create_app(app_dir)
+            if factory == "dev"
+            else create_route_app(app_dir, function)
+        )
+        return make_client(app)("GET", path)
+
+    # Outer representation applies to /api/items.
+    v1 = serve("/api/items", "api/items")
+    assert v1.headers["content-type"] == "application/vnd.v1+json"
+    assert v1.json() == {"version": "v1", "payload": {"n": 1}}
+
+    # Nearest (route-group) representation replaces outer; no chaining or merging.
+    v2 = serve("/api/nested", "api/nested")
+    assert v2.headers["content-type"] == "application/vnd.v2+json"
+    assert v2.json() == {"version": "v2", "payload": {"n": 2}}
+
+    # Route outside any representation keeps default wire format and schema.
+    plain = serve("/plain?n=5", "plain")
+    assert plain.headers["content-type"] == "application/json"
+    assert plain.json() == {"n": 5}
+    plain_404 = serve("/plain?n=0", "plain")
+    assert plain_404.status_code == 404
+    assert plain_404.headers["content-type"] == "application/json"
+    assert plain_404.json() == {"detail": "nope"}
+
+    if factory == "dev":
+        app = create_app(app_dir)
+        # Unmatched path 404 stays default JSON mapping.
+        unmatched = make_client(app)("GET", "/api/does-not-exist")
+        assert unmatched.status_code == 404
+        assert unmatched.headers["content-type"] == "application/json"
+        assert unmatched.json() == {"detail": "Not Found"}
+
+        spec = app.openapi()
+        assert list(
+            spec["paths"]["/api/items"]["get"]["responses"]["200"]["content"]
+        ) == ["application/vnd.v1+json"]
+        assert list(
+            spec["paths"]["/api/nested"]["get"]["responses"]["200"]["content"]
+        ) == ["application/vnd.v2+json"]
+        plain_op = spec["paths"]["/plain"]["get"]
+        assert plain_op["responses"]["200"]["content"] == {
+            "application/json": {
+                "schema": {
+                    "type": "object",
+                    "additionalProperties": {"type": "integer"},
+                }
+            }
+        }
+        assert plain_op["responses"]["422"] == {
+            "description": "Validation Error",
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "detail": {"type": "array", "items": {"type": "object"}}
+                        },
+                    }
+                }
+            },
+        }
+        assert plain_op["responses"]["404"] == {"description": "Missing"}
+
+
+# @lat: [[tests#Representations#Error boundaries run before representation error]]
+@pytest.mark.parametrize("factory", FACTORIES)
+def test_representation_error_boundary_order(tmp_path, isolated_imports, factory):
+    write_project(
+        tmp_path,
+        {
+            "app/representation.py": (
+                "from chano import (\n"
+                "    JSONRepresentation,\n"
+                "    JSONResponse,\n"
+                "    Request,\n"
+                "    Response,\n"
+                ")\n\n"
+                "class Rep(JSONRepresentation):\n"
+                "    error_media_type = 'application/problem+json'\n\n"
+                "    def success(self, request: Request, value):\n"
+                "        if value == 'bad-success':\n"
+                "            raise ValueError('success failed')\n"
+                "        return JSONResponse({'ok': value})\n\n"
+                "    def error(self, request: Request, exc: Exception) -> Response:\n"
+                "        payload = {\n"
+                "            'by': 'representation',\n"
+                "            'type': type(exc).__name__,\n"
+                "            'msg': str(exc),\n"
+                "        }\n"
+                "        return JSONResponse(\n"
+                "            payload,\n"
+                "            status_code=502,\n"
+                "            headers={'content-type': self.error_media_type},\n"
+                "        )\n\n"
+                "representation = Rep()\n"
+            ),
+            "app/error.py": (
+                "from chano import HTTPException, JSONResponse\n\n"
+                "def handle_error(request, exc):\n"
+                "    if request.query_params.get('catch') == ['1']:\n"
+                "        payload = {\n"
+                "            'by': 'error.py',\n"
+                "            'type': type(exc).__name__,\n"
+                "            'msg': str(exc),\n"
+                "        }\n"
+                "        return JSONResponse(payload, status_code=418)\n"
+                "    if request.query_params.get('replace') == ['1']:\n"
+                "        raise HTTPException(409, 'replaced by error.py')\n"
+                "    raise\n"
+            ),
+            "app/route.py": (
+                "def GET(mode: str = 'ok'):\n"
+                "    if mode == 'boom':\n"
+                "        raise RuntimeError('handler failed')\n"
+                "    if mode == 'bad-success':\n"
+                "        return 'bad-success'\n"
+                "    return mode\n"
+            ),
+        },
+    )
+    app_dir = tmp_path / "app"
+    app = (
+        create_app(app_dir) if factory == "dev" else create_route_app(app_dir, "index")
+    )
+    client = make_client(app)
+
+    # error.py handles the error first when it returns a Response.
+    caught = client("GET", "/?mode=boom&catch=1")
+    assert caught.status_code == 418
+    assert caught.json() == {
+        "by": "error.py",
+        "type": "RuntimeError",
+        "msg": "handler failed",
+    }
+
+    # Re-raising in error.py falls through to representation.error.
+    reraised = client("GET", "/?mode=boom")
+    assert reraised.status_code == 502
+    assert reraised.headers["content-type"] == "application/problem+json"
+    assert reraised.json() == {
+        "by": "representation",
+        "type": "RuntimeError",
+        "msg": "handler failed",
+    }
+
+    # Replacing the exception in error.py sends it to representation.error.
+    replaced = client("GET", "/?mode=boom&replace=1")
+    assert replaced.status_code == 502
+    assert replaced.json() == {
+        "by": "representation",
+        "type": "HTTPException",
+        "msg": "409: replaced by error.py",
+    }
+
+    # An exception raised by representation.success enters error.py first.
+    success_err_caught = client("GET", "/?mode=bad-success&catch=1")
+    assert success_err_caught.status_code == 418
+    assert success_err_caught.json() == {
+        "by": "error.py",
+        "type": "ValueError",
+        "msg": "success failed",
+    }
+    success_err_rep = client("GET", "/?mode=bad-success")
+    assert success_err_rep.status_code == 502
+    assert success_err_rep.json() == {
+        "by": "representation",
+        "type": "ValueError",
+        "msg": "success failed",
+    }
+
+
+# @lat: [[tests#Representations#Invalid representation.py and conflicting paths]]
+@pytest.mark.parametrize(
+    "source",
+    [
+        "x = 1\n",
+        "representation = 123\n",
+        "from chano import JSONRepresentation\nrepresentation = JSONRepresentation\n",
+        (
+            "class Bad:\n"
+            "    media_type = 123\n"
+            "    error_media_type = 'application/json'\n"
+            "    def success_type(self, r): return r\n"
+            "    def success(self, req, val): ...\n"
+            "    def error_type(self, code): return None\n"
+            "    def error(self, req, exc): ...\n"
+            "representation = Bad()\n"
+        ),
+        (
+            "class Bad:\n"
+            "    media_type = 'application/json'\n"
+            "    error_media_type = 'application/json'\n"
+            "    success_type = 'not-callable'\n"
+            "    def success(self, req, val): ...\n"
+            "    def error_type(self, code): return None\n"
+            "    def error(self, req, exc): ...\n"
+            "representation = Bad()\n"
+        ),
+    ],
+)
+def test_representation_invalid_and_conflicting(tmp_path, isolated_imports, source):
+    write_project(
+        tmp_path,
+        {
+            "app/(group)/representation.py": source,
+            "app/(group)/a/route.py": "def GET():\n    return {}\n",
+        },
+    )
+    file = (tmp_path / "app" / "(group)" / "representation.py").resolve()
+    for make_app in [
+        lambda: create_app(tmp_path / "app"),
+        lambda: create_route_app(tmp_path / "app", "a"),
+    ]:
+        with pytest.raises(TypeError, match=re.escape(str(file))):
+            make_app()
+
+    # Direct Chano.add_route rejects non-Representation values too.
+    app = Chano(docs=False)
+    bad_rep: Any = "bad"
+    with pytest.raises(TypeError, match="representation"):
+        app.add_route("/x", lambda: {}, ["GET"], representation=bad_rep)
+
+    # Conflicting representations on one URL path raise ValueError.
+    conflict_dir = tmp_path / "conflict"
+    write_project(
+        conflict_dir,
+        {
+            "app/(a)/representation.py": (
+                "from chano import JSONRepresentation\n"
+                "representation = JSONRepresentation()\n"
+            ),
+            "app/(a)/x/route.py": "def GET():\n    return {}\n",
+            "app/(b)/x/route.py": "def POST():\n    return {}\n",
+        },
+    )
+    with pytest.raises(ValueError, match="conflicting representation for route '/x'"):
+        create_app(conflict_dir / "app")
+
+
+# @lat: [[tests#Representations#Broken representation error and non-Response fallback]]
+def test_representation_broken_fallback(capsys):
+    class RaisingErrorRep(JSONRepresentation):
+        def error(self, request: Request, exc: Exception) -> Response:
+            raise RuntimeError("error renderer crashed")
+
+    class NonResponseRep(JSONRepresentation):
+        def success(self, request: Request, value: Any) -> Any:
+            return {"not": "a response"}
+
+        def error(self, request: Request, exc: Exception) -> Any:
+            return "not a response"
+
+    class NonResponseSuccessRep(JSONRepresentation):
+        def success(self, request: Request, value: Any) -> Any:
+            return 42
+
+        def error(self, request: Request, exc: Exception) -> Response:
+            return JSONResponse(
+                {"type": type(exc).__name__, "msg": str(exc)}, status_code=500
+            )
+
+    def fail():
+        raise HTTPException(404, "missing")
+
+    def ok():
+        return {"ok": True}
+
+    app = Chano(docs=False)
+    app.add_route("/raise", fail, ["GET"], representation=RaisingErrorRep())
+    app.add_route("/nonresp", ok, ["GET"], representation=NonResponseRep())
+    app.add_route(
+        "/nonresp-success", ok, ["GET"], representation=NonResponseSuccessRep()
+    )
+    client = make_client(app)
+
+    # Raising inside representation.error falls back to error_response (500).
+    res1 = client("GET", "/raise")
+    assert res1.status_code == 500
+    assert res1.text == "Internal Server Error"
+    err1 = capsys.readouterr().err
+    assert "error renderer crashed" in err1
+
+    # Non-Response from representation.success raises TypeError naming the
+    # representation and passes into representation.error.
+    res2 = client("GET", "/nonresp-success")
+    assert res2.status_code == 500
+    body2 = res2.json()
+    assert body2["type"] == "TypeError"
+    assert "NonResponseSuccessRep" in body2["msg"]
+
+    # Non-Response from representation.error raises TypeError naming the
+    # representation and falls back to error_response (500).
+    res3 = client("GET", "/nonresp")
+    assert res3.status_code == 500
+    assert res3.text == "Internal Server Error"
+    err3 = capsys.readouterr().err
+    assert "TypeError" in err3
+    assert "NonResponseRep" in err3
+
+
+# @lat: [[tests#Representations#Sync and async representations]]
+@pytest.mark.parametrize("factory", FACTORIES)
+def test_representation_sync_and_async(tmp_path, isolated_imports, factory):
+    assert isinstance(JSONRepresentation(), Representation)
+
+    write_project(
+        tmp_path,
+        {
+            "app/sync/representation.py": (
+                "from typing import Any\n"
+                "from chano import JSONResponse, Request, Response\n\n"
+                "class SyncRep:\n"
+                "    media_type = 'application/json'\n"
+                "    error_media_type = 'application/json'\n"
+                "    def success_type(self, returns: Any) -> Any:\n"
+                "        return returns\n"
+                "    def success(self, request: Request, value: Any) -> Response:\n"
+                "        return JSONResponse({'mode': 'sync', 'value': value})\n"
+                "    def error_type(self, status_code: int) -> Any:\n"
+                "        return dict[str, Any]\n"
+                "    def error(self, request: Request, exc: Exception) -> Response:\n"
+                "        return JSONResponse(\n"
+                "            {'mode': 'sync', 'err': str(exc)}, 400\n"
+                "        )\n\n"
+                "representation = SyncRep()\n"
+            ),
+            "app/sync/route.py": (
+                "from chano import HTTPException\n"
+                "def GET(fail: bool = False):\n"
+                "    if fail:\n"
+                "        raise HTTPException(400, 'bad')\n"
+                "    return 'hi'\n"
+            ),
+            "app/async_rep/representation.py": (
+                "import asyncio\n"
+                "from typing import Any\n"
+                "from chano import (\n"
+                "    JSONRepresentation,\n"
+                "    JSONResponse,\n"
+                "    Request,\n"
+                "    Response,\n"
+                ")\n\n"
+                "class AsyncRep(JSONRepresentation):\n"
+                "    async def success(\n"
+                "        self, request: Request, value: Any\n"
+                "    ) -> Response:\n"
+                "        await asyncio.sleep(0)\n"
+                "        return JSONResponse({'mode': 'async', 'value': value})\n"
+                "    async def error(\n"
+                "        self, request: Request, exc: Exception\n"
+                "    ) -> Response:\n"
+                "        await asyncio.sleep(0)\n"
+                "        return JSONResponse(\n"
+                "            {'mode': 'async', 'err': str(exc)}, 400\n"
+                "        )\n\n"
+                "representation = AsyncRep()\n"
+            ),
+            "app/async_rep/route.py": (
+                "from chano import HTTPException\n"
+                "async def GET(fail: bool = False):\n"
+                "    if fail:\n"
+                "        raise HTTPException(400, 'bad')\n"
+                "    return 'hi'\n"
+            ),
+        },
+    )
+    app_dir = tmp_path / "app"
+
+    for name in ("sync", "async_rep"):
+        expected = "sync" if name == "sync" else "async"
+        app = (
+            create_app(app_dir) if factory == "dev" else create_route_app(app_dir, name)
+        )
+        client = make_client(app)
+        assert client("GET", f"/{name}").json() == {"mode": expected, "value": "hi"}
+        err = client("GET", f"/{name}?fail=true")
+        assert err.status_code == 400
+        assert err.json() == {"mode": expected, "err": "400: bad"}
+
+
+# @lat: [[tests#Representations#Build trace roots and bundling]]
+def test_representation_build_trace_roots(tmp_path, isolated_imports, monkeypatch):
+    store_files: dict[str, str] = {}
+    for dist in (
+        make_dist("chano", "chano"),
+        make_dist("vercel-runtime", "vercel_runtime"),
+        make_dist("rep-pkg", "rep_pkg"),
+    ):
+        store_files.update(dist)
+
+    def fake_install(_workspace, vendor_dir, _python, _platform, _package=None):
+        write_project(vendor_dir, store_files)
+
+    monkeypatch.setattr(build_module, "_install_dependencies", fake_install)
+    monkeypatch.setattr(build_module, "_check_function_imports", lambda *args: None)
+
+    project = tmp_path / "reps"
+    write_project(
+        project,
+        {
+            "pyproject.toml": '[project]\nname = "reps"\nversion = "0"\n',
+            "app/(api)/representation.py": (
+                "from typing import Any\n"
+                "import msgspec\n"
+                "from chano import JSONRepresentation, Request, Response\n\n"
+                "class Problem(msgspec.Struct):\n"
+                "    detail: str\n\n"
+                "class ApiRep(JSONRepresentation):\n"
+                "    error_media_type = 'application/problem+json'\n"
+                "    def error_type(self, status_code: int) -> Any:\n"
+                "        return Problem\n"
+                "    def error(self, request: Request, exc: Exception) -> Response:\n"
+                "        import rep_pkg\n"
+                "        return Response(\n"
+                "            msgspec.json.encode(Problem(detail=str(exc))),\n"
+                "            status_code=500,\n"
+                "            media_type=self.error_media_type,\n"
+                "        )\n\n"
+                "representation = ApiRep()\n"
+            ),
+            "app/(api)/items/route.py": (
+                "from chano import raises\n\n"
+                "@raises(404, 'Item not found')\n"
+                "def GET(item_id: int) -> dict[str, int]:\n"
+                "    return {'id': item_id}\n"
+            ),
+            "app/public/route.py": (
+                "def GET() -> dict[str, bool]:\n    return {'ok': True}\n"
+            ),
+        },
+    )
+    app = (project / "app").resolve()
+    plan = plan_build(project, platform=None)
+    by_name = {spec.name: spec for spec in plan.functions}
+    assert by_name["items"].trace_roots == (
+        app / "(api)" / "items" / "route.py",
+        app / "(api)" / "representation.py",
+    )
+    assert by_name["public"].trace_roots == (app / "public" / "route.py",)
+
+    built = json.loads({f.path: f.content for f in plan.static_files}["openapi.json"])
+    items_404 = built["paths"]["/items"]["get"]["responses"]["404"]
+    assert items_404 == {
+        "description": "Item not found",
+        "content": {
+            "application/problem+json": {
+                "schema": {"$ref": "#/components/schemas/Problem"}
+            }
+        },
+    }
+    assert "404" not in built["paths"]["/public"]["get"]["responses"]
+
+    out = build(project, platform=None, output=tmp_path / "out")
+
+    def bundled(function: str) -> set[str]:
+        vendor = out / "functions" / f"{function}.func" / "_vendor"
+        return set(build_module.index_store(vendor).distributions)
+
+    assert bundled("items") == {"chano", "vercel-runtime", "rep-pkg"}
+    assert bundled("public") == {"chano", "vercel-runtime"}

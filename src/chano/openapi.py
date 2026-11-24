@@ -20,6 +20,7 @@ from chano.responses import Response
 
 if TYPE_CHECKING:
     from chano.app import Chano
+    from chano.representation import Representation
 
 _REF = "#/components/schemas/{name}"
 _PYDANTIC_REF = "#/components/schemas/{model}"
@@ -266,12 +267,30 @@ def _input_schema(
     return schemas[0] if len(schemas) == 1 else {"allOf": schemas}
 
 
+def _error_openapi_response(
+    description: str,
+    status: int,
+    representation: Representation,
+    components: dict[str, Any],
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {"description": description}
+    error_annotation = representation.error_type(status)
+    if error_annotation is not None:
+        entry["content"] = {
+            representation.error_media_type: {
+                "schema": _schema(error_annotation, components, mode="serialization")
+            }
+        }
+    return entry
+
+
 def _operation(
     method: str,
     path: str,
     endpoint: Endpoint,
     components: dict[str, Any],
     security_schemes: dict[str, Any],
+    representation: Representation | None = None,
 ) -> dict[str, Any]:
     info = openapi_info(endpoint.func)
     doc = inspect.getdoc(endpoint.func) or ""
@@ -344,16 +363,35 @@ def _operation(
     returns = inspect.signature(endpoint.func, eval_str=True).return_annotation
     is_response = isinstance(returns, type) and issubclass(returns, Response)
     if returns not in (inspect.Signature.empty, None) and not is_response:
-        success["content"] = {
-            "application/json": {
-                "schema": _schema(returns, components, mode="serialization")
+        if representation is None:
+            media_type = "application/json"
+            body_type = returns
+        else:
+            media_type = representation.media_type
+            body_type = representation.success_type(returns)
+        if body_type not in (inspect.Signature.empty, None):
+            success["content"] = {
+                media_type: {
+                    "schema": _schema(body_type, components, mode="serialization")
+                }
             }
-        }
     responses: dict[int, Any] = {200: success}
     if fields:
-        responses[422] = _VALIDATION_ERROR
+        if representation is None:
+            responses[422] = _VALIDATION_ERROR
+        else:
+            responses[422] = _error_openapi_response(
+                "Validation Error", 422, representation, components
+            )
     for status, description in endpoint.declared_responses().items():
-        responses.setdefault(status, {"description": description})
+        if status in responses:
+            continue
+        if representation is None:
+            responses[status] = {"description": description}
+        else:
+            responses[status] = _error_openapi_response(
+                description, status, representation, components
+            )
     operation["responses"] = {str(k): v for k, v in sorted(responses.items())}
 
     # All dependencies run, so every scheme is required together: one
@@ -373,11 +411,17 @@ def openapi_schema(app: Chano) -> dict[str, Any]:
     security_schemes: dict[str, Any] = {}
     paths: dict[str, Any] = {}
     for path, _, endpoints in app.routes:
+        representation = app.representations.get(path)
         # Components are collected only from documented operations, so a
         # schema or scheme used solely by hidden ones is left out too.
         operations = {
             method.lower(): _operation(
-                method, path, endpoint, components, security_schemes
+                method,
+                path,
+                endpoint,
+                components,
+                security_schemes,
+                representation,
             )
             for method, endpoint in endpoints.items()
             if (path, method) not in app.hidden_operations

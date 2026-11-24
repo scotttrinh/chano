@@ -1,6 +1,6 @@
 ---
 title: Application structure
-description: Structure shared authentication, middleware, error boundaries, lazy singletons, and background work in Chano.
+description: Structure shared authentication, middleware, error boundaries, representations, lazy singletons, and background work in Chano.
 lede: Because each route compiles into its own function, Chano replaces central app wiring with file-system conventions and lazy initialization.
 section: guides
 order: 3
@@ -125,7 +125,76 @@ def handle_error(request: Request, exc: Exception) -> Response:
     raise exc
 ```
 
-Error boundaries run **leaf-to-root** (nearest wins). If `handle_error` re-raises, the exception bubbles up to the next ancestor `error.py`, or falls back to Chano's default error mapping.
+Error boundaries run **leaf-to-root** (nearest wins). If `handle_error` re-raises, the exception bubbles up to the next ancestor `error.py`, then to the route's `representation.py` (when present) or Chano's default error mapping.
+
+## Folder-scoped `representation.py`
+
+Middleware and `error.py` can rewrite response bytes on the wire, but they do not update `openapi.json`. To keep runtime output and OpenAPI schemas in agreement — for example, RFC 9457 Problem JSON errors or a response envelope like `Document[T]` — place a `representation.py` in any folder under `app/` and export `representation`:
+
+```python
+# app/api/representation.py
+from typing import Any
+
+import msgspec
+
+from chano import (
+    HTTPException,
+    JSONRepresentation,
+    Request,
+    RequestValidationError,
+    Response,
+)
+
+
+class ProblemDetail(msgspec.Struct):
+    title: str
+    status: int
+    detail: Any = None
+    instance: str | None = None
+
+
+class ProblemJSON(JSONRepresentation):
+    error_media_type = "application/problem+json"
+
+    def error_type(self, status_code: int) -> Any:
+        return ProblemDetail
+
+    def error(self, request: Request, exc: Exception) -> Response:
+        if isinstance(exc, HTTPException):
+            status, title, detail, headers = (
+                exc.status_code,
+                "HTTP Error",
+                exc.detail,
+                exc.headers,
+            )
+        elif isinstance(exc, RequestValidationError):
+            status, title, detail, headers = (
+                422,
+                "Validation Error",
+                exc.errors,
+                None,
+            )
+        else:
+            # Unexpected errors keep the default: a logged traceback and a plain 500.
+            return super().error(request, exc)
+        body = ProblemDetail(
+            title=title,
+            status=status,
+            detail=detail,
+            instance=request.path,
+        )
+        return Response(
+            msgspec.json.encode(body),
+            status_code=status,
+            headers=headers,
+            media_type=self.error_media_type,
+        )
+
+
+representation = ProblemJSON()
+```
+
+Subclassing `JSONRepresentation` lets you override only the error half or only the success half (`media_type`, `success_type`, and `success`). The nearest `representation.py` to a route wins (they do not chain or merge), `error.py` boundaries still run first, and any handler that returns a `Response` directly bypasses the representation. See [Representation](/reference/requests-and-responses#representation) and [representation.py](/reference/routing#representation-py) for the full contract.
 
 ## `lazy()` instead of startup hooks
 

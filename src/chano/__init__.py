@@ -4,6 +4,7 @@ from chano.exceptions import HTTPException, RequestValidationError
 from chano.openapi import openapi
 from chano.params import Body, Cookie, Depends, Header, Query, lazy, raises
 from chano.queues import create_queue_app, invoke_queue
+from chano.representation import JSONRepresentation, Representation
 from chano.requests import Geo, Request
 from chano.responses import (
     HTMLResponse,
@@ -31,10 +32,12 @@ __all__ = [
     "Chano",
     "ChanoConfig",
     "Header",
+    "JSONRepresentation",
     "JSONResponse",
     "PlainTextResponse",
     "Query",
     "RedirectResponse",
+    "Representation",
     "Request",
     "RequestValidationError",
     "Response",

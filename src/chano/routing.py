@@ -37,6 +37,7 @@ from chano.app import AfterBackend, Chano, ErrorHandler, Middleware
 from chano.config import normalize_base_path, project_base_path, project_config
 from chano.exceptions import HTTPException
 from chano.params import is_generator_callable
+from chano.representation import Representation, is_representation
 from chano.requests import Request
 from chano.responses import Response
 
@@ -45,6 +46,7 @@ ROUTE_FILE = "route.py"
 MIDDLEWARE_FILE = "middleware.py"
 ERROR_FILE = "error.py"
 DEPENDENCIES_FILE = "dependencies.py"
+REPRESENTATION_FILE = "representation.py"
 
 
 def load_module(path: Path) -> ModuleType:
@@ -222,10 +224,25 @@ def _dependencies(route: Route) -> list[list[Callable[..., Any]]]:
     return load_segment_dependencies(route.load_segments(DEPENDENCIES_FILE))
 
 
+def _representation(route: Route) -> Representation | None:
+    """The nearest ancestor ``representation.py``'s ``representation``, if any."""
+    selected: Representation | None = None
+    for module in route.load_segments(REPRESENTATION_FILE):
+        rep = getattr(module, "representation", None)
+        if not is_representation(rep):
+            raise TypeError(
+                f"invalid `representation` in {module.__file__}: expected a "
+                f"Representation, got {rep!r}"
+            )
+        selected = rep
+    return selected
+
+
 def _add_route(app: Chano, route: Route) -> None:
     middleware = _middleware(route)
     error_handlers = _error_handlers(route)
     dependencies = _dependencies(route)
+    representation = _representation(route)
     module = route.load()
     for method in HTTP_METHODS:
         handler = getattr(module, method, None)
@@ -237,6 +254,7 @@ def _add_route(app: Chano, route: Route) -> None:
                 middleware=middleware,
                 error_handlers=error_handlers,
                 dependencies=dependencies,
+                representation=representation,
             )
 
 
