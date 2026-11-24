@@ -39,6 +39,9 @@ dev = [
     { name = "pytest", specifier = ">=8" },
     { name = "ruff", specifier = ">=0.17.5" },
     { name = "ty", specifier = ">=0.0.104" },
+    { name = "vercel-queue", specifier = ">=0.11.0" },
+    { name = "vercel-runtime" },
+    { name = "vercel-workflow", specifier = ">=0.13.0" },
 ]
 
 [[package]]

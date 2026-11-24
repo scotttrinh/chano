@@ -9,12 +9,12 @@ import mimetypes
 import re
 import sys
 import traceback
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Literal
 
-from chano.config import normalize_base_path
+from chano.config import WorkflowConfig, normalize_base_path
 from chano.exceptions import HTTPException, RequestValidationError
 from chano.openapi import openapi_info, openapi_schema, swagger_html
 from chano.params import Endpoint
@@ -26,6 +26,7 @@ _PATH_PARAM = re.compile(r"\{(\w+)(:path)?\}")
 CallNext = Callable[[Request], Awaitable[Response]]
 Middleware = Callable[[Request, CallNext], Awaitable[Response]]
 ErrorHandler = Callable[[Request, Exception], Response | Awaitable[Response]]
+ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
 AfterBackend = Literal["local", "wait_until"]
 
 _AFTER_BACKENDS = ("local", "wait_until")
@@ -244,6 +245,60 @@ class Chano:
         """Each path's middleware chain, outermost first."""
         self.error_handlers: dict[str, tuple[ErrorHandler, ...]] = {}
         """Each path's error handlers, root to leaf; the leaf runs first."""
+        self._mounted_apps: dict[str, ASGIApp] = {}
+        """Internal ASGI sub-apps mounted by exact path (excluded from OpenAPI)."""
+        self.queues: tuple[Any, ...] = ()
+        """Discovered queue consumers attached by ``create_app``."""
+        self.schedules: tuple[Any, ...] = ()
+        """Discovered schedule jobs attached by ``create_app``."""
+        self.workflows: tuple[WorkflowConfig, ...] = ()
+        """Configured workflow entrypoints from ``[[tool.vercel.workflows]]``."""
+        self.workflows_mounted: bool = False
+        """Whether LocalWorld workflow endpoints are mounted on this app."""
+        self._queue_dispatcher: Callable[..., Awaitable[Any]] | None = None
+        self._schedule_runner: Callable[..., Awaitable[Any]] | None = None
+        self._startup_hooks: list[Callable[[], Awaitable[None]]] = []
+        self._shutdown_hooks: list[Callable[[], Awaitable[None]]] = []
+
+    def on_startup(self, hook: Callable[[], Awaitable[None]]) -> None:
+        """Register an async hook invoked on ASGI ``lifespan.startup``."""
+        self._startup_hooks.append(hook)
+
+    def on_shutdown(self, hook: Callable[[], Awaitable[None]]) -> None:
+        """Register an async hook invoked on ASGI ``lifespan.shutdown``."""
+        self._shutdown_hooks.append(hook)
+
+    def mount_asgi(self, path: str, asgi_app: ASGIApp) -> None:
+        """Mount a raw ASGI callable at exact ``path``, outside OpenAPI."""
+        if not path.startswith("/"):
+            raise ValueError(f"mount path must start with '/': {path!r}")
+        self._mounted_apps[path] = asgi_app
+
+    async def dispatch_queue(
+        self,
+        topic: str,
+        payload: Any,
+        *,
+        consumer: str | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> Any:
+        """Dispatch ``payload`` to local queue consumer(s) subscribed to ``topic``."""
+        if self._queue_dispatcher is None:
+            raise LookupError(f"no queue consumer registered for topic {topic!r}")
+        return await self._queue_dispatcher(
+            topic, payload, consumer=consumer, headers=headers
+        )
+
+    async def run_schedule(
+        self,
+        target: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> Any:
+        """Run a local schedule job matching ``target``."""
+        if self._schedule_runner is None:
+            raise LookupError(f"no schedule registered matching {target!r}")
+        return await self._schedule_runner(target, headers=headers)
 
     def add_route(
         self,
@@ -300,10 +355,20 @@ class Chano:
         if scope["type"] == "lifespan":
             while True:
                 message = await receive()
+                if message["type"] == "lifespan.startup":
+                    for hook in self._startup_hooks:
+                        await hook()
+                elif message["type"] == "lifespan.shutdown":
+                    for hook in reversed(self._shutdown_hooks):
+                        await hook()
                 await send({"type": f"{message['type']}.complete"})
                 if message["type"] == "lifespan.shutdown":
                     return
         if scope["type"] != "http":
+            return
+
+        if mounted := self._mounted_apps.get(scope["path"]):
+            await mounted(scope, receive, send)
             return
 
         request = Request(scope, receive)
@@ -427,3 +492,69 @@ class Chano:
             raise HTTPException(405, "Method Not Allowed", {"allow": "GET, HEAD"})
         media_type = mimetypes.guess_type(file.name)[0] or "application/octet-stream"
         return Response(file.read_bytes(), media_type=media_type)
+
+
+class EndpointASGIApp:
+    """Single-endpoint ASGI app for private Vercel functions (queues, schedules).
+
+    Accepts any path on ``methods``, runs the ``Endpoint`` with Chano's
+    ``after()`` context and error boundaries, and serializes non-``Response``
+    return values as JSON (or empty 200 for ``None``).
+    """
+
+    def __init__(
+        self,
+        endpoint: Endpoint,
+        *,
+        methods: Sequence[str] = ("POST",),
+        error_handlers: Sequence[ErrorHandler] = (),
+        after_backend: AfterBackend = "local",
+    ) -> None:
+        if after_backend not in _AFTER_BACKENDS:
+            raise ValueError(
+                f"unknown after_backend {after_backend!r}: "
+                f"expected one of {_AFTER_BACKENDS}"
+            )
+        self.endpoint = endpoint
+        self.methods = tuple(dict.fromkeys(m.upper() for m in methods))
+        self.error_handlers = tuple(error_handlers)
+        self.after_backend: AfterBackend = after_backend
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "lifespan":
+            while True:
+                message = await receive()
+                await send({"type": f"{message['type']}.complete"})
+                if message["type"] == "lifespan.shutdown":
+                    return
+        if scope["type"] != "http":
+            return
+
+        request = Request(scope, receive)
+        after_state = _AfterState(self.after_backend)
+        token = _after_state.set(after_state)
+        cancelled = False
+        try:
+            try:
+                if request.method not in self.methods:
+                    headers = {"allow": ", ".join(sorted(self.methods))}
+                    raise HTTPException(405, "Method Not Allowed", headers)
+                result = await self.endpoint.call(request)
+                if isinstance(result, Response):
+                    response = result
+                elif result is None:
+                    response = Response(status_code=200)
+                else:
+                    response = JSONResponse(result)
+            except Exception as exc:
+                response = await _error_boundary(self.error_handlers, request, exc)
+            await response(receive, send, include_body=request.method != "HEAD")
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        finally:
+            tasks = after_state.close_and_take()
+            _after_state.reset(token)
+            if not cancelled:
+                for task in tasks:
+                    await task()

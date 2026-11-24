@@ -18,8 +18,8 @@ uv run chano build
 What `chano build` writes:
 
 - `.vercel/output/static/`: `public/` assets plus pre-rendered `openapi.json` and `docs.html`.
-- `.vercel/output/functions/`: one `<route>.func/` directory per `route.py`, containing a minimal ASGI entrypoint, your project files, `.vc-config.json`, and tree-shaken `_vendor/` dependencies.
-- `.vercel/output/config.json`: Vercel routing rules (`filesystem` check first, then `/docs` rewrite, then dynamic route regex rewrites).
+- `.vercel/output/functions/`: one `<route>.func/` per `route.py`, plus private `_queues/<name>.func/` for `queue.py`, `_schedules/<name>.func/` for `schedule.py`, and `.well-known/workflow/v1/{flow,step}.func/` for `[[tool.vercel.workflows]]`, each with `.vc-config.json` and tree-shaken `_vendor/` dependencies.
+- `.vercel/output/config.json`: Vercel routing rules (`filesystem` check first, then `/docs` rewrite, then dynamic route regex rewrites), plus `schedules` when configured.
 
 Deploy the prebuilt output directly with the [Vercel CLI](https://vercel.com/docs/cli):
 

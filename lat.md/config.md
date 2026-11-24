@@ -1,16 +1,17 @@
 # Project Configuration
 
-Project-level settings live in `[tool.chano]` in the project's `pyproject.toml` and are read without importing user code.
+Project-level settings live in `[tool.chano]` and `[[tool.vercel.workflows]]` in `pyproject.toml` and are read without importing user code.
 
 ## Config Struct
 
-[[src/chano/config.py#load_config]] parses `pyproject.toml` with `tomllib` and converts `[tool.chano]` into the frozen [[src/chano/config.py#ChanoConfig]] `msgspec.Struct`.
+[[src/chano/config.py#load_config]] parses `pyproject.toml` with `tomllib`, converts `[tool.chano]` via [[src/chano/config.py#_ChanoTable]], parses `[[tool.vercel.workflows]]` via [[src/chano/config.py#_load_workflows]], and returns a frozen [[src/chano/config.py#ChanoConfig]] `msgspec.Struct`.
 
 - `base_path: str = ""` — URL prefix for every route, doc and static file ([[config#Base Path]]).
 - `tree_shake: bool = True` — bundle only the distributions each function traces plus always-included sets, or link the whole store when `False` ([[build#Dependency Tree-Shaking and Size Reporting#Import Tracing, Closure, and Emit]]).
-- `include: tuple[str, ...] = ()` — distribution names bundled (with their closures) into every function alongside route-level `include` ([[build#Dependency Tree-Shaking and Size Reporting#Import Tracing, Closure, and Emit]]).
+- `include: tuple[str, ...] = ()` — distribution names bundled (with their closures) into every function alongside module-level `include` ([[build#Dependency Tree-Shaking and Size Reporting#Import Tracing, Closure, and Emit]]).
+- `workflows: tuple[WorkflowConfig, ...] = ()` — [[src/chano/config.py#WorkflowConfig]] entries declared under `[[tool.vercel.workflows]]`, each pointing `entrypoint` at a `module:object` dotted Python identifier ([[vercel-primitives#Vercel Workflows]]).
 
-A missing table gives the defaults. A non-table `tool` or `tool.chano`, unknown keys (`forbid_unknown_fields`), wrong types (strict: `tree_shake = 1`, `include = "anyio"` and `include = [1]` all fail) and invalid prefixes raise `ValueError` naming the file. Route-level settings stay in `route.py` ([[build#Per-Route Function Config]]).
+Missing tables give the defaults. Non-table `tool`, `tool.chano`, or `tool.vercel`, unknown keys in `[tool.chano]` (`forbid_unknown_fields`), wrong types (strict: `tree_shake = 1`, `include = "anyio"` and `include = [1]` all fail), invalid `base_path` prefixes, invalid workflow entrypoints, and duplicate workflow entrypoints raise `ValueError` naming the file. Per-function settings stay in `route.py`, `queue.py`, or `schedule.py` ([[build#Per-Route Function Config]]).
 
 ## Base Path
 

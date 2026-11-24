@@ -246,11 +246,13 @@ def test_build_plan(tmp_path, isolated_imports):
     assert not plan.output_dir.exists()
 
     assert [f.name for f in plan.functions] == ["orders", "orders/[order_id]"]
-    assert [f.route.url_path for f in plan.functions] == [
+    assert [f.route.url_path for f in plan.functions if f.route is not None] == [
         "/orders",
         "/orders/{order_id}",
     ]
     orders, order = plan.functions
+    assert orders.route is not None
+    assert order.route is not None
     assert plan.config == ChanoConfig()
     assert "create_route_app(" in order.entrypoint
     assert (
@@ -2733,6 +2735,7 @@ def test_segment_files_are_trace_roots(tmp_path, isolated_imports, monkeypatch, 
     )
     for name in ("admin", "admin/members", "admin/settings/[id]"):
         spec = by_name[name]
+        assert spec.route is not None
         assert spec.trace_roots == (spec.route.file, *admin_segments)
     assert by_name["public"].trace_roots == (
         app / "public" / "route.py",
@@ -2741,6 +2744,7 @@ def test_segment_files_are_trace_roots(tmp_path, isolated_imports, monkeypatch, 
     )
     for name in ("index", "about"):
         spec = by_name[name]
+        assert spec.route is not None
         assert spec.trace_roots == (spec.route.file, app / "middleware.py")
 
     out = build(

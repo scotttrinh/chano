@@ -194,3 +194,59 @@ async def GET():
 ```
 
 `SSEResponse` sets `content-type: text/event-stream` and `cache-control: no-cache`, JSON-encodes structured payloads automatically, and sends `: ping` keepalive comments when `ping` is set. On client disconnect, Chano cancels the producer and closes the iterator cleanly.
+
+## Queues, schedules, and workflows
+
+Beyond HTTP `route.py` endpoints, Chano compiles Vercel Queues, Schedules, and Workflows into private Vercel Functions that stay out of `/openapi.json` and `/docs`.
+
+### Queue consumers (`queue.py`)
+
+Add a `queue.py` file anywhere under `app/` exporting `topic` and a `CONSUME` handler (sync or async). Typed parameters bind from the JSON message payload, and `Depends()`, `after()`, `dependencies.py`, and `error.py` work just like HTTP routes:
+
+```python
+# app/orders/queue.py
+from msgspec import Struct
+
+topic = "orders-created"
+consumer = "billing"
+retry_after = 30
+max_concurrency = 5
+
+
+class OrderEvent(Struct):
+    order_id: str
+    amount: int
+
+
+async def CONSUME(event: OrderEvent):
+    ...
+```
+
+Test consumers locally with `uv run chano queue list` and `uv run chano queue send orders-created '{"order_id": "o_1", "amount": 4200}'`.
+
+### Scheduled jobs (`schedule.py`)
+
+Add a `schedule.py` file exporting a 5-field cron `schedule` and a `RUN` handler for a private scheduled function (with optional `timezone` and `name`):
+
+```python
+# app/reports/daily/schedule.py
+schedule = "0 9 * * *"
+timezone = "America/New_York"
+
+
+async def RUN():
+    ...
+```
+
+Inspect and trigger scheduled jobs locally with `uv run chano schedule list` and `uv run chano schedule run reports-daily`.
+
+### Durable workflows (`[[tool.vercel.workflows]]`)
+
+If your project installs the optional `vercel-workflow` package, point `[[tool.vercel.workflows]]` in `pyproject.toml` at your `Workflows` registry:
+
+```toml
+[[tool.vercel.workflows]]
+entrypoint = "workflows.orders:wf"
+```
+
+In `chano dev`, Chano mounts `/.well-known/workflow/v1/flow` and `/.well-known/workflow/v1/manifest.json` automatically when `vercel-workflow` is installed. During `chano build`, Chano introspects registered `vercel.queue` subscriptions and emits `.well-known/workflow/v1/flow.func` (plus `step.func` when step subscriptions are registered). See [Routing and special files](/reference/routing) and [Configuration and CLI](/reference/configuration-and-cli) for all options.

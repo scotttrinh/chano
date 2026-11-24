@@ -24,6 +24,9 @@ dev = [
     "pytest>=8",
     "ruff>=0.17.5",
     "ty>=0.0.104",
+    "vercel-queue>=0.11.0",
+    "vercel-runtime",
+    "vercel-workflow>=0.13.0",
 ]
 
 [build-system]

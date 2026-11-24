@@ -28,14 +28,14 @@ Each `route.py` exports top-level functions named after standard HTTP methods.
 
 [[src/chano/routing.py#Route#load]] delegates to [[src/chano/routing.py#load_module]], which [[src/chano/routing.py#Route#load_segments]] also uses. It caches each module in `sys.modules` as `chano_routes._<hash>`, keyed only by 12 hex digits of the SHA-1 of the resolved file path. Same-named files in different projects never share a module, and one file reached from several routes or two `base_path` values reuses one, so a file runs at most once per process. If the import raises, the entry is removed before re-raising, so no partial module is cached.
 
-- [[src/chano/routing.py#create_app]] registers all discovered routes and enables `/docs`, `/openapi.json`, and optional `public_dir` static serving.
-- [[src/chano/routing.py#create_route_app]] registers only the single [[src/chano/routing.py#Route]] matching `function` and sets `docs=False`.
+- [[src/chano/routing.py#create_app]] registers all discovered routes, enables `/docs`, `/openapi.json`, and optional `public_dir` static serving, and wires local `queue.py` / `schedule.py` dispatch plus optional `[[tool.vercel.workflows]]` ASGI mounts without exposing them in OpenAPI ([[vercel-primitives]]).
+- [[src/chano/routing.py#create_route_app]] registers only the single [[src/chano/routing.py#Route]] matching `function` and sets `docs=False`. Private queue and schedule functions use [[src/chano/app.py#EndpointASGIApp]] (or `vercel-queue` callback adapters) via [[src/chano/queues.py#create_queue_app]] and [[src/chano/schedules.py#create_schedule_app]].
 
 Both take `base_path`; `None` reads it from `[tool.chano]` beside `app_dir`, and the value is passed to both [[src/chano/app.py#Chano]] and [[src/chano/routing.py#discover_routes]].
 
 ## ASGI Request Handling
 
-[[src/chano/app.py#Chano#__call__]] dispatches HTTP requests through [[src/chano/app.py#Chano#_handle]], handles lifespan events as no-ops, and maps exceptions to HTTP responses.
+[[src/chano/app.py#Chano#__call__]] dispatches HTTP requests through [[src/chano/app.py#Chano#_handle]] (after checking exact ASGI sub-apps registered via [[src/chano/app.py#Chano#mount_asgi]]), runs [[src/chano/app.py#Chano#on_startup]] / [[src/chano/app.py#Chano#on_shutdown]] hooks on ASGI lifespan events, and maps exceptions to HTTP responses.
 
 Matching always uses the full public path from [[src/chano/requests.py#Request#path]] ([[config#Full Request Path]]).
 

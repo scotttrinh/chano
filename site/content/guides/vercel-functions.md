@@ -40,8 +40,11 @@ Chano keeps familiar typed handler signatures, `Depends()`, automatic request va
 | Error handlers | App-wide exception handlers | `error.py` in any route folder |
 | Startup and lifespan | Lifespan context manager | `lazy(factory)` (initializes on first use per warm instance) |
 | Background tasks | In-process background tasks | `after(fn, *args, **kwargs)` (`wait_until` in production) |
+| Queue workers | Separate worker service / broker | `app/**/queue.py` (`CONSUME`) compiled to private `_queues/` functions |
+| Scheduled jobs | External cron runner | `app/**/schedule.py` (`RUN`) compiled to private `_schedules/` functions |
+| Durable workflows | External workflow engine | `[[tool.vercel.workflows]]` compiled to `.well-known/workflow/v1/` functions |
 | OpenAPI and `/docs` | Generated at runtime in Python | Pre-rendered at build time to static CDN files |
-| Deployment unit | One container running `uvicorn` | One isolated Vercel Function per `route.py` |
+| Deployment unit | One container running `uvicorn` | One isolated Vercel Function per route, queue, schedule, or workflow |
 
 ## Why `msgspec` and a minimal ASGI core
 
