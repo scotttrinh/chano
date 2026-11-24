@@ -193,11 +193,13 @@ def render_markdown(source: str) -> tuple[str, list[TocItem]]:
 
 def render_header(active_section: str) -> str:
     guides_current = ' aria-current="page"' if active_section == "guides" else ""
+    tutorial_current = ' aria-current="page"' if active_section == "tutorial" else ""
     ref_current = ' aria-current="page"' if active_section == "reference" else ""
     return f"""    <header class="vbg-custom-header">
       <a class="vbg-custom-brand" href="/">{SITE_NAME}</a>
       <nav class="vbg-custom-nav" aria-label="Primary">
         <a href="/guides/getting-started"{guides_current}>Guides</a>
+        <a href="/tutorial/"{tutorial_current}>Tutorial</a>
         <a href="/reference/routing"{ref_current}>Reference</a>
         <a href="{GITHUB_URL}">GitHub</a>
       </nav>
@@ -210,6 +212,7 @@ def render_footer() -> str:
       <span>
         Python web framework for Vercel Functions ·
         <a href="/guides/getting-started">Guides</a> ·
+        <a href="/tutorial/">Tutorial</a> ·
         <a href="/reference/routing">Reference</a> ·
         <a href="{GITHUB_URL}">GitHub</a>
       </span>
@@ -430,7 +433,11 @@ def render_landing(page: Page) -> str:
 
 def render_sidebar(current: Page, sections: dict[str, list[Page]]) -> str:
     groups: list[str] = []
-    for key, heading in (("guides", "Guides"), ("reference", "Reference")):
+    for key, heading in (
+        ("guides", "Guides"),
+        ("tutorial", "Tutorial"),
+        ("reference", "Reference"),
+    ):
         pages = sections.get(key, [])
         if not pages:
             continue
