@@ -6,7 +6,7 @@ Chano is a serverless-first Python web framework with FastAPI-style typed handle
 
 Chano adapts web framework features to isolated serverless functions rather than assuming a single long-lived process.
 
-In production builds ([[src/chano/build.py#build]]), each `route.py` becomes an independent function running [[src/chano/routing.py#create_route_app]] with docs disabled, while static assets and pre-rendered API docs are served from the platform CDN. In local development, [[src/chano/routing.py#create_app]] combines all routes, interactive docs, and `public/` static files into one [[src/chano/app.py#Chano]] ASGI application.
+In production builds ([[src/chano/build.py#build]]), each `route.py` becomes an independent function running [[src/chano/routing.py#create_route_app]] with docs disabled, while `queue.py` consumers, `schedule.py` jobs, and `[[tool.vercel.workflows]]` entrypoints compile into isolated private functions ([[vercel-primitives]]) and static assets and pre-rendered API docs are served from the platform CDN. In local development, [[src/chano/routing.py#create_app]] combines all routes, interactive docs, `public/` static files, local queue/schedule triggers, and optional workflow endpoints into one [[src/chano/app.py#Chano]] ASGI application.
 
 ## Key Design Decisions
 

@@ -11,7 +11,7 @@ Chano infers each handler parameter's source, coercion rules, and dependencies d
 3. Explicit [[src/chano/params.py#Query]], [[src/chano/params.py#Header]], [[src/chano/params.py#Cookie]], or [[src/chano/params.py#Body]] markers inside `Annotated` override inference; `Header()` converts parameter underscores to hyphens unless `alias` is set. Using any marker or `Depends()` as a default value raises `TypeError`.
 4. A parameter name matching a route `{segment}` comes from `path`.
 5. A model type ([[src/chano/params.py#_is_model]]: `msgspec.Struct`, `dataclass`, `attrs` class, or `pydantic.BaseModel` via [[src/chano/_pydantic.py#is_pydantic_model]]) comes from `body`.
-6. Everything else defaults to `query`.
+6. Everything else defaults to `default_source` (`query` for HTTP routes and schedules, or `body` for queue consumers via [[src/chano/queues.py#load_queue]]).
 
 [[src/chano/_pydantic.py#pydantic_module]] inspects `sys.modules.get("pydantic")` without importing `pydantic`, so `BaseModel` detection adds no import or runtime dependency when user code has not loaded `pydantic`.
 

@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import json
 import os
 import sys
 from importlib.util import find_spec
 
+import msgspec
+
+from chano._pydantic import enc_hook as _pydantic_enc_hook
 from chano.build import DEFAULT_PLATFORM, DEFAULT_PYTHON, build
 from chano.config import PYPROJECT
+from chano.queues import invoke_queue, load_all_queues
+from chano.responses import Response
+from chano.schedules import invoke_schedule, load_all_schedules
 
 
 def dev_app():
@@ -14,6 +22,21 @@ def dev_app():
     from chano import create_app
 
     return create_app("app", public_dir="public")
+
+
+def _print_result(result: object) -> None:
+    if result is None:
+        return
+    if isinstance(result, Response):
+        if result.body:
+            print(result.body.decode("utf-8", errors="replace"))
+        return
+    try:
+        encoded = msgspec.json.encode(result, enc_hook=_pydantic_enc_hook).decode()
+    except TypeError:
+        print(result)
+    else:
+        print(json.dumps(json.loads(encoded), indent=2, sort_keys=True))
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -43,6 +66,43 @@ def main(argv: list[str] | None = None) -> None:
         metavar="FUNCTION",
         help="explain why each distribution was included or excluded for a function",
     )
+
+    queue_cmd = commands.add_parser("queue", help="inspect or invoke local queues")
+    queue_sub = queue_cmd.add_subparsers(dest="queue_command", required=True)
+
+    queue_list = queue_sub.add_parser("list", help="list discovered queue consumers")
+    queue_list.add_argument("--app", default="app", help="path to app directory")
+
+    queue_send = queue_sub.add_parser(
+        "send", help="deliver a JSON payload to a local queue consumer"
+    )
+    queue_send.add_argument("topic", help="queue topic name")
+    queue_send.add_argument(
+        "payload",
+        nargs="?",
+        default="{}",
+        help="JSON payload string, or '-' to read from stdin (default: '{}')",
+    )
+    queue_send.add_argument(
+        "--consumer",
+        default=None,
+        help="target a specific consumer group",
+    )
+    queue_send.add_argument("--app", default="app", help="path to app directory")
+
+    schedule_cmd = commands.add_parser(
+        "schedule", help="inspect or run local schedules"
+    )
+    schedule_sub = schedule_cmd.add_subparsers(dest="schedule_command", required=True)
+
+    schedule_list = schedule_sub.add_parser("list", help="list discovered schedules")
+    schedule_list.add_argument("--app", default="app", help="path to app directory")
+
+    schedule_run = schedule_sub.add_parser("run", help="run a local schedule job")
+    schedule_run.add_argument(
+        "target", help="schedule name, logical path, or function path (e.g. cleanup)"
+    )
+    schedule_run.add_argument("--app", default="app", help="path to app directory")
 
     args = parser.parse_args(argv)
 
@@ -78,6 +138,42 @@ def main(argv: list[str] | None = None) -> None:
         )
         print(f"Build output written to {os.path.relpath(output)}")
         print("Deploy with: vercel deploy --prebuilt")
+    elif args.command == "queue":
+        if args.queue_command == "list":
+            queues = load_all_queues(args.app)
+            if not queues:
+                print("(no queue consumers)")
+                return
+            for item in queues:
+                print(
+                    f"{item.trigger.topic}\tconsumer={item.trigger.consumer}\t"
+                    f"function={item.spec.function}"
+                )
+        elif args.queue_command == "send":
+            raw_payload = sys.stdin.read() if args.payload == "-" else args.payload
+            result = asyncio.run(
+                invoke_queue(
+                    args.app,
+                    args.topic,
+                    raw_payload.encode(),
+                    consumer=args.consumer,
+                )
+            )
+            _print_result(result)
+    elif args.command == "schedule":
+        if args.schedule_command == "list":
+            jobs = load_all_schedules(args.app)
+            if not jobs:
+                print("(no schedules)")
+                return
+            for job in jobs:
+                tz = (
+                    f"\ttimezone={job.trigger.timezone}" if job.trigger.timezone else ""
+                )
+                print(f"{job.schedule_name}\t{job.trigger.schedule}{tz}")
+        elif args.schedule_command == "run":
+            result = asyncio.run(invoke_schedule(args.app, args.target))
+            _print_result(result)
 
 
 if __name__ == "__main__":

@@ -115,3 +115,35 @@ Exports `dependencies: list[Callable] | tuple[Callable, ...]`:
 - Each item is a bare callable (not wrapped in `Depends(...)`) and must not be a generator or async generator.
 - Shares the per-request dependency cache with handler `Depends(...)`, so a callable listed in `dependencies.py` and requested via `Depends()` runs once per request.
 - Any `HTTPBearer` or `@raises` declarations on inherited checks are included in generated OpenAPI schemas.
+
+## Private Vercel primitive files
+
+Queue consumers (`queue.py`) and private schedules (`schedule.py`) live under `app/` alongside routes, inherit ancestor `dependencies.py` and `error.py` (never `middleware.py`), support `max_duration`, `memory`, `regions`, and `include`, and are excluded from public HTTP routes and OpenAPI. Route groups `(group)` are stripped from function names; dynamic `[param]` segments are rejected.
+
+### `queue.py` (Vercel Queues)
+
+Each `app/**/queue.py` compiles to `functions/_queues/<path>.func/` (`app/queue.py` -> `_queues/index`) with a `queue/v2beta` trigger in `.vc-config.json` and requires `vercel-queue` in the build dependency store.
+
+| Export | Type | Required / Default | Description |
+| --- | --- | --- | --- |
+| `CONSUME` | sync or async callable | Required | Handler invoked per message (non-generator; parameters default to JSON body fields) |
+| `topic` | `str` | Required | Topic name (`[A-Za-z0-9_-]+`), wildcard prefix (`prefix*`), or `*` |
+| `consumer` | `str` | `"default"` | Consumer group name (reversibly sanitized to match `vercel.queue`) |
+| `retry_after` | `int` | `None` | Seconds before retry (`1`–`86400` -> `retryAfterSeconds`) |
+| `initial_delay` | `int` | `None` | Initial delivery delay in seconds (`0`–`86400` -> `initialDelaySeconds`) |
+| `max_concurrency` | `int` | `None` | Maximum concurrent deliveries (`>= 1` -> `maxConcurrency`) |
+
+Duplicate or overlapping wildcard topics within the same consumer group raise `ValueError`. Returning normally acknowledges the message; raising or returning a `>= 400` `Response` triggers retries.
+
+### `schedule.py` (Vercel Schedules)
+
+Each `app/**/schedule.py` compiles to `functions/_schedules/<path>.func/` (`app/schedule.py` -> `_schedules/index`) with `experimentalTriggers: [{"type": "schedule/v1beta"}]` and a `config.json["schedules"][name]` entry.
+
+| Export | Type | Required / Default | Description |
+| --- | --- | --- | --- |
+| `RUN` | sync or async callable | Required | Handler invoked on schedule (non-generator; supports `Depends()` and `after()`) |
+| `schedule` | `str` | Required | 5-field cron expression (cannot constrain both day-of-month and day-of-week) |
+| `timezone` | `str` | `None` | Optional IANA timezone name (for example `"UTC"` or `"America/New_York"`) |
+| `name` | `str` | Path with `/` -> `-` | Schedule key (`1`–`256` chars, alnum start, `[A-Za-z0-9._-]`) |
+
+Duplicate logical paths or colliding schedule names raise `ValueError`.

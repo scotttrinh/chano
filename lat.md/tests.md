@@ -4,7 +4,7 @@ lat:
 ---
 # Tests
 
-Test specifications for Chano, anchored to [[tests/test_chano.py]] against the `examples/hello` project.
+Test specifications for Chano, anchored to [[tests/test_chano.py]] and [[tests/test_vercel_primitives.py]].
 
 ## Routes and parameters
 
@@ -615,3 +615,127 @@ Verify invalid `after_backend` values raise `ValueError`, `"local"` never import
 ### Build entrypoint and vercel install
 
 Verify [[src/chano/build.py#plan_build]] emits `after_backend="wait_until"` in `index.py`, [[src/chano/build.py#_install_dependencies]] installs `vercel>=0.10.0`, and executing the emitted `index.py` schedules route `after()` work via `vercel.functions.wait_until`.
+
+## Vercel Queues
+
+Tests for `app/**/queue.py` discovery, validation, local/SDK delivery, tree-shaken builds, and `chano queue` CLI commands.
+
+### Discovery and OpenAPI isolation
+
+Verify [[src/chano/queues.py#discover_queues]] strips `(group)` segments, maps to `_queues/...`, and keeps queue consumers and dev triggers out of public routes, `openapi.json`, and `/docs`.
+
+### Sync, async, validation, and Depends
+
+Verify `CONSUME` supports sync/async handlers, `msgspec.Struct` body binding, `Depends()`, inherited `dependencies.py`, `after()`, and `RequestValidationError` `loc` reporting.
+
+### Multi-consumer dev trigger and ASGI fallback
+
+Verify multiple consumer groups on one topic dispatch via [[src/chano/app.py#Chano#dispatch_queue]] and `/_chano/queues/{topic}`, and [[src/chano/queues.py#_LocalQueueASGIApp]] rejects CloudEvent deliveries with `500` when `vercel-queue` is absent.
+
+### Delivery lifecycle, ack, and retry
+
+Verify [[src/chano/queues.py#create_queue_app]] registers with `vercel.queue`, acknowledges successful runs, retries on exceptions or `>= 400` responses, respects `error.py`, and supports both `create_queue_service_app()` and `accept_and_handle`.
+
+### Real vercel-queue SDK registration and delivery
+
+Verify end-to-end registration and delivery with the real `vercel-queue` SDK, including `Message[bytes]` metadata headers, sanitized consumer groups, and strong subscriber retention.
+
+### Build requires vercel-queue in store
+
+Verify [[src/chano/build.py#emit_build]] raises `RuntimeError` when a project defines `queue.py` consumers but `vercel-queue` is missing from the dependency store.
+
+### Queue validation errors
+
+Verify invalid `queue.py` files (dynamic segments, missing/non-callable/generator `CONSUME`, bad `topic`, `consumer`, `retry_after`, `initial_delay`, or `max_concurrency`) fail during planning.
+
+### Duplicate topic and consumer rejected
+
+Verify [[src/chano/queues.py#load_all_queues]] raises `ValueError` when two `queue.py` modules register the same topic and consumer group.
+
+### Wildcard dispatch and consumer sanitization
+
+Verify wildcard topic patterns (`prefix*` and `*`) and sanitized consumer names resolve deterministically in [[src/chano/queues.py#resolve_queues]], [[src/chano/app.py#Chano#dispatch_queue]], and `/_chano/queues/{topic}`.
+
+### Overlapping wildcard topics rejected
+
+Verify [[src/chano/queues.py#load_all_queues]] rejects overlapping wildcard/exact topics on the same consumer group while permitting distinct consumer groups on overlapping topics.
+
+### Queue build output and tree-shaking
+
+Verify [[src/chano/build.py#emit_build]] emits `_queues/*.func` with `queue/v2beta` triggers, `max_duration`/`memory`/`regions`/`include`, `vercel-queue`, and per-function tree-shaking isolated from HTTP routes.
+
+### Queue CLI list and send
+
+Verify `chano queue list` and `chano queue send` (including `--consumer` and stdin `-` payload) list and invoke local queue consumers.
+
+## Vercel Schedules
+
+Tests for `app/**/schedule.py` private jobs, cron/timezone/name validation, build output, and `chano schedule` CLI commands.
+
+### Discovery and OpenAPI isolation
+
+Verify [[src/chano/schedules.py#discover_schedules]] strips `(group)` segments, maps to `_schedules/...`, and keeps private schedules and dev triggers out of public routes and `openapi.json`.
+
+### Sync, async, Depends, and ASGI app
+
+Verify `RUN` supports sync/async handlers, `Depends()`, inherited `dependencies.py`, `after()`, and [[src/chano/schedules.py#create_schedule_app]] accepts `POST`/`GET` and returns `405` on other methods.
+
+### Schedule build output and tree-shaking
+
+Verify [[src/chano/build.py#emit_build]] emits `_schedules/*.func` with `schedule/v1beta` triggers, `config.json["schedules"]` (including optional `timezone` and custom `name`), no legacy `crons`, and isolated per-function tree-shaking.
+
+### Schedule validation errors
+
+Verify invalid `schedule.py` modules (dynamic segments, missing/generator `RUN`, malformed/out-of-bounds/DOM+DOW crons, unknown timezones, or invalid names) fail planning.
+
+### Schedule name collision rejected
+
+Verify [[src/chano/schedules.py#load_all_schedules]] raises `ValueError` when two `schedule.py` modules resolve to the same Vercel schedule name.
+
+### Schedule handler KeyError returns 500
+
+Verify an unhandled `KeyError` inside a `schedule.py` `RUN` handler runs the handler once and returns `500` rather than being misclassified as missing.
+
+### Schedule dev trigger and CLI
+
+Verify `POST /_chano/schedules/{target:path}` plus `chano schedule list` and `chano schedule run` inspect and execute `schedule.py` jobs by schedule name, logical path, or function path.
+
+## Vercel Workflows
+
+Tests for `[[tool.vercel.workflows]]` config parsing, optional SDK behavior, live subscription introspection, build output, and local dev mounting.
+
+### Config parsing and optional dependency
+
+Verify Chano's `pyproject.toml` does not require `vercel-workflow`, and [[src/chano/config.py#load_config]] parses `[[tool.vercel.workflows]]` into [[src/chano/config.py#WorkflowConfig]] entries.
+
+### Config validation errors
+
+Verify malformed `[tool.vercel]` / `[[tool.vercel.workflows]]` tables, invalid `module:object` entrypoints, and duplicate entrypoints raise `ValueError`.
+
+### Build output and sequential replays
+
+Verify [[src/chano/build.py#plan_build]] introspects live subscriptions to emit `.well-known/workflow/v1/flow.func` (and `step.func` only when step subscriptions exist), honoring `WORKFLOW_SEQUENTIAL_REPLAYS=1`.
+
+### Build fails without SDK or subscriptions
+
+Verify building `[[tool.vercel.workflows]]` fails with `RuntimeError` when `vercel-workflow`/`vercel-queue` is missing, `http_handler` is unavailable, or no subscriptions are registered.
+
+### Local dev without SDK is graceful
+
+Verify [[src/chano/routing.py#create_app]] succeeds with `workflows_mounted=False` when `vercel-workflow` is not installed, while deployed workflow factories raise `RuntimeError`.
+
+### Real vercel-workflow SDK end-to-end run and build
+
+Verify end-to-end workflow execution and build output against the real `vercel-workflow` and `vercel-queue` SDKs, including namespaced topics and local `LocalWorld` runs.
+
+### Ignores unrelated queue subscribers
+
+Verify [[src/chano/workflows.py#introspect_workflow_triggers]] attributes only subscriptions owned by the configured `Workflows` registry and ignores unrelated `@vercel.queue.subscribe` handlers on step topics.
+
+### Real SDK shape local dev and build
+
+Verify multi-namespace `Workflows` registries mount `/.well-known/workflow/v1/flow` and `manifest.json` in `create_app`, route by `x-vqs-queue-name`, manage lifespan hooks, and emit valid build artifacts.
+
+## Combined Vercel primitives
+
+Verify a single project combining HTTP `route.py`, `queue.py`, `schedule.py`, and `[[tool.vercel.workflows]]` builds cleanly with all functions, `config.json` sections, and isolated OpenAPI output.

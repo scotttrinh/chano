@@ -312,10 +312,12 @@ class Endpoint:
         func: Callable[..., Any],
         path_params: set[str],
         dependencies: Sequence[Sequence[Callable[..., Any]]] = (),
+        *,
+        default_source: str = "query",
     ) -> None:
         self.func = func
         fields = [
-            _field(parameter, path_params)
+            _field(parameter, path_params, default_source=default_source)
             for parameter in inspect.signature(func, eval_str=True).parameters.values()
         ]
         if sum(field.source == "body" for field in fields) > 1:
@@ -579,7 +581,12 @@ def _is_model(annotation: Any) -> bool:
     )
 
 
-def _field(parameter: inspect.Parameter, path_params: set[str]) -> Field:
+def _field(
+    parameter: inspect.Parameter,
+    path_params: set[str],
+    *,
+    default_source: str = "query",
+) -> Field:
     name = parameter.name
     annotation = parameter.annotation
     default = parameter.default
@@ -619,7 +626,7 @@ def _field(parameter: inspect.Parameter, path_params: set[str]) -> Field:
     elif _is_model(annotation):
         source = "body"
     else:
-        source = "query"
+        source = default_source
 
     alias = marker.alias if isinstance(marker, ParamInfo) and marker.alias else name
     if source == "header" and alias == name:

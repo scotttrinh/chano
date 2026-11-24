@@ -27,15 +27,18 @@ import importlib.util
 import inspect
 import re
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
 from chano.app import AfterBackend, Chano, ErrorHandler, Middleware
-from chano.config import normalize_base_path, project_base_path
+from chano.config import normalize_base_path, project_base_path, project_config
+from chano.exceptions import HTTPException
 from chano.params import is_generator_callable
+from chano.requests import Request
+from chano.responses import Response
 
 HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 ROUTE_FILE = "route.py"
@@ -171,10 +174,10 @@ def _middleware(route: Route) -> list[Middleware]:
     return chain
 
 
-def _error_handlers(route: Route) -> list[ErrorHandler]:
-    """Each ancestor ``error.py``'s ``handle_error``, root to leaf."""
+def load_segment_error_handlers(modules: Sequence[ModuleType]) -> list[ErrorHandler]:
+    """Validate and return ``handle_error`` from each ``error.py`` module."""
     handlers = []
-    for module in route.load_segments(ERROR_FILE):
+    for module in modules:
         handler = getattr(module, "handle_error", None)
         if not callable(handler):
             raise TypeError(
@@ -185,11 +188,17 @@ def _error_handlers(route: Route) -> list[ErrorHandler]:
     return handlers
 
 
-def _dependencies(route: Route) -> list[list[Callable[..., Any]]]:
-    """Each ancestor ``dependencies.py``'s ``dependencies``, one group per
-    file, root to leaf and in declared order within each."""
+def _error_handlers(route: Route) -> list[ErrorHandler]:
+    """Each ancestor ``error.py``'s ``handle_error``, root to leaf."""
+    return load_segment_error_handlers(route.load_segments(ERROR_FILE))
+
+
+def load_segment_dependencies(
+    modules: Sequence[ModuleType],
+) -> list[list[Callable[..., Any]]]:
+    """Validate and return ``dependencies`` from each ``dependencies.py`` module."""
     groups: list[list[Callable[..., Any]]] = []
-    for module in route.load_segments(DEPENDENCIES_FILE):
+    for module in modules:
         declared = getattr(module, "dependencies", None)
         if not isinstance(declared, list | tuple) or not all(
             callable(check) for check in declared
@@ -205,6 +214,12 @@ def _dependencies(route: Route) -> list[list[Callable[..., Any]]]:
             )
         groups.append(list(declared))
     return groups
+
+
+def _dependencies(route: Route) -> list[list[Callable[..., Any]]]:
+    """Each ancestor ``dependencies.py``'s ``dependencies``, one group per
+    file, root to leaf and in declared order within each."""
+    return load_segment_dependencies(route.load_segments(DEPENDENCIES_FILE))
 
 
 def _add_route(app: Chano, route: Route) -> None:
@@ -238,12 +253,124 @@ def create_app(
     ``public_dir`` is only for local development: in a deployment, static
     files are served by the platform. ``base_path=None`` reads it from
     ``[tool.chano]`` in the ``pyproject.toml`` beside ``app_dir``.
+
+    Queue consumers (``queue.py``), private schedules (``schedule.py``) and
+    configured ``[[tool.vercel.workflows]]`` endpoints are wired for local
+    invocation without exposing them in OpenAPI.
     """
+    from chano.queues import (
+        QueueNotFoundError,
+        dispatch_loaded_queues,
+        invoke_resolved_queues,
+        load_all_queues,
+        resolve_queues,
+    )
+    from chano.schedules import (
+        ScheduleNotFoundError,
+        invoke_loaded_schedule,
+        load_all_schedules,
+        resolve_schedule,
+        run_loaded_schedule,
+    )
+    from chano.workflows import mount_workflows
+
+    config = project_config(app_dir)
     if base_path is None:
-        base_path = project_base_path(app_dir)
+        base_path = config.base_path
     app = Chano(title=title, public_dir=public_dir, base_path=base_path)
     for route in discover_routes(app_dir, app.base_path):
         _add_route(app, route)
+
+    queues = tuple(load_all_queues(app_dir))
+    app.queues = queues
+
+    async def _dispatch_queue(
+        topic: str,
+        payload: Any,
+        *,
+        consumer: str | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> Any:
+        return await dispatch_loaded_queues(
+            queues, topic, payload, consumer=consumer, headers=headers
+        )
+
+    app._queue_dispatcher = _dispatch_queue
+
+    if queues:
+
+        async def _dev_queue_trigger(
+            topic: str, request: Request, consumer: str | None = None
+        ) -> Any:
+            try:
+                matches = resolve_queues(queues, topic, consumer=consumer)
+            except QueueNotFoundError as exc:
+                raise HTTPException(404, str(exc)) from None
+            body = await request.body()
+            result = await invoke_resolved_queues(
+                matches,
+                body,
+                topic=topic,
+                headers=request.headers,
+            )
+            if isinstance(result, Response):
+                return result
+            if result is None:
+                return Response(status_code=200)
+            return result
+
+        app.add_route(
+            f"{app.base_path}/_chano/queues/{{topic}}",
+            _dev_queue_trigger,
+            methods=["POST"],
+            include_in_schema=False,
+        )
+
+    schedules = tuple(load_all_schedules(app_dir))
+    app.schedules = schedules
+
+    async def _run_schedule(
+        target: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> Any:
+        return await run_loaded_schedule(
+            schedules,
+            target,
+            headers=headers,
+        )
+
+    app._schedule_runner = _run_schedule
+
+    if schedules:
+
+        async def _dev_schedule_trigger(target: str, request: Request) -> Any:
+            try:
+                resolved = resolve_schedule(schedules, target)
+            except ScheduleNotFoundError as exc:
+                raise HTTPException(404, str(exc)) from None
+            result = await invoke_loaded_schedule(resolved, headers=request.headers)
+            if isinstance(result, Response):
+                return result
+            if result is None:
+                return Response(status_code=200)
+            return result
+
+        app.add_route(
+            f"{app.base_path}/_chano/schedules/{{target:path}}",
+            _dev_schedule_trigger,
+            methods=["POST"],
+            include_in_schema=False,
+        )
+
+    app.workflows = config.workflows
+    if config.workflows:
+        mount_workflows(
+            app,
+            config.workflows,
+            project_root=Path(app_dir).resolve().parent,
+        )
+
     return app
 
 

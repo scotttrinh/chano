@@ -44,8 +44,15 @@ from email.parser import HeaderParser
 from pathlib import Path
 from types import ModuleType
 
-from chano.config import PYPROJECT, ChanoConfig, load_config, read_pyproject
+from chano.config import (
+    PYPROJECT,
+    ChanoConfig,
+    WorkflowConfig,
+    load_config,
+    read_pyproject,
+)
 from chano.openapi import swagger_html
+from chano.queues import LoadedQueue, load_all_queues
 from chano.routing import (
     DEPENDENCIES_FILE,
     ERROR_FILE,
@@ -53,6 +60,15 @@ from chano.routing import (
     Route,
     create_app,
     discover_routes,
+)
+from chano.schedules import LoadedSchedule, load_all_schedules
+from chano.workflows import (
+    WORKFLOW_FLOW_FUNCTION,
+    WORKFLOW_FLOW_MAX_DURATION,
+    WORKFLOW_STEP_FUNCTION,
+    WORKFLOW_STEP_MAX_DURATION,
+    introspect_workflow_triggers,
+    resolve_workflow_trace_roots,
 )
 
 OUTPUT_DIR = Path(".vercel") / "output"
@@ -91,6 +107,37 @@ app = create_route_app(
     base_path={base_path!r},
     after_backend="wait_until",
 )
+"""
+
+QUEUE_ENTRYPOINT_SOURCE = """\
+import os
+
+from chano.queues import create_queue_app
+
+app = create_queue_app(
+    os.path.join(os.path.dirname(__file__), "app"),
+    {function!r},
+    after_backend="wait_until",
+)
+"""
+
+SCHEDULE_ENTRYPOINT_SOURCE = """\
+import os
+
+from chano.schedules import create_schedule_app
+
+app = create_schedule_app(
+    os.path.join(os.path.dirname(__file__), "app"),
+    {function!r},
+    after_backend="wait_until",
+)
+"""
+
+WORKFLOW_ENTRYPOINT_SOURCE = """\
+{imports}
+from chano.workflows import {factory}
+
+app = {factory}({entrypoints!r})
 """
 
 # Module-level settings a route.py may define, and their .vc-config.json keys.
@@ -390,20 +437,23 @@ def index_store(store_dir: Path) -> StoreIndex:
 
 @dataclass(frozen=True)
 class FunctionSpec:
-    """One Vercel function: a route and everything emitted beside its payload."""
+    """One Vercel function and everything emitted beside its payload."""
 
     name: str
     """Function path under ``functions/``, without ``.func``."""
-    route: Route
+    route: Route | None
     entrypoint: str
     """Source of the function's ``index.py``."""
     vc_config: dict[str, object]
     """Content of the function's ``.vc-config.json``."""
     trace_roots: tuple[Path, ...] = ()
-    """Project source files traced for this function: ``route.py``, then its
-    ancestor ``middleware.py`` and ``error.py`` files, root to leaf."""
+    """Project source files traced for this function."""
     include: tuple[str, ...] = ()
     """PEP 503 normalized distribution names from module-level ``include``."""
+    required_distributions: tuple[str, ...] = ()
+    """Distributions that MUST exist in the build store for this function."""
+    source_file: Path | None = None
+    """Primary source file for display in ``--explain``."""
 
 
 @dataclass(frozen=True)
@@ -429,7 +479,7 @@ class BuildPlan:
     """The project's ``public/`` directory, or None if it has none."""
     output_dir: Path
     config: ChanoConfig
-    """The project's ``[tool.chano]`` settings."""
+    """The project's ``[tool.chano]`` and ``[[tool.vercel.workflows]]`` settings."""
     python: str
     platform: str | None
     functions: tuple[FunctionSpec, ...]
@@ -437,6 +487,8 @@ class BuildPlan:
     """Generated files written into ``static/`` over ``public/``."""
     routes: tuple[dict[str, str], ...]
     """The ``routes`` array of ``config.json``."""
+    schedules: tuple[tuple[str, dict[str, str]], ...] = ()
+    """Sorted ``(name, config)`` pairs for ``config.json["schedules"]``."""
 
 
 def _clone_config(value: object) -> object:
@@ -476,37 +528,46 @@ def _dump_json(value: object, *, indent: int | None = None) -> str:
         return json.dumps(_sort_keys(value), indent=indent)
 
 
-def _read_route_include(module: ModuleType, route: Route) -> tuple[str, ...]:
-    """Read and normalize module-level ``include`` from a loaded route module."""
+def _read_module_include(module: ModuleType, file: Path) -> tuple[str, ...]:
+    """Read and normalize module-level ``include`` from a loaded module."""
     if not hasattr(module, "include"):
         return ()
     raw = module.include
     if isinstance(raw, (str, bytes, bytearray)) or not isinstance(raw, Sequence):
-        raise ValueError(
-            f"invalid `include` in {route.file}: expected a sequence of strings"
-        )
+        raise ValueError(f"invalid `include` in {file}: expected a sequence of strings")
     names: list[str] = []
     for item in raw:
         if not isinstance(item, str) or not item.strip():
             raise ValueError(
-                f"invalid `include` entry {item!r} in {route.file}: "
+                f"invalid `include` entry {item!r} in {file}: "
                 "expected a non-empty string"
             )
         names.append(normalize_dist_name(item.strip()))
     return tuple(dict.fromkeys(names))
 
 
-def _plan_function(route: Route, python: str, base_path: str) -> FunctionSpec:
-    module = route.load()
+def _read_route_include(module: ModuleType, route: Route) -> tuple[str, ...]:
+    """Read and normalize module-level ``include`` from a loaded route module."""
+    return _read_module_include(module, route.file)
+
+
+def _base_vc_config(python: str, module: ModuleType | None = None) -> dict[str, object]:
     config: dict[str, object] = {
         "runtime": f"python{python}",
         "handler": f"{HANDLER_MODULE}.vc_handler",
         "supportsResponseStreaming": True,
         "environment": {"PYTHONDONTWRITEBYTECODE": "1"},
     }
-    for name, key in ROUTE_CONFIG.items():
-        if hasattr(module, name):
-            config[key] = _clone_config(getattr(module, name))
+    if module is not None:
+        for name, key in ROUTE_CONFIG.items():
+            if hasattr(module, name):
+                config[key] = _clone_config(getattr(module, name))
+    return config
+
+
+def _plan_function(route: Route, python: str, base_path: str) -> FunctionSpec:
+    module = route.load()
+    config = _base_vc_config(python, module)
     return FunctionSpec(
         name=route.function,
         route=route,
@@ -518,8 +579,110 @@ def _plan_function(route: Route, python: str, base_path: str) -> FunctionSpec:
             route.file,
             *route.segment_files(MIDDLEWARE_FILE, ERROR_FILE, DEPENDENCIES_FILE),
         ),
-        include=_read_route_include(module, route),
+        include=_read_module_include(module, route.file),
+        source_file=route.file,
     )
+
+
+def _plan_queue_function(loaded: LoadedQueue, python: str) -> FunctionSpec:
+    config = _base_vc_config(python, loaded.module)
+    config["experimentalTriggers"] = [loaded.trigger.to_vc_trigger()]
+    user_include = _read_module_include(loaded.module, loaded.spec.file)
+    vercel_queue = normalize_dist_name("vercel-queue")
+    include = tuple(dict.fromkeys((*user_include, vercel_queue)))
+    return FunctionSpec(
+        name=loaded.spec.function,
+        route=None,
+        entrypoint=QUEUE_ENTRYPOINT_SOURCE.format(function=loaded.spec.function),
+        vc_config=config,
+        trace_roots=(
+            loaded.spec.file,
+            *loaded.spec.segment_files(ERROR_FILE, DEPENDENCIES_FILE),
+        ),
+        include=include,
+        required_distributions=(vercel_queue,),
+        source_file=loaded.spec.file,
+    )
+
+
+def _plan_schedule_function(loaded: LoadedSchedule, python: str) -> FunctionSpec:
+    config = _base_vc_config(python, loaded.module)
+    config["experimentalTriggers"] = [loaded.trigger.to_vc_trigger()]
+    return FunctionSpec(
+        name=loaded.spec.function,
+        route=None,
+        entrypoint=SCHEDULE_ENTRYPOINT_SOURCE.format(function=loaded.spec.function),
+        vc_config=config,
+        trace_roots=(
+            loaded.spec.file,
+            *loaded.spec.segment_files(ERROR_FILE, DEPENDENCIES_FILE),
+        ),
+        include=_read_module_include(loaded.module, loaded.spec.file),
+        source_file=loaded.spec.file,
+    )
+
+
+def _plan_workflow_functions(
+    workflows: tuple[WorkflowConfig, ...],
+    project_dir: Path,
+    python: str,
+) -> tuple[FunctionSpec, ...]:
+    if not workflows:
+        return ()
+    trace_roots = resolve_workflow_trace_roots(workflows, project_dir)
+    flow_triggers, step_triggers = introspect_workflow_triggers(workflows, project_dir)
+    entrypoints = tuple(wf.entrypoint for wf in workflows)
+    imports = "\n".join(f"import {wf.module_name}  # noqa: F401" for wf in workflows)
+    primary_source = trace_roots[0] if trace_roots else None
+    required = (
+        normalize_dist_name("vercel-workflow"),
+        normalize_dist_name("vercel-queue"),
+    )
+
+    specs: list[FunctionSpec] = []
+    if flow_triggers:
+        flow_config = _base_vc_config(python)
+        flow_config["maxDuration"] = WORKFLOW_FLOW_MAX_DURATION
+        flow_config["experimentalTriggers"] = flow_triggers
+        specs.append(
+            FunctionSpec(
+                name=WORKFLOW_FLOW_FUNCTION,
+                route=None,
+                entrypoint=WORKFLOW_ENTRYPOINT_SOURCE.format(
+                    imports=imports,
+                    factory="create_workflow_flow_app",
+                    entrypoints=entrypoints,
+                ),
+                vc_config=flow_config,
+                trace_roots=trace_roots,
+                include=required,
+                required_distributions=required,
+                source_file=primary_source,
+            )
+        )
+
+    if step_triggers:
+        step_config = _base_vc_config(python)
+        step_config["maxDuration"] = WORKFLOW_STEP_MAX_DURATION
+        step_config["experimentalTriggers"] = step_triggers
+        specs.append(
+            FunctionSpec(
+                name=WORKFLOW_STEP_FUNCTION,
+                route=None,
+                entrypoint=WORKFLOW_ENTRYPOINT_SOURCE.format(
+                    imports=imports,
+                    factory="create_workflow_step_app",
+                    entrypoints=entrypoints,
+                ),
+                vc_config=step_config,
+                trace_roots=trace_roots,
+                include=required,
+                required_distributions=required,
+                source_file=primary_source,
+            )
+        )
+
+    return tuple(specs)
 
 
 def _static_prefix(base_path: str) -> str:
@@ -625,6 +788,33 @@ def plan_build(
     )
     _validate_output_dir(output_dir, project_dir, app_dir, public)
     routes = discover_routes(app_dir, base_path)
+    queues = load_all_queues(app_dir)
+    schedules = load_all_schedules(app_dir)
+
+    route_functions = tuple(
+        _plan_function(route, python, base_path) for route in routes
+    )
+    queue_functions = tuple(_plan_queue_function(q, python) for q in queues)
+    schedule_functions = tuple(_plan_schedule_function(s, python) for s in schedules)
+    schedule_entries = tuple(
+        sorted(
+            ((s.schedule_name, s.to_config_schedule()) for s in schedules),
+            key=lambda item: item[0],
+        )
+    )
+    workflow_functions = _plan_workflow_functions(config.workflows, project_dir, python)
+
+    all_functions = (
+        *route_functions,
+        *queue_functions,
+        *schedule_functions,
+        *workflow_functions,
+    )
+    seen_functions: set[str] = set()
+    for spec in all_functions:
+        if spec.name in seen_functions:
+            raise ValueError(f"duplicate function path {spec.name!r} in build plan")
+        seen_functions.add(spec.name)
 
     # Plan.
     return BuildPlan(
@@ -637,9 +827,10 @@ def plan_build(
         config=config,
         python=python,
         platform=platform,
-        functions=tuple(_plan_function(route, python, base_path) for route in routes),
+        functions=all_functions,
         static_files=_plan_static(project_dir, app_dir, base_path),
         routes=_plan_routes(routes, base_path),
+        schedules=schedule_entries,
     )
 
 
@@ -1128,7 +1319,10 @@ def _resolve_shaken_reasons(
     """Compute sorted ``distribution -> reason`` for a tree-shaken function."""
     project_root = project_dir.resolve()
     traced = _trace_function_chains(spec, project_root, store)
-    route_label = _relative_display(spec.route.file, project_root)
+    source_file = spec.source_file or (spec.route.file if spec.route else None)
+    route_label = (
+        _relative_display(source_file, project_root) if source_file else spec.name
+    )
 
     seeds: list[tuple[str, str]] = [
         (name, "always included") for name in ALWAYS_INCLUDED
@@ -1475,6 +1669,19 @@ def emit_build(plan: BuildPlan, *, explain: str | None = None) -> Path:
         all_distributions = tuple(store.distributions)
         reports: list[FunctionReport] = []
         for spec in plan.functions:
+            missing_required = [
+                dist
+                for dist in spec.required_distributions
+                if dist not in store.distributions
+            ]
+            if missing_required:
+                names = ", ".join(repr(dist) for dist in missing_required)
+                raise RuntimeError(
+                    f"Function {spec.name!r} requires {names} in the build "
+                    "dependency store. Add the missing package(s) to your project "
+                    "dependencies (for example `vercel-queue`, `vercel-workflow`, "
+                    "or `vercel>=0.10.0`)."
+                )
             func_dir = _write_function(spec, shared, output / "functions")
             vendor_dest = func_dir / VENDOR_DIR
             if plan.config.tree_shake:
@@ -1508,9 +1715,10 @@ def emit_build(plan: BuildPlan, *, explain: str | None = None) -> Path:
     _check_function_imports(plan, func_dirs)
 
     _write_static(plan, output / "static")
-    (output / "config.json").write_text(
-        _dump_json({"version": 3, "routes": list(plan.routes)}, indent=2)
-    )
+    config_json: dict[str, object] = {"version": 3, "routes": list(plan.routes)}
+    if plan.schedules:
+        config_json["schedules"] = dict(plan.schedules)
+    (output / "config.json").write_text(_dump_json(config_json, indent=2))
     return output
 
 

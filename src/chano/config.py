@@ -1,4 +1,5 @@
-"""Project configuration: the ``[tool.chano]`` table of ``pyproject.toml``.
+"""Project configuration: ``[tool.chano]`` and ``[[tool.vercel.workflows]]``
+in ``pyproject.toml``.
 
 The file is parsed with ``tomllib`` and never imports user code, so the
 build can read it before loading any route module.
@@ -9,7 +10,7 @@ from __future__ import annotations
 import os
 import re
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import msgspec
@@ -43,6 +44,46 @@ def normalize_base_path(base_path: str) -> str:
     return f"/{stripped}"
 
 
+def _is_dotted_identifier(value: str) -> bool:
+    parts = value.split(".")
+    return bool(parts) and all(part.isidentifier() for part in parts)
+
+
+class WorkflowConfig(msgspec.Struct, frozen=True):
+    """One ``[[tool.vercel.workflows]]`` entry pointing to a ``module:object``."""
+
+    entrypoint: str
+
+    def __post_init__(self) -> None:
+        module_path, sep, obj_path = self.entrypoint.partition(":")
+        if (
+            not sep
+            or ":" in obj_path
+            or not _is_dotted_identifier(module_path)
+            or not _is_dotted_identifier(obj_path)
+        ):
+            raise ValueError(
+                f"invalid workflow entrypoint {self.entrypoint!r}: "
+                "expected 'module:object' with valid Python identifiers"
+            )
+
+    @property
+    def module_name(self) -> str:
+        return self.entrypoint.split(":", 1)[0]
+
+    @property
+    def object_name(self) -> str:
+        return self.entrypoint.split(":", 1)[1]
+
+
+class _ChanoTable(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    """Strict schema for ``[tool.chano]``; unknown keys are an error."""
+
+    base_path: str = ""
+    tree_shake: bool = True
+    include: tuple[str, ...] = ()
+
+
 class ChanoConfig(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     """Project-level settings. Unknown keys are an error."""
 
@@ -52,6 +93,8 @@ class ChanoConfig(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     """Bundle only the distributions each function imports."""
     include: tuple[str, ...] = ()
     """Distribution names bundled into every function."""
+    workflows: tuple[WorkflowConfig, ...] = ()
+    """Entries declared under ``[[tool.vercel.workflows]]``."""
 
     def __post_init__(self) -> None:
         normalized = normalize_base_path(self.base_path)
@@ -64,8 +107,47 @@ def read_pyproject(pyproject: str | Path) -> dict[str, object]:
         return tomllib.load(file)
 
 
+def _load_workflows(
+    tool: Mapping[str, object], pyproject: Path
+) -> tuple[WorkflowConfig, ...]:
+    vercel = tool.get("vercel", {})
+    if not isinstance(vercel, Mapping):
+        raise ValueError(
+            f"invalid [tool.vercel] in {pyproject}: `tool.vercel` must be a table"
+        )
+    raw = vercel.get("workflows", ())
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
+        raise ValueError(
+            f"invalid [[tool.vercel.workflows]] in {pyproject}: "
+            "expected an array of tables"
+        )
+    workflows: list[WorkflowConfig] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw):
+        if not isinstance(item, Mapping):
+            raise ValueError(
+                f"invalid [[tool.vercel.workflows]][{index}] in {pyproject}: "
+                "expected a table"
+            )
+        try:
+            wf = msgspec.convert(item, WorkflowConfig)
+        except (msgspec.ValidationError, ValueError) as exc:
+            raise ValueError(
+                f"invalid [[tool.vercel.workflows]][{index}] in {pyproject}: {exc}"
+            ) from exc
+        if wf.entrypoint in seen:
+            raise ValueError(
+                f"duplicate [[tool.vercel.workflows]] entrypoint {wf.entrypoint!r} "
+                f"in {pyproject}"
+            )
+        seen.add(wf.entrypoint)
+        workflows.append(wf)
+    return tuple(workflows)
+
+
 def load_config(pyproject: str | Path) -> ChanoConfig:
-    """Read ``[tool.chano]`` from ``pyproject``; defaults if the table is absent.
+    """Read ``[tool.chano]`` and ``[[tool.vercel.workflows]]`` from ``pyproject``;
+    defaults if the tables are absent.
 
     Raises ``ValueError`` for unknown keys or invalid values.
     """
@@ -78,17 +160,30 @@ def load_config(pyproject: str | Path) -> ChanoConfig:
     if not isinstance(table, Mapping):
         raise ValueError(f"{error}: `tool.chano` must be a table")
     try:
-        return msgspec.convert(table, ChanoConfig)
+        parsed = msgspec.convert(table, _ChanoTable)
     except msgspec.ValidationError as exc:
         raise ValueError(f"invalid [tool.chano] in {pyproject}: {exc}") from exc
+    workflows = _load_workflows(tool, pyproject)
+    return ChanoConfig(
+        base_path=parsed.base_path,
+        tree_shake=parsed.tree_shake,
+        include=parsed.include,
+        workflows=workflows,
+    )
 
 
-def project_base_path(app_dir: str | Path) -> str:
-    """The ``base_path`` configured beside ``app_dir``, or ``""`` if the
-    project has no ``pyproject.toml``.
+def project_config(app_dir: str | Path) -> ChanoConfig:
+    """The configuration beside ``app_dir``, or defaults if the project has no
+    ``pyproject.toml``.
 
     Symlinks in ``app_dir`` are not resolved first, so ``app -> src/app``
     reads the project root's ``pyproject.toml``, as ``plan_build`` does.
     """
     pyproject = Path(os.path.abspath(app_dir)).parent / PYPROJECT
-    return load_config(pyproject).base_path if pyproject.is_file() else ""
+    return load_config(pyproject) if pyproject.is_file() else ChanoConfig()
+
+
+def project_base_path(app_dir: str | Path) -> str:
+    """The ``base_path`` configured beside ``app_dir``, or ``""`` if the
+    project has no ``pyproject.toml``."""
+    return project_config(app_dir).base_path
