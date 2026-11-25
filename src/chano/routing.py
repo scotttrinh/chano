@@ -22,8 +22,6 @@ deployed, each route is its own function running a single-route app
 
 from __future__ import annotations
 
-import hashlib
-import importlib.util
 import re
 import sys
 from collections.abc import Mapping, Sequence
@@ -32,37 +30,31 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from chano._primitives import load_module
 from chano.app import AfterBackend, Boundary, Chano
 from chano.config import normalize_base_path, project_base_path, project_config
+from chano.queues import (
+    QueueNotFoundError,
+    dispatch_loaded_queues,
+    invoke_resolved_queues,
+    load_all_queues,
+    resolve_queues,
+)
 from chano.requests import Request
 from chano.responses import Response
+from chano.schedules import (
+    ScheduleNotFoundError,
+    invoke_loaded_schedule,
+    load_all_schedules,
+    resolve_schedule,
+    run_loaded_schedule,
+)
 from chano.status import NotFound
+from chano.workflows import mount_workflows
 
 HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 ROUTE_FILE = "route.py"
 BOUNDARY_FILE = "boundary.py"
-
-
-def load_module(path: Path) -> ModuleType:
-    """Import a route or segment file once per process, keyed only by its
-    resolved path: files from different projects never share a
-    ``sys.modules`` entry, and one file reached from several routes or
-    prefixes reuses its module. A failed import leaves no partial module
-    behind, so a retry runs the file again."""
-    digest = hashlib.sha1(str(path.resolve()).encode()).hexdigest()[:12]
-    name = f"chano_routes._{digest}"
-    if name in sys.modules:
-        return sys.modules[name]
-    spec = importlib.util.spec_from_file_location(name, path)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop(name, None)
-        raise
-    return module
 
 
 @dataclass(frozen=True)
@@ -184,6 +176,94 @@ def _add_route(app: Chano, route: Route) -> None:
             )
 
 
+def _normalize_dev_trigger_result(result: Any) -> Any:
+    if isinstance(result, Response):
+        return result
+    if result is None:
+        return Response(status_code=200)
+    return result
+
+
+def _wire_dev_queues(app: Chano, app_dir: str | Path) -> None:
+    queues = tuple(load_all_queues(app_dir))
+    app.queues = queues
+
+    async def _dispatch_queue(
+        topic: str,
+        payload: Any,
+        *,
+        consumer: str | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> Any:
+        return await dispatch_loaded_queues(
+            queues, topic, payload, consumer=consumer, headers=headers
+        )
+
+    app._queue_dispatcher = _dispatch_queue
+
+    if not queues:
+        return
+
+    async def _dev_queue_trigger(
+        topic: str, request: Request, consumer: str | None = None
+    ) -> Any:
+        try:
+            matches = resolve_queues(queues, topic, consumer=consumer)
+        except QueueNotFoundError as exc:
+            raise NotFound(str(exc)) from None
+        body = await request.body()
+        result = await invoke_resolved_queues(
+            matches,
+            body,
+            topic=topic,
+            headers=request.headers,
+        )
+        return _normalize_dev_trigger_result(result)
+
+    app.add_route(
+        f"{app.base_path}/_chano/queues/{{topic}}",
+        _dev_queue_trigger,
+        methods=["POST"],
+        include_in_schema=False,
+    )
+
+
+def _wire_dev_schedules(app: Chano, app_dir: str | Path) -> None:
+    schedules = tuple(load_all_schedules(app_dir))
+    app.schedules = schedules
+
+    async def _run_schedule(
+        target: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> Any:
+        return await run_loaded_schedule(
+            schedules,
+            target,
+            headers=headers,
+        )
+
+    app._schedule_runner = _run_schedule
+
+    if not schedules:
+        return
+
+    async def _dev_schedule_trigger(target: str, request: Request) -> Any:
+        try:
+            resolved = resolve_schedule(schedules, target)
+        except ScheduleNotFoundError as exc:
+            raise NotFound(str(exc)) from None
+        result = await invoke_loaded_schedule(resolved, headers=request.headers)
+        return _normalize_dev_trigger_result(result)
+
+    app.add_route(
+        f"{app.base_path}/_chano/schedules/{{target:path}}",
+        _dev_schedule_trigger,
+        methods=["POST"],
+        include_in_schema=False,
+    )
+
+
 def create_app(
     app_dir: str | Path = "app",
     *,
@@ -202,22 +282,6 @@ def create_app(
     configured ``[[tool.vercel.workflows]]`` endpoints are wired for local
     invocation without exposing them in OpenAPI.
     """
-    from chano.queues import (
-        QueueNotFoundError,
-        dispatch_loaded_queues,
-        invoke_resolved_queues,
-        load_all_queues,
-        resolve_queues,
-    )
-    from chano.schedules import (
-        ScheduleNotFoundError,
-        invoke_loaded_schedule,
-        load_all_schedules,
-        resolve_schedule,
-        run_loaded_schedule,
-    )
-    from chano.workflows import mount_workflows
-
     config = project_config(app_dir)
     if base_path is None:
         base_path = config.base_path
@@ -225,87 +289,8 @@ def create_app(
     for route in discover_routes(app_dir, app.base_path):
         _add_route(app, route)
 
-    queues = tuple(load_all_queues(app_dir))
-    app.queues = queues
-
-    async def _dispatch_queue(
-        topic: str,
-        payload: Any,
-        *,
-        consumer: str | None = None,
-        headers: Mapping[str, str] | None = None,
-    ) -> Any:
-        return await dispatch_loaded_queues(
-            queues, topic, payload, consumer=consumer, headers=headers
-        )
-
-    app._queue_dispatcher = _dispatch_queue
-
-    if queues:
-
-        async def _dev_queue_trigger(
-            topic: str, request: Request, consumer: str | None = None
-        ) -> Any:
-            try:
-                matches = resolve_queues(queues, topic, consumer=consumer)
-            except QueueNotFoundError as exc:
-                raise NotFound(str(exc)) from None
-            body = await request.body()
-            result = await invoke_resolved_queues(
-                matches,
-                body,
-                topic=topic,
-                headers=request.headers,
-            )
-            if isinstance(result, Response):
-                return result
-            if result is None:
-                return Response(status_code=200)
-            return result
-
-        app.add_route(
-            f"{app.base_path}/_chano/queues/{{topic}}",
-            _dev_queue_trigger,
-            methods=["POST"],
-            include_in_schema=False,
-        )
-
-    schedules = tuple(load_all_schedules(app_dir))
-    app.schedules = schedules
-
-    async def _run_schedule(
-        target: str,
-        *,
-        headers: Mapping[str, str] | None = None,
-    ) -> Any:
-        return await run_loaded_schedule(
-            schedules,
-            target,
-            headers=headers,
-        )
-
-    app._schedule_runner = _run_schedule
-
-    if schedules:
-
-        async def _dev_schedule_trigger(target: str, request: Request) -> Any:
-            try:
-                resolved = resolve_schedule(schedules, target)
-            except ScheduleNotFoundError as exc:
-                raise NotFound(str(exc)) from None
-            result = await invoke_loaded_schedule(resolved, headers=request.headers)
-            if isinstance(result, Response):
-                return result
-            if result is None:
-                return Response(status_code=200)
-            return result
-
-        app.add_route(
-            f"{app.base_path}/_chano/schedules/{{target:path}}",
-            _dev_schedule_trigger,
-            methods=["POST"],
-            include_in_schema=False,
-        )
+    _wire_dev_queues(app, app_dir)
+    _wire_dev_schedules(app, app_dir)
 
     app.workflows = config.workflows
     if config.workflows:

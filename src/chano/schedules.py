@@ -13,9 +13,7 @@ top-level ``schedules`` entry in ``config.json``.
 
 from __future__ import annotations
 
-import asyncio
 import re
-import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,15 +21,18 @@ from types import ModuleType
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from chano._primitives import (
+    discover_app_files,
+    load_module,
+    synthetic_post_request,
+    validate_handler,
+)
 from chano.app import (
     AfterBackend,
     EndpointASGIApp,
-    _after_state,
-    _AfterState,
+    _after_scope,
 )
-from chano.params import Endpoint, is_generator_callable
-from chano.requests import Message, Request, Scope
-from chano.routing import load_module
+from chano.params import Endpoint
 
 SCHEDULE_FILE = "schedule.py"
 SCHEDULE_FUNCTION_PREFIX = "_schedules"
@@ -213,38 +214,12 @@ def validate_schedule_name(name: object, file: Path) -> str:
     return name
 
 
-def _schedule_job(app_dir: Path, schedule_file: Path) -> ScheduleJob:
-    parts = schedule_file.parent.relative_to(app_dir).parts
-    name_parts: list[str] = []
-    for part in parts:
-        if part.startswith("(") and part.endswith(")"):
-            continue
-        if part.startswith("[") and part.endswith("]"):
-            raise ValueError(
-                f"invalid schedule path {schedule_file}: schedule.py cannot live "
-                f"inside dynamic segment {part!r}"
-            )
-        name_parts.append(part)
-    name = "/".join(name_parts) or "index"
-    return ScheduleJob(
-        name=name,
-        file=schedule_file,
-        function=f"{SCHEDULE_FUNCTION_PREFIX}/{name}",
-    )
-
-
 def discover_schedules(app_dir: str | Path) -> list[ScheduleJob]:
     """Find all ``schedule.py`` jobs under ``app_dir``, sorted deterministically."""
-    app_path = Path(app_dir).resolve()
-    if not app_path.is_dir():
-        raise FileNotFoundError(f"app directory not found: {app_path}")
-
-    project_root = str(app_path.parent)
-    if project_root not in sys.path:
-        sys.path.insert(0, project_root)
-
-    jobs = [_schedule_job(app_path, file) for file in app_path.rglob(SCHEDULE_FILE)]
-    return sorted(jobs, key=lambda job: (job.function, job.file))
+    return [
+        ScheduleJob(name=name, file=file, function=f"{SCHEDULE_FUNCTION_PREFIX}/{name}")
+        for name, file in discover_app_files(app_dir, SCHEDULE_FILE, label="schedule")
+    ]
 
 
 def read_schedule_trigger(module: ModuleType, file: Path) -> ScheduleTrigger:
@@ -266,16 +241,7 @@ def _read_schedule_name(module: ModuleType, job: ScheduleJob) -> str:
 def load_schedule(job: ScheduleJob) -> LoadedSchedule:
     """Import ``job`` and validate its ``RUN`` handler and schedule config."""
     module = job.load()
-    handler = getattr(module, "RUN", None)
-    if not callable(handler):
-        raise TypeError(
-            f"invalid `RUN` in {job.file}: expected a callable handler, got {handler!r}"
-        )
-    if is_generator_callable(handler):
-        raise TypeError(
-            f"invalid `RUN` in {job.file}: generator functions are not "
-            "supported as schedule handlers"
-        )
+    handler = validate_handler(module, "RUN", job.file, kind_plural="schedule handlers")
     trigger = read_schedule_trigger(module, job.file)
     schedule_name = _read_schedule_name(module, job)
     endpoint = Endpoint(handler, set())
@@ -334,61 +300,15 @@ def resolve_schedule(
     raise ScheduleNotFoundError(f"no schedule registered matching {target!r}")
 
 
-def _synthetic_schedule_request(
-    loaded: LoadedSchedule,
-    headers: Mapping[str, str] | None = None,
-) -> Request:
-    merged: dict[str, str] = {}
-    if headers:
-        for key, value in headers.items():
-            merged[key.lower()] = value
-    path = f"/{loaded.spec.function}"
-    scope: Scope = {
-        "type": "http",
-        "asgi": {"version": "3.0"},
-        "http_version": "1.1",
-        "method": "POST",
-        "scheme": "http",
-        "path": path,
-        "raw_path": path.encode(),
-        "query_string": b"",
-        "headers": [
-            (k.encode("latin-1"), v.encode("latin-1")) for k, v in merged.items()
-        ],
-    }
-    sent = False
-
-    async def receive() -> Message:
-        nonlocal sent
-        if not sent:
-            sent = True
-            return {"type": "http.request", "body": b"", "more_body": False}
-        return {"type": "http.disconnect"}
-
-    return Request(scope, receive)
-
-
 async def invoke_loaded_schedule(
     loaded: LoadedSchedule,
     *,
     headers: Mapping[str, str] | None = None,
 ) -> Any:
     """Invoke a single ``LoadedSchedule`` locally with ``after()`` support."""
-    request = _synthetic_schedule_request(loaded, headers=headers)
-    after_state = _AfterState("local")
-    token = _after_state.set(after_state)
-    cancelled = False
-    try:
+    request = synthetic_post_request(f"/{loaded.spec.function}", headers=headers)
+    async with _after_scope("local"):
         return await loaded.endpoint.call(request)
-    except asyncio.CancelledError:
-        cancelled = True
-        raise
-    finally:
-        tasks = after_state.close_and_take()
-        _after_state.reset(token)
-        if not cancelled:
-            for task in tasks:
-                await task()
 
 
 async def run_loaded_schedule(

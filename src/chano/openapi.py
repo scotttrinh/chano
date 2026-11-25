@@ -469,16 +469,12 @@ def _apply_recover_rules(
     return annotation
 
 
-def _operation(
+def _operation_metadata(
     method: str,
     path: str,
-    endpoint: Endpoint,
-    components: dict[str, Any],
-    security_schemes: dict[str, Any],
-    boundaries: Sequence[Boundary] = (),
+    info: OpenAPIInfo | None,
+    doc: str,
 ) -> dict[str, Any]:
-    info = openapi_info(endpoint.func)
-    doc = inspect.getdoc(endpoint.func) or ""
     operation: dict[str, Any] = {
         "summary": (
             info.summary
@@ -499,9 +495,14 @@ def _operation(
         operation["tags"] = list(info.tags)
     if info is not None and info.deprecated:
         operation["deprecated"] = True
+    return operation
 
-    fields = endpoint.request_inputs()
-    parameters = [
+
+def _operation_parameters(
+    fields: Sequence[RequestInput],
+    components: dict[str, Any],
+) -> list[dict[str, Any]]:
+    return [
         {
             "name": field.alias,
             "in": field.source,
@@ -511,10 +512,15 @@ def _operation(
         for field in fields
         if field.source != "body"
     ]
-    if parameters:
-        operation["parameters"] = parameters
 
+
+def _operation_request_body(
+    fields: Sequence[RequestInput],
+    components: dict[str, Any],
+) -> dict[str, Any] | None:
     body = [field for field in fields if field.source == "body"]
+    if not body:
+        return None
     # Each whole-body field decodes the entire body; embedded ones are keys
     # of one JSON object. A request must satisfy all of them at once.
     parts: list[dict[str, Any]] = []
@@ -532,12 +538,51 @@ def _operation(
             }
         )
     body_schema = parts[0] if len(parts) == 1 else {"allOf": parts}
-    if body:
-        operation["requestBody"] = {
-            "required": any(field.required for field in body),
-            "content": {"application/json": {"schema": body_schema}},
-        }
+    return {
+        "required": any(field.required for field in body),
+        "content": {"application/json": {"schema": body_schema}},
+    }
 
+
+def _add_handler_returns(
+    responses: dict[int, dict[str, Any]],
+    returns: Any,
+    default_200_desc: str,
+    rules: Sequence[tuple[Any, Any | None]],
+    components: dict[str, Any],
+) -> None:
+    if returns in (inspect.Signature.empty, None):
+        responses[200] = {"description": default_200_desc}
+        return
+    plain: list[Any] = []
+    has_other_response = False
+    for member in _iter_union_members(returns):
+        if _outcome_class(member) is not None:
+            _add_outcome(responses, _apply_recover_rules(member, rules), components)
+        elif _is_response_type(member):
+            has_other_response = True
+        else:
+            plain.append(member)
+    if plain:
+        entry = responses.setdefault(200, {"description": default_200_desc})
+        if not (len(plain) == 1 and plain[0] is type(None)):
+            for member in plain:
+                _add_schema(
+                    entry,
+                    "application/json",
+                    _schema(member, components, mode="serialization"),
+                )
+    elif has_other_response and 200 not in responses:
+        responses[200] = {"description": default_200_desc}
+
+
+def _operation_responses(
+    endpoint: Endpoint,
+    fields: Sequence[RequestInput],
+    info: OpenAPIInfo | None,
+    components: dict[str, Any],
+    boundaries: Sequence[Boundary],
+) -> dict[str, Any]:
     rules = _recover_rules(boundaries)
     responses: dict[int, dict[str, Any]] = {}
     default_200_desc = (
@@ -546,30 +591,7 @@ def _operation(
         else "Successful Response"
     )
     returns = inspect.signature(endpoint.func, eval_str=True).return_annotation
-    if returns in (inspect.Signature.empty, None):
-        responses[200] = {"description": default_200_desc}
-    else:
-        plain: list[Any] = []
-        has_other_response = False
-        for member in _iter_union_members(returns):
-            if _outcome_class(member) is not None:
-                _add_outcome(responses, _apply_recover_rules(member, rules), components)
-            elif _is_response_type(member):
-                has_other_response = True
-            else:
-                plain.append(member)
-        if plain:
-            entry = responses.setdefault(200, {"description": default_200_desc})
-            if not (len(plain) == 1 and plain[0] is type(None)):
-                for member in plain:
-                    _add_schema(
-                        entry,
-                        "application/json",
-                        _schema(member, components, mode="serialization"),
-                    )
-        elif has_other_response and 200 not in responses:
-            responses[200] = {"description": default_200_desc}
-
+    _add_handler_returns(responses, returns, default_200_desc, rules, components)
     if not responses:
         responses[200] = {"description": default_200_desc}
 
@@ -589,7 +611,30 @@ def _operation(
         _add_outcome(
             responses, _apply_recover_rules(RequestValidationError, rules), components
         )
-    operation["responses"] = {str(k): v for k, v in sorted(responses.items())}
+    return {str(k): v for k, v in sorted(responses.items())}
+
+
+def _operation(
+    method: str,
+    path: str,
+    endpoint: Endpoint,
+    components: dict[str, Any],
+    security_schemes: dict[str, Any],
+    boundaries: Sequence[Boundary] = (),
+) -> dict[str, Any]:
+    info = openapi_info(endpoint.func)
+    doc = inspect.getdoc(endpoint.func) or ""
+    operation = _operation_metadata(method, path, info, doc)
+
+    fields = endpoint.request_inputs()
+    if parameters := _operation_parameters(fields, components):
+        operation["parameters"] = parameters
+    if (request_body := _operation_request_body(fields, components)) is not None:
+        operation["requestBody"] = request_body
+
+    operation["responses"] = _operation_responses(
+        endpoint, fields, info, components, boundaries
+    )
 
     # All dependencies run, so every scheme is required together: one
     # requirement object naming each of them.

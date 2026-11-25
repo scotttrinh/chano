@@ -84,7 +84,7 @@ Verify `Route.segments` lists the directories from `app/` to the route's own dir
 
 ## Segment module loading
 
-Verify [[src/chano/routing.py#load_module]] runs a segment file once when two sibling routes load it, shares the cache with [[src/chano/routing.py#Route#load]], and leaves `sys.modules` clean after a failing import that raises again on retry.
+Verify [[src/chano/_primitives.py#load_module]] runs a segment file once when two sibling routes load it, shares the cache with [[src/chano/routing.py#Route#load]], and leaves `sys.modules` clean after a failing import that raises again on retry.
 
 ## Ancestor segment loading
 
@@ -256,13 +256,13 @@ Verify [[src/chano/cli.py#main]] exits with a `SystemExit` message pointing to `
 
 ## Store index
 
-Verify [[src/chano/build.py#normalize_dist_name]] and [[src/chano/build.py#index_store]] record PEP 503 names, in-store `RECORD` paths, top-level import names, `Requires-Dist` names, and byte sizes.
+Verify [[src/chano/_store.py#normalize_dist_name]] and [[src/chano/_store.py#index_store]] record PEP 503 names, in-store `RECORD` paths, top-level import names, `Requires-Dist` names, and byte sizes.
 
 Covers a synthetic store fixture (including `top_level.txt`, namespace packages, quoted CSV paths, escaped/absolute `RECORD` entries, excluded `*.dist-info`/`*.data`/`__pycache__`/`bin/`, and missing stores) and the real `_vendor/` from `examples/hello`.
 
 ## Build size report and limits
 
-Verify [[src/chano/build.py#SIZE_WARN_BYTES]], [[src/chano/build.py#SIZE_LIMIT_BYTES]], per-function size and distribution count reporting in [[src/chano/build.py#build]] and [[src/chano/cli.py#main]], warnings above the warn threshold, and `RuntimeError` failure above the limit.
+Verify [[src/chano/_report.py#SIZE_WARN_BYTES]], [[src/chano/_report.py#SIZE_LIMIT_BYTES]], per-function size and distribution count reporting in [[src/chano/build.py#build]] and [[src/chano/cli.py#main]], warnings above the warn threshold, and `RuntimeError` failure above the limit.
 
 Lowers thresholds via `monkeypatch` to confirm warning messages name the largest distributions in descending size order while letting the build succeed, and that exceeding the fail limit raises `RuntimeError` naming the oversized function and largest distributions.
 
@@ -274,7 +274,7 @@ Covers recursive project helpers with relative imports and cycles, transitive `R
 
 ## Import tracer and closure
 
-Verify [[src/chano/build.py#_trace_function_chains]], [[src/chano/build.py#_resolve_closure_with_reasons]], [[src/chano/build.py#ALWAYS_INCLUDED]], and [[src/chano/build.py#_read_module_include]] handle tracer, closure, size-report, and validation edge cases against a synthetic store.
+Verify [[src/chano/_trace.py#_trace_function_chains]], [[src/chano/_trace.py#_resolve_closure_with_reasons]], [[src/chano/_trace.py#ALWAYS_INCLUDED]], and [[src/chano/build.py#_read_module_include]] handle tracer, closure, size-report, and validation edge cases against a synthetic store.
 
 Covers `vercel` inclusion with its closure, cyclic `Requires-Dist`, namespace packages in the store and project helpers, package `__init__.py` tracing, `if TYPE_CHECKING:` `else` branches and `if not TYPE_CHECKING:`, aliased/relative `importlib.import_module`, unknown/stdlib ignores, per-function size warnings, and `ValueError` on invalid route `include`.
 
@@ -292,11 +292,11 @@ Also verifies `PYTHONPATH` is ignored by `-I` and no `__pycache__` directories a
 
 ## Import check platform matching
 
-Verify [[src/chano/build.py#_check_function_imports]] skips with a printed message (without invoking `uv python find`) when `plan.platform` does not match the host OS/architecture, and runs when it matches.
+Verify [[src/chano/_importcheck.py#_check_function_imports]] skips with a printed message (without invoking `uv python find`) when `plan.platform` does not match the host OS/architecture, and runs when it matches.
 
 ## Import check target interpreter
 
-Verify [[src/chano/build.py#_check_function_imports]] executes the interpreter returned by `uv python find <python>` with `-I` instead of `sys.executable`, and skips with a printed message when `uv python find` finds none.
+Verify [[src/chano/_importcheck.py#_check_function_imports]] executes the interpreter returned by `uv python find <python>` with `-I` instead of `sys.executable`, and skips with a printed message when `uv python find` finds none.
 
 ## Build explain
 
@@ -654,7 +654,7 @@ Verify invalid `after_backend` values raise `ValueError`, `"local"` never import
 
 ### Build entrypoint and vercel install
 
-Verify [[src/chano/build.py#plan_build]] emits `after_backend="wait_until"` in `index.py`, [[src/chano/build.py#_install_dependencies]] installs `vercel>=0.10.0`, and executing the emitted `index.py` schedules route `after()` work via `vercel.functions.wait_until`.
+Verify [[src/chano/build.py#plan_build]] emits `after_backend="wait_until"` in `index.py`, [[src/chano/_vendor.py#_install_dependencies]] installs `vercel>=0.10.0`, and executing the emitted `index.py` schedules route `after()` work via `vercel.functions.wait_until`.
 
 ## Vercel Queues
 
@@ -766,7 +766,11 @@ Verify building `[[tool.vercel.workflows]]` fails with `RuntimeError` when `verc
 
 ### Local dev without SDK is graceful
 
-Verify [[src/chano/routing.py#create_app]] succeeds with `workflows_mounted=False` when `vercel-workflow` is not installed, while deployed workflow factories raise `RuntimeError`.
+Verify [[src/chano/routing.py#create_app]] succeeds without mounting `/.well-known/workflow/v1/flow` (404) when `vercel-workflow` is not installed, while deployed workflow factories raise `RuntimeError`.
+
+### Partial SDK fallback to http_handler
+
+Verify [[src/chano/workflows.py#create_workflow_app]] falls back to the registry's `http_handler` when importing `vercel_runtime.workers` raises `ModuleNotFoundError` for another optional Vercel SDK package (such as `vercel_workflow.dependencies`).
 
 ### Real vercel-workflow SDK end-to-end run and build
 

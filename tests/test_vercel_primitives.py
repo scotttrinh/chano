@@ -1706,14 +1706,55 @@ def test_workflow_local_dev_without_sdk_is_graceful(
 
     app = create_app(project / "app")
     assert app.workflows == (WorkflowConfig(entrypoint="wf_test_nosdk:wf"),)
-    assert app.workflows_mounted is False
     client = make_client(app)
     assert client("GET", "/").json() == {"ok": True}
+    assert client("POST", "/.well-known/workflow/v1/flow").status_code == 404
 
     write_project(project, {"wf_test_plain.py": "wf = object()\n"})
     sys.path.insert(0, str(project))
     with pytest.raises(RuntimeError, match="vercel-workflow is required"):
         create_workflow_app(["wf_test_plain:wf"])
+
+
+# @lat: [[tests#Vercel Workflows#Partial SDK fallback to http_handler]]
+def test_workflow_app_falls_back_on_partial_vercel_sdk(
+    tmp_path: Path, monkeypatch: Any, isolated_imports: Any
+):
+    project = tmp_path / "wf-partial-sdk"
+    write_project(
+        project,
+        {
+            "wf_test_partial.py": (
+                "from types import SimpleNamespace\n\n"
+                "class _Registry:\n"
+                "    namespace = None\n\n"
+                "    async def http_handler(self, req):\n"
+                "        return SimpleNamespace(\n"
+                "            status=200,\n"
+                '            headers={"content-type": "application/json"},\n'
+                "            body=b'{\"fallback\": true}',\n"
+                "        )\n\n"
+                "wf = _Registry()\n"
+            ),
+            "vercel_runtime/__init__.py": "",
+            "vercel_runtime/workers.py": "import vercel_workflow.dependencies\n",
+            "vercel_workflow/__init__.py": "",
+        },
+    )
+    sys.path.insert(0, str(project))
+
+    fake_vr = types.ModuleType("vercel_runtime")
+    fake_vr.__path__ = [str(project / "vercel_runtime")]
+    monkeypatch.setitem(sys.modules, "vercel_runtime", fake_vr)
+    monkeypatch.delitem(sys.modules, "vercel_runtime.workers", raising=False)
+    monkeypatch.delitem(sys.modules, "vercel_workflow", raising=False)
+    monkeypatch.delitem(sys.modules, "vercel_workflow.dependencies", raising=False)
+
+    app = create_workflow_app(["wf_test_partial:wf"])
+    client = make_client(app)
+    resp = client("POST", "/.well-known/workflow/v1/flow", json={"ok": True})
+    assert resp.status_code == 200
+    assert resp.json() == {"fallback": True}
 
 
 # @lat: [[tests#Vercel Workflows#Real vercel-workflow SDK end-to-end run and build]]
@@ -1755,7 +1796,6 @@ def test_workflow_real_sdk_end_to_end_run_and_build(
     )
 
     app = create_app(project / "app")
-    assert app.workflows_mounted is True
 
     async def run_end_to_end() -> tuple[Any, Any, Any, Any]:
         in_q: asyncio.Queue[Message] = asyncio.Queue()
@@ -1996,7 +2036,6 @@ def test_workflow_real_sdk_shape_local_dev_and_build(
     )
 
     app = create_app(project / "app")
-    assert app.workflows_mounted is True
     client = make_client(app)
     assert client("GET", "/").json() == {"app": "ok"}
 

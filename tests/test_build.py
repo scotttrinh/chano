@@ -12,7 +12,7 @@ from chano import (
     create_app,
     create_route_app,
 )
-from chano import build as build_module
+from chano import _report as report_module
 from chano.build import build, emit_build, plan_build
 from chano.cli import main as cli_main
 from chano.openapi import swagger_html
@@ -922,8 +922,8 @@ def test_store_index(tmp_path, output):
 def test_build_size_report_and_limits(
     tmp_path, isolated_imports, monkeypatch, stub_build_install, capsys
 ):
-    assert build_module.SIZE_WARN_BYTES == 250 * 1024 * 1024
-    assert build_module.SIZE_LIMIT_BYTES == 500 * 1024 * 1024
+    assert report_module.SIZE_WARN_BYTES == 250 * 1024 * 1024
+    assert report_module.SIZE_LIMIT_BYTES == 500 * 1024 * 1024
 
     project = tmp_path / "sized"
     write_project(
@@ -988,8 +988,8 @@ def test_build_size_report_and_limits(
 
     # Above warn threshold (and below fail limit): emits warning naming largest
     # distributions in descending size order, and build still succeeds.
-    monkeypatch.setattr(build_module, "SIZE_WARN_BYTES", 4_096)
-    monkeypatch.setattr(build_module, "SIZE_LIMIT_BYTES", 1024 * 1024)
+    monkeypatch.setattr(report_module, "SIZE_WARN_BYTES", 4_096)
+    monkeypatch.setattr(report_module, "SIZE_LIMIT_BYTES", 1024 * 1024)
     with pytest.warns(UserWarning, match="big-pkg") as record:
         out_warn = build(project, platform=None, output=tmp_path / "out-warn")
     assert out_warn.is_dir()
@@ -1003,7 +1003,7 @@ def test_build_size_report_and_limits(
     capsys.readouterr()
 
     # Above fail limit: build fails with RuntimeError naming function and largest dists.
-    monkeypatch.setattr(build_module, "SIZE_LIMIT_BYTES", 4_096)
+    monkeypatch.setattr(report_module, "SIZE_LIMIT_BYTES", 4_096)
     with pytest.raises(RuntimeError) as exc_info:
         build(project, platform=None, output=tmp_path / "out-fail")
     error_message = str(exc_info.value)
@@ -1013,8 +1013,8 @@ def test_build_size_report_and_limits(
     capsys.readouterr()
 
     # CLI build prints the per-function size report alongside the build summary.
-    monkeypatch.setattr(build_module, "SIZE_WARN_BYTES", 1024 * 1024)
-    monkeypatch.setattr(build_module, "SIZE_LIMIT_BYTES", 2 * 1024 * 1024)
+    monkeypatch.setattr(report_module, "SIZE_WARN_BYTES", 1024 * 1024)
+    monkeypatch.setattr(report_module, "SIZE_LIMIT_BYTES", 2 * 1024 * 1024)
     monkeypatch.chdir(project)
     cli_main(["build", "--platform", "native", "--output", str(tmp_path / "cli-out")])
     cli_out = capsys.readouterr().out

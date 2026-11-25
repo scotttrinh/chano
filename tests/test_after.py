@@ -9,7 +9,8 @@ from chano import (
     Chano,
     create_route_app,
 )
-from chano import build as build_module
+from chano import _trace as trace_module
+from chano import _vendor as vendor_module
 from chano.build import build, plan_build
 from chano.routing import discover_routes
 from tests.helpers import (
@@ -523,15 +524,15 @@ def test_build_after_entrypoint_and_vercel_install(
     plan = plan_build(project, platform=None, output=tmp_path / "out")
     ping = next(spec for spec in plan.functions if spec.name == "ping")
     assert 'after_backend="wait_until"' in ping.entrypoint
-    assert "vercel" in build_module.ALWAYS_INCLUDED
+    assert "vercel" in trace_module.ALWAYS_INCLUDED
 
     commands: list[list[str]] = []
 
     def fake_run(cmd, *, cwd):
         commands.append(list(cmd))
 
-    monkeypatch.setattr(build_module, "_run", fake_run)
-    build_module._install_dependencies(project, tmp_path / "vendor", "3.12", None)
+    monkeypatch.setattr(vendor_module, "_run", fake_run)
+    vendor_module._install_dependencies(project, tmp_path / "vendor", "3.12", None)
     pip_install = next(cmd for cmd in commands if cmd[:3] == ["uv", "pip", "install"])
     assert "vercel-runtime" in pip_install
     assert "vercel>=0.10.0" in pip_install

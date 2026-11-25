@@ -39,7 +39,7 @@ def _print_result(result: object) -> None:
         print(json.dumps(json.loads(encoded), indent=2, sort_keys=True))
 
 
-def main(argv: list[str] | None = None) -> None:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="chano")
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -104,76 +104,92 @@ def main(argv: list[str] | None = None) -> None:
     )
     schedule_run.add_argument("--app", default="app", help="path to app directory")
 
-    args = parser.parse_args(argv)
+    return parser
 
-    if args.command == "dev":
-        try:
-            import uvicorn
-        except ModuleNotFoundError as exc:
-            if exc.name != "uvicorn":
-                raise
-            raise SystemExit("chano dev requires uvicorn; install chano[dev]") from None
 
-        sys.path.insert(0, os.getcwd())
-        # base_path lives in pyproject.toml. Only the watchfiles reloader
-        # honors non-.py patterns; uvicorn warns about them otherwise.
-        includes = ["*.py", PYPROJECT] if find_spec("watchfiles") else None
-        uvicorn.run(
-            "chano.cli:dev_app",
-            factory=True,
-            host=args.host,
-            port=args.port,
-            reload=True,
-            reload_dirs=[os.getcwd()],
-            reload_includes=includes,
-        )
-    elif args.command == "build":
-        platform = None if args.platform == "native" else args.platform
-        output = build(
-            ".",
-            python=args.python,
-            platform=platform,
-            output=args.output,
-            explain=args.explain,
-        )
-        print(f"Build output written to {os.path.relpath(output)}")
-        print("Deploy with: vercel deploy --prebuilt")
-    elif args.command == "queue":
-        if args.queue_command == "list":
-            queues = load_all_queues(args.app)
-            if not queues:
-                print("(no queue consumers)")
-                return
-            for item in queues:
-                print(
-                    f"{item.trigger.topic}\tconsumer={item.trigger.consumer}\t"
-                    f"function={item.spec.function}"
-                )
-        elif args.queue_command == "send":
-            raw_payload = sys.stdin.read() if args.payload == "-" else args.payload
-            result = asyncio.run(
-                invoke_queue(
-                    args.app,
-                    args.topic,
-                    raw_payload.encode(),
-                    consumer=args.consumer,
-                )
+def _cmd_dev(args: argparse.Namespace) -> None:
+    try:
+        import uvicorn
+    except ModuleNotFoundError as exc:
+        if exc.name != "uvicorn":
+            raise
+        raise SystemExit("chano dev requires uvicorn; install chano[dev]") from None
+
+    sys.path.insert(0, os.getcwd())
+    # base_path lives in pyproject.toml. Only the watchfiles reloader
+    # honors non-.py patterns; uvicorn warns about them otherwise.
+    includes = ["*.py", PYPROJECT] if find_spec("watchfiles") else None
+    uvicorn.run(
+        "chano.cli:dev_app",
+        factory=True,
+        host=args.host,
+        port=args.port,
+        reload=True,
+        reload_dirs=[os.getcwd()],
+        reload_includes=includes,
+    )
+
+
+def _cmd_build(args: argparse.Namespace) -> None:
+    platform = None if args.platform == "native" else args.platform
+    output = build(
+        ".",
+        python=args.python,
+        platform=platform,
+        output=args.output,
+        explain=args.explain,
+    )
+    print(f"Build output written to {os.path.relpath(output)}")
+    print("Deploy with: vercel deploy --prebuilt")
+
+
+def _cmd_queue(args: argparse.Namespace) -> None:
+    if args.queue_command == "list":
+        queues = load_all_queues(args.app)
+        if not queues:
+            print("(no queue consumers)")
+            return
+        for item in queues:
+            print(
+                f"{item.trigger.topic}\tconsumer={item.trigger.consumer}\t"
+                f"function={item.spec.function}"
             )
-            _print_result(result)
-    elif args.command == "schedule":
-        if args.schedule_command == "list":
-            jobs = load_all_schedules(args.app)
-            if not jobs:
-                print("(no schedules)")
-                return
-            for job in jobs:
-                tz = (
-                    f"\ttimezone={job.trigger.timezone}" if job.trigger.timezone else ""
-                )
-                print(f"{job.schedule_name}\t{job.trigger.schedule}{tz}")
-        elif args.schedule_command == "run":
-            result = asyncio.run(invoke_schedule(args.app, args.target))
-            _print_result(result)
+    elif args.queue_command == "send":
+        raw_payload = sys.stdin.read() if args.payload == "-" else args.payload
+        result = asyncio.run(
+            invoke_queue(
+                args.app,
+                args.topic,
+                raw_payload.encode(),
+                consumer=args.consumer,
+            )
+        )
+        _print_result(result)
+
+
+def _cmd_schedule(args: argparse.Namespace) -> None:
+    if args.schedule_command == "list":
+        jobs = load_all_schedules(args.app)
+        if not jobs:
+            print("(no schedules)")
+            return
+        for job in jobs:
+            tz = f"\ttimezone={job.trigger.timezone}" if job.trigger.timezone else ""
+            print(f"{job.schedule_name}\t{job.trigger.schedule}{tz}")
+    elif args.schedule_command == "run":
+        result = asyncio.run(invoke_schedule(args.app, args.target))
+        _print_result(result)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = _build_parser().parse_args(argv)
+    handlers = {
+        "dev": _cmd_dev,
+        "build": _cmd_build,
+        "queue": _cmd_queue,
+        "schedule": _cmd_schedule,
+    }
+    handlers[args.command](args)
 
 
 if __name__ == "__main__":

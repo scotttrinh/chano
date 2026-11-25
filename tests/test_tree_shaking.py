@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from chano import _importcheck as importcheck_module
+from chano import _report as report_module
 from chano import build as build_module
 from chano.build import build, plan_build
 from chano.cli import main as cli_main
@@ -371,8 +373,8 @@ def test_trace_and_closure_edge_cases(
         },
     )
 
-    monkeypatch.setattr(build_module, "SIZE_WARN_BYTES", 8_192)
-    monkeypatch.setattr(build_module, "SIZE_LIMIT_BYTES", 1024 * 1024)
+    monkeypatch.setattr(report_module, "SIZE_WARN_BYTES", 8_192)
+    monkeypatch.setattr(report_module, "SIZE_LIMIT_BYTES", 1024 * 1024)
     with pytest.warns(UserWarning, match="huge-pkg") as record:
         out = build(project, platform=None, output=tmp_path / "out")
     capsys.readouterr()
@@ -661,10 +663,12 @@ def test_build_import_check_skips_non_matching_platform(
             )
         return real_run(cmd, *args, **kwargs)
 
-    monkeypatch.setattr(build_module.subprocess, "run", spy_run)
+    monkeypatch.setattr(importcheck_module.subprocess, "run", spy_run)
 
     # On macOS arm64, DEFAULT_PLATFORM (x86_64-manylinux_2_28) skips the check.
-    monkeypatch.setattr(build_module, "_host_os_arch", lambda: ("darwin", "aarch64"))
+    monkeypatch.setattr(
+        importcheck_module, "_host_os_arch", lambda: ("darwin", "aarch64")
+    )
     out = build(project, output=tmp_path / "out-darwin")
     assert out.is_dir()
     skipped_out = capsys.readouterr().out
@@ -673,7 +677,9 @@ def test_build_import_check_skips_non_matching_platform(
     assert uv_calls == []
 
     # On Linux x86_64, a non-matching platform (e.g. aarch64-apple-darwin) also skips.
-    monkeypatch.setattr(build_module, "_host_os_arch", lambda: ("linux", "x86_64"))
+    monkeypatch.setattr(
+        importcheck_module, "_host_os_arch", lambda: ("linux", "x86_64")
+    )
     out_linux_skip = build(
         project, platform="aarch64-apple-darwin", output=tmp_path / "out-linux-skip"
     )
@@ -751,7 +757,7 @@ def test_build_import_check_uses_uv_python_find(
             return subprocess.CompletedProcess(cmd, find_returncode, find_stdout, "")
         return real_run(cmd, *args, **kwargs)
 
-    monkeypatch.setattr(build_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(importcheck_module.subprocess, "run", fake_run)
 
     out = build(api, python=host_python, platform=None, output=tmp_path / "out-ok")
     assert out.is_dir()
