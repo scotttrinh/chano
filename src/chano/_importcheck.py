@@ -1,5 +1,3 @@
-"""Build-time isolated import verification for emitted function bundles."""
-
 from __future__ import annotations
 
 import json

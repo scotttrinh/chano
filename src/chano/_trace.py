@@ -1,5 +1,3 @@
-"""Static import tracing and transitive distribution closure resolution."""
-
 from __future__ import annotations
 
 import ast

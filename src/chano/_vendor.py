@@ -1,5 +1,3 @@
-"""uv workspace detection, dependency vendoring, and function layout constants."""
-
 from __future__ import annotations
 
 import subprocess

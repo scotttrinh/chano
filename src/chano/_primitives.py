@@ -1,5 +1,3 @@
-"""Shared helpers for file-based primitives (routes, queues, schedules, workflows)."""
-
 from __future__ import annotations
 
 import hashlib
@@ -43,11 +41,6 @@ def discover_app_files(
     *,
     label: str,
 ) -> list[tuple[str, Path]]:
-    """Find all ``filename`` modules under ``app_dir`` as sorted ``(name, file)`` pairs.
-
-    Strips ``(group)`` directory segments, rejects ``[param]`` dynamic segments,
-    and falls back to ``"index"`` at the root of ``app_dir``.
-    """
     app_path = Path(app_dir).resolve()
     if not app_path.is_dir():
         raise FileNotFoundError(f"app directory not found: {app_path}")
@@ -81,7 +74,6 @@ def validate_handler(
     *,
     kind_plural: str,
 ) -> Callable[..., Any]:
-    """Read and validate a non-generator callable handler attribute from ``module``."""
     handler = getattr(module, attr, None)
     if not callable(handler):
         raise TypeError(
@@ -102,7 +94,6 @@ def synthetic_post_request(
     default_headers: Mapping[str, str] | None = None,
     headers: Mapping[str, str] | None = None,
 ) -> Request:
-    """Build a synthetic ASGI ``POST`` ``Request`` for in-process invocation."""
     merged: dict[str, str] = dict(default_headers) if default_headers else {}
     if headers:
         for key, value in headers.items():
@@ -133,7 +124,6 @@ def synthetic_post_request(
 
 
 async def handle_noop_lifespan(receive: Receive, send: Send) -> None:
-    """Acknowledge ASGI ``lifespan`` startup and shutdown events."""
     while True:
         message = await receive()
         await send({"type": f"{message['type']}.complete"})
@@ -142,7 +132,6 @@ async def handle_noop_lifespan(receive: Receive, send: Send) -> None:
 
 
 def headers_from_scope(scope: Scope) -> dict[str, str]:
-    """Decode ASGI ``scope["headers"]`` into a lowercased ``dict[str, str]``."""
     return {
         raw_k.decode("latin-1").lower(): raw_v.decode("latin-1")
         for raw_k, raw_v in scope.get("headers", ())
@@ -150,14 +139,11 @@ def headers_from_scope(scope: Scope) -> dict[str, str]:
 
 
 def is_missing_module(exc: ModuleNotFoundError, *roots: str) -> bool:
-    """Return whether ``exc`` reports one of ``roots`` (or a submodule) missing."""
     name = exc.name or ""
     return any(name == root or name.startswith(f"{root}.") for root in roots)
 
 
 def try_import_optional(name: str) -> Any | None:
-    """Import ``name`` if available, returning ``None`` when its top-level package
-    is absent while letting unrelated ``ModuleNotFoundError`` propagate."""
     try:
         return importlib.import_module(name)
     except ModuleNotFoundError as exc:

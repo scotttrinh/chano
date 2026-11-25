@@ -100,7 +100,6 @@ def _validate_after_backend(after_backend: AfterBackend) -> AfterBackend:
 
 @contextlib.asynccontextmanager
 async def _after_scope(backend: AfterBackend) -> AsyncGenerator[None]:
-    """Install a per-request ``_AfterState`` and drain local tasks on exit."""
     after_state = _AfterState(backend)
     token = _after_state.set(after_state)
     cancelled = False

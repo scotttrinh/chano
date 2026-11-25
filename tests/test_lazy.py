@@ -136,7 +136,7 @@ def test_lazy_cancelled_waiter_does_not_cancel_creation():
 
 
 # @lat: [[tests#Lazy values#Lazy as a dependency]]
-def test_lazy_as_dependency(tmp_path, isolated_imports):
+def test_lazy_as_dependency(tmp_path, isolated_project_imports):
     project = tmp_path / "clients"
     write_project(
         project,
@@ -218,7 +218,7 @@ def test_lazy_async_shared_across_event_loops():
 
 
 # @lat: [[tests#Lazy values#Async callable instance factory]]
-def test_lazy_async_callable_instance(tmp_path, isolated_imports):
+def test_lazy_async_callable_instance(tmp_path, isolated_project_imports):
     project = tmp_path / "callable"
     write_project(
         project,

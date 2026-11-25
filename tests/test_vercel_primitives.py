@@ -58,7 +58,9 @@ from tests.helpers import make_client, make_dist, write_project
 
 
 # @lat: [[tests#Vercel Queues#Discovery and OpenAPI isolation]]
-def test_queue_discovery_and_openapi_isolation(tmp_path: Path, isolated_imports: Any):
+def test_queue_discovery_and_openapi_isolation(
+    tmp_path: Path, isolated_project_imports: Any
+):
     project = write_project(
         tmp_path,
         {
@@ -97,7 +99,7 @@ def test_queue_discovery_and_openapi_isolation(tmp_path: Path, isolated_imports:
 
 # @lat: [[tests#Vercel Queues#Sync, async, validation, and Depends]]
 def test_queue_consume_sync_async_validation_and_depends(
-    tmp_path: Path, isolated_imports: Any
+    tmp_path: Path, isolated_project_imports: Any
 ):
     project = write_project(
         tmp_path,
@@ -176,7 +178,7 @@ def test_queue_consume_sync_async_validation_and_depends(
 
 # @lat: [[tests#Vercel Queues#Multi-consumer dev trigger and ASGI fallback]]
 def test_queue_multi_consumer_dev_trigger_and_asgi_app(
-    tmp_path: Path, monkeypatch: Any, isolated_imports: Any
+    tmp_path: Path, monkeypatch: Any, isolated_project_imports: Any
 ):
     project = write_project(
         tmp_path,
@@ -263,7 +265,7 @@ def test_queue_multi_consumer_dev_trigger_and_asgi_app(
 
 # @lat: [[tests#Vercel Queues#Delivery lifecycle, ack, and retry]]
 def test_queue_delivery_lifecycle_accept_renew_ack_and_retry(
-    tmp_path: Path, monkeypatch: Any, isolated_imports: Any
+    tmp_path: Path, monkeypatch: Any, isolated_project_imports: Any
 ):
     """Platform CloudEvent push delivery runs through vercel.queue +
     vercel_runtime.workers.create_queue_service_app: subscribe, accept, lease
@@ -499,7 +501,7 @@ def test_queue_delivery_lifecycle_accept_renew_ack_and_retry(
 
 # @lat: [[tests#Vercel Queues#Real vercel-queue SDK registration and delivery]]
 def test_queue_real_sdk_registration_sanitization_and_delivery(
-    tmp_path: Path, isolated_imports: Any
+    tmp_path: Path, isolated_project_imports: Any
 ):
     """End-to-end test with the real vercel-queue SDK: Message[bytes] metadata,
     SanitizedName consumer normalization matching .vc-config.json, and real
@@ -576,7 +578,7 @@ def test_queue_real_sdk_registration_sanitization_and_delivery(
 
 # @lat: [[tests#Vercel Queues#Build requires vercel-queue in store]]
 def test_queue_build_fails_when_vercel_queue_missing_from_store(
-    tmp_path: Path, isolated_imports: Any, stub_build_install: Any
+    tmp_path: Path, isolated_project_imports: Any, stub_build_install: Any
 ):
     project = write_project(
         tmp_path,
@@ -687,7 +689,7 @@ def test_queue_build_fails_when_vercel_queue_missing_from_store(
 )
 def test_queue_validation_errors(
     tmp_path: Path,
-    isolated_imports: Any,
+    isolated_project_imports: Any,
     rel_path: str,
     source: str,
     exc_type: type[Exception],
@@ -705,7 +707,9 @@ def test_queue_validation_errors(
 
 
 # @lat: [[tests#Vercel Queues#Duplicate topic and consumer rejected]]
-def test_queue_duplicate_topic_consumer_rejected(tmp_path: Path, isolated_imports: Any):
+def test_queue_duplicate_topic_consumer_rejected(
+    tmp_path: Path, isolated_project_imports: Any
+):
     project = write_project(
         tmp_path,
         {
@@ -720,7 +724,7 @@ def test_queue_duplicate_topic_consumer_rejected(tmp_path: Path, isolated_import
 
 # @lat: [[tests#Vercel Queues#Wildcard dispatch and consumer sanitization]]
 def test_queue_wildcard_dispatch_and_deterministic_consumer_matching(
-    tmp_path: Path, isolated_imports: Any
+    tmp_path: Path, isolated_project_imports: Any
 ):
     project = write_project(
         tmp_path,
@@ -793,7 +797,7 @@ def test_queue_wildcard_dispatch_and_deterministic_consumer_matching(
 
 # @lat: [[tests#Vercel Queues#Overlapping wildcard topics rejected]]
 def test_queue_overlapping_wildcard_topics_rejected(
-    tmp_path: Path, isolated_imports: Any
+    tmp_path: Path, isolated_project_imports: Any
 ):
     # Wildcard + exact topic on same consumer group -> rejected.
     exact_overlap = write_project(
@@ -841,7 +845,10 @@ def test_queue_overlapping_wildcard_topics_rejected(
 
 # @lat: [[tests#Vercel Queues#Queue build output and tree-shaking]]
 def test_queue_build_output_and_tree_shaking(
-    tmp_path: Path, monkeypatch: Any, isolated_imports: Any, stub_build_install: Any
+    tmp_path: Path,
+    monkeypatch: Any,
+    isolated_project_imports: Any,
+    stub_build_install: Any,
 ):
     project = write_project(
         tmp_path,
@@ -941,7 +948,7 @@ def test_queue_build_output_and_tree_shaking(
 
 # @lat: [[tests#Vercel Queues#Queue CLI list and send]]
 def test_queue_cli_list_and_send(
-    tmp_path: Path, monkeypatch: Any, capsys: Any, isolated_imports: Any
+    tmp_path: Path, monkeypatch: Any, capsys: Any, isolated_project_imports: Any
 ):
     project = write_project(
         tmp_path,
@@ -980,7 +987,7 @@ def test_queue_cli_list_and_send(
 
 # @lat: [[tests#Vercel Schedules#Discovery and OpenAPI isolation]]
 def test_schedule_discovery_and_openapi_isolation(
-    tmp_path: Path, isolated_imports: Any
+    tmp_path: Path, isolated_project_imports: Any
 ):
     project = write_project(
         tmp_path,
@@ -1015,7 +1022,7 @@ def test_schedule_discovery_and_openapi_isolation(
 
 # @lat: [[tests#Vercel Schedules#Sync, async, Depends, and ASGI app]]
 def test_schedule_run_sync_async_depends_and_asgi(
-    tmp_path: Path, isolated_imports: Any
+    tmp_path: Path, isolated_project_imports: Any
 ):
     project = write_project(
         tmp_path,
@@ -1075,7 +1082,10 @@ def test_schedule_run_sync_async_depends_and_asgi(
 
 # @lat: [[tests#Vercel Schedules#Schedule build output and tree-shaking]]
 def test_schedule_build_output_and_tree_shaking(
-    tmp_path: Path, monkeypatch: Any, isolated_imports: Any, stub_build_install: Any
+    tmp_path: Path,
+    monkeypatch: Any,
+    isolated_project_imports: Any,
+    stub_build_install: Any,
 ):
     project = write_project(
         tmp_path,
@@ -1285,7 +1295,7 @@ def test_schedule_build_output_and_tree_shaking(
 )
 def test_schedule_validation_errors(
     tmp_path: Path,
-    isolated_imports: Any,
+    isolated_project_imports: Any,
     rel_path: str,
     source: str,
     exc_type: type[Exception],
@@ -1303,7 +1313,9 @@ def test_schedule_validation_errors(
 
 
 # @lat: [[tests#Vercel Schedules#Schedule name collision rejected]]
-def test_schedule_name_collision_rejected(tmp_path: Path, isolated_imports: Any):
+def test_schedule_name_collision_rejected(
+    tmp_path: Path, isolated_project_imports: Any
+):
     project = write_project(
         tmp_path,
         {
@@ -1318,7 +1330,7 @@ def test_schedule_name_collision_rejected(tmp_path: Path, isolated_imports: Any)
 
 # @lat: [[tests#Vercel Schedules#Schedule handler KeyError returns 500]]
 def test_schedule_handler_keyerror_returns_500_and_runs_once(
-    tmp_path: Path, isolated_imports: Any
+    tmp_path: Path, isolated_project_imports: Any
 ):
     project = write_project(
         tmp_path,
@@ -1354,7 +1366,7 @@ def test_schedule_handler_keyerror_returns_500_and_runs_once(
 
 # @lat: [[tests#Vercel Schedules#Schedule dev trigger and CLI]]
 def test_schedule_dev_trigger_and_cli(
-    tmp_path: Path, capsys: Any, isolated_imports: Any
+    tmp_path: Path, capsys: Any, isolated_project_imports: Any
 ):
     project = write_project(
         tmp_path,
@@ -1485,7 +1497,10 @@ def test_workflow_config_validation_errors(tmp_path: Path, toml_text: str, match
 
 # @lat: [[tests#Vercel Workflows#Build output and sequential replays]]
 def test_workflow_build_output_and_sequential_replays(
-    tmp_path: Path, monkeypatch: Any, isolated_imports: Any, stub_build_install: Any
+    tmp_path: Path,
+    monkeypatch: Any,
+    isolated_project_imports: Any,
+    stub_build_install: Any,
 ):
     """Build introspects real vercel-workflow subscriptions, emits flow.func
     matching actual SDK subscriptions (no unbacked step.func), traces step
@@ -1600,7 +1615,7 @@ def test_workflow_build_output_and_sequential_replays(
 
 # @lat: [[tests#Vercel Workflows#Build fails without SDK or subscriptions]]
 def test_workflow_build_fails_without_sdk_or_subscriptions(
-    tmp_path: Path, monkeypatch: Any, isolated_imports: Any
+    tmp_path: Path, monkeypatch: Any, isolated_project_imports: Any
 ):
     project = write_project(
         tmp_path,
@@ -1683,7 +1698,7 @@ def test_workflow_build_fails_without_sdk_or_subscriptions(
 
 # @lat: [[tests#Vercel Workflows#Local dev without SDK is graceful]]
 def test_workflow_local_dev_without_sdk_is_graceful(
-    tmp_path: Path, monkeypatch: Any, isolated_imports: Any
+    tmp_path: Path, monkeypatch: Any, isolated_project_imports: Any
 ):
     project = write_project(
         tmp_path,
@@ -1718,7 +1733,7 @@ def test_workflow_local_dev_without_sdk_is_graceful(
 
 # @lat: [[tests#Vercel Workflows#Partial SDK fallback to http_handler]]
 def test_workflow_app_falls_back_on_partial_vercel_sdk(
-    tmp_path: Path, monkeypatch: Any, isolated_imports: Any
+    tmp_path: Path, monkeypatch: Any, isolated_project_imports: Any
 ):
     project = tmp_path / "wf-partial-sdk"
     write_project(
@@ -1760,7 +1775,7 @@ def test_workflow_app_falls_back_on_partial_vercel_sdk(
 # @lat: [[tests#Vercel Workflows#Real vercel-workflow SDK end-to-end run and build]]
 @pytest.mark.slow
 def test_workflow_real_sdk_end_to_end_run_and_build(
-    tmp_path: Path, monkeypatch: Any, isolated_imports: Any
+    tmp_path: Path, monkeypatch: Any, isolated_project_imports: Any
 ):
     """End-to-end test using the REAL vercel-workflow + vercel-queue SDKs:
     runs a real workflow with a @wf.step to completion under create_app(),
@@ -1853,7 +1868,7 @@ def test_workflow_real_sdk_end_to_end_run_and_build(
 
 # @lat: [[tests#Vercel Workflows#Ignores unrelated queue subscribers]]
 def test_workflow_ignores_unrelated_queue_subscriber_on_step_topic(
-    tmp_path: Path, monkeypatch: Any, isolated_imports: Any
+    tmp_path: Path, monkeypatch: Any, isolated_project_imports: Any
 ):
     """Real-SDK regression test: an unrelated @vercel.queue.subscribe on
     `__review_wkf_step_*` must NOT be attributed to Workflows(namespace="review")."""
@@ -1906,7 +1921,10 @@ def test_workflow_ignores_unrelated_queue_subscriber_on_step_topic(
 
 # @lat: [[tests#Vercel Workflows#Real SDK shape local dev and build]]
 def test_workflow_real_sdk_shape_local_dev_and_build(
-    tmp_path: Path, monkeypatch: Any, isolated_imports: Any, stub_build_install: Any
+    tmp_path: Path,
+    monkeypatch: Any,
+    isolated_project_imports: Any,
+    stub_build_install: Any,
 ):
     """Tests the real vercel-workflow SDK API shape: Workflows(namespace=...),
     http_handler(HTTPRequest) -> HTTPResponse, manifest_handler, ENDPOINT_PATH,
@@ -2155,8 +2173,6 @@ def test_workflow_real_sdk_shape_local_dev_and_build(
         "served_by": "create_queue_service_app"
     }
 
-    # Emit build and invoke each generated entrypoint in a fresh subprocess
-    # after deleting the source tree so imports come only from the artifact.
     stub_build_install(
         {
             **make_dist("chano", "chano"),
@@ -2254,7 +2270,10 @@ def test_workflow_real_sdk_shape_local_dev_and_build(
 
 # @lat: [[tests#Combined Vercel primitives]]
 def test_combined_build_with_all_primitives(
-    tmp_path: Path, monkeypatch: Any, isolated_imports: Any, stub_build_install: Any
+    tmp_path: Path,
+    monkeypatch: Any,
+    isolated_project_imports: Any,
+    stub_build_install: Any,
 ):
     monkeypatch.setenv("WORKFLOW_LOCAL_DATA_DIR", str(tmp_path / ".wf-data"))
     project = write_project(
@@ -2334,7 +2353,10 @@ def test_combined_build_with_all_primitives(
 
 # @lat: [[tests#Boundary#HTTP-only boundary scoping for queues and schedules]]
 def test_boundary_is_http_only_for_routes_queues_and_schedules(
-    tmp_path: Path, monkeypatch: Any, isolated_imports: Any, stub_build_install: Any
+    tmp_path: Path,
+    monkeypatch: Any,
+    isolated_project_imports: Any,
+    stub_build_install: Any,
 ):
     project = write_project(
         tmp_path,
@@ -2614,7 +2636,7 @@ def test_boundary_is_http_only_for_routes_queues_and_schedules(
 
 # @lat: [[tests#Vercel Workflows#Multi-namespace step topic routing]]
 def test_workflow_multi_namespace_step_prefix_routing(
-    tmp_path: Path, monkeypatch: Any, isolated_imports: Any
+    tmp_path: Path, monkeypatch: Any, isolated_project_imports: Any
 ):
     write_project(
         tmp_path,
@@ -2671,7 +2693,6 @@ def test_workflow_multi_namespace_step_prefix_routing(
     assert step_resp.status_code == 200
     assert step_resp.json()["namespace"] == "payments"
 
-    # Unexpected ASGI message while reading request body raises ValueError.
     messages = iter([{"type": "websocket.receive"}, {"type": "http.disconnect"}])
 
     async def receive() -> Message:
@@ -2745,7 +2766,7 @@ def test_workflow_prefix_fallback_and_flow_trigger_concurrency(
 
 # @lat: [[tests#Vercel Workflows#Src trace roots and missing attribute]]
 def test_workflow_trace_roots_src_layout_and_missing_attr(
-    tmp_path: Path, isolated_imports: Any
+    tmp_path: Path, isolated_project_imports: Any
 ):
     project = write_project(
         tmp_path / "src_wf",
@@ -2762,7 +2783,7 @@ def test_workflow_trace_roots_src_layout_and_missing_attr(
 
 # @lat: [[tests#Vercel Workflows#Trigger introspection error paths]]
 def test_workflow_introspection_error_paths(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_imports: Any
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_project_imports: Any
 ):
     project = write_project(
         tmp_path / "wf_errs",
@@ -2786,12 +2807,10 @@ def test_workflow_introspection_error_paths(
         },
     )
 
-    # vercel.queue without get_subscriptions() fails clearly.
     monkeypatch.setitem(sys.modules, "vercel.queue", types.ModuleType("vercel.queue"))
     with pytest.raises(RuntimeError, match="does not expose get_subscriptions"):
         introspect_workflow_triggers([WorkflowConfig("wf_no_subs:wf")], project)
 
-    # vercel.queue present, but vercel.workflow missing when loading entrypoint.
     fake_queue: Any = types.ModuleType("vercel.queue")
     fake_queue.get_subscriptions = lambda: []
     monkeypatch.setitem(sys.modules, "vercel.queue", fake_queue)
@@ -2799,17 +2818,14 @@ def test_workflow_introspection_error_paths(
     with pytest.raises(RuntimeError, match="'vercel-workflow' is not installed"):
         introspect_workflow_triggers([WorkflowConfig("wf_missing_sdk:wf")], project)
 
-    # Non-vercel missing module propagates unchanged instead of being masked.
     with pytest.raises(ModuleNotFoundError, match="no_such_user_dep_xyz"):
         introspect_workflow_triggers(
             [WorkflowConfig("wf_missing_user_dep:wf")], project
         )
 
-    # Non-string namespace on registry raises ValueError.
     with pytest.raises(ValueError, match="invalid namespace"):
         introspect_workflow_triggers([WorkflowConfig("wf_bad_ns:wf")], project)
 
-    # Registry with http_handler but zero registered vercel.queue subscriptions fails.
     with pytest.raises(
         RuntimeError, match=r"did not register any vercel\.queue subscription"
     ):
@@ -2818,7 +2834,7 @@ def test_workflow_introspection_error_paths(
 
 # @lat: [[tests#Vercel Workflows#ASGI adapter lifespan and chunking]]
 def test_workflow_asgi_adapter_lifespan_chunking_disconnect_and_str_body(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_imports: Any
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_project_imports: Any
 ):
     project = write_project(
         tmp_path / "wf_asgi",
@@ -2847,7 +2863,6 @@ def test_workflow_asgi_adapter_lifespan_chunking_disconnect_and_str_body(
     async def run_asgi(scope: dict[str, Any], receive: Any, send: Any) -> None:
         await app(scope, receive, send)
 
-    # Lifespan startup/shutdown handshake completes cleanly.
     lifespan_msgs = iter([{"type": "lifespan.startup"}, {"type": "lifespan.shutdown"}])
     lifespan_sent: list[Message] = []
 
@@ -2863,7 +2878,6 @@ def test_workflow_asgi_adapter_lifespan_chunking_disconnect_and_str_body(
         {"type": "lifespan.shutdown.complete"},
     ]
 
-    # Non-HTTP scope is ignored cleanly.
     ws_sent: list[Message] = []
 
     async def ws_send(msg: Message) -> None:
@@ -2872,14 +2886,12 @@ def test_workflow_asgi_adapter_lifespan_chunking_disconnect_and_str_body(
     asyncio.run(run_asgi({"type": "websocket"}, lifespan_receive, ws_send))
     assert ws_sent == []
 
-    # Chunked body streaming + non-ASCII str response body encoded as UTF-8.
     client = make_client(app)
     resp = client("POST", "/.well-known/workflow/v1/flow", content=b"abcdefg")
     assert resp.status_code == 200
     assert resp.headers["x-ok"] == "1"
     assert resp.content == "café:abc|def|g".encode()
 
-    # Client disconnect mid-body terminates aiter_bytes cleanly.
     disc_msgs = iter(
         [
             {"type": "http.request", "body": b"hi", "more_body": True},
@@ -2912,7 +2924,9 @@ def test_workflow_asgi_adapter_lifespan_chunking_disconnect_and_str_body(
 
 
 # @lat: [[tests#Vercel Workflows#Dev mount edge cases]]
-def test_workflow_mount_workflows_edge_cases(tmp_path: Path, isolated_imports: Any):
+def test_workflow_mount_workflows_edge_cases(
+    tmp_path: Path, isolated_project_imports: Any
+):
     project = write_project(
         tmp_path / "wf_mount",
         {

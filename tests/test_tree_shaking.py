@@ -49,7 +49,9 @@ def _write_workspace_pkg(
 
 # @lat: [[tests#Per-function tree-shaking]]
 @pytest.mark.slow
-def test_tree_shaking_workspace_build(tmp_path, isolated_imports, monkeypatch, capsys):
+def test_tree_shaking_workspace_build(
+    tmp_path, isolated_project_imports, monkeypatch, capsys
+):
     from chano.build import index_store
 
     repo_root = Path(__file__).parent.parent.resolve()
@@ -281,7 +283,7 @@ def test_tree_shaking_workspace_build(tmp_path, isolated_imports, monkeypatch, c
 
 # @lat: [[tests#Import tracer and closure]]
 def test_trace_and_closure_edge_cases(
-    tmp_path, isolated_imports, monkeypatch, stub_build_install, capsys
+    tmp_path, isolated_project_imports, monkeypatch, stub_build_install, capsys
 ):
     from chano.build import index_store
 
@@ -451,7 +453,7 @@ def lazy_middleware(*modules: str) -> str:
 
 # @lat: [[tests#Segment files as trace roots]]
 def test_segment_files_are_trace_roots(
-    tmp_path, isolated_imports, stub_build_install, capsys
+    tmp_path, isolated_project_imports, stub_build_install, capsys
 ):
     store_files: dict[str, str] = {}
     for dist in (
@@ -552,7 +554,7 @@ def test_segment_files_are_trace_roots(
 # @lat: [[tests#Build-time import check]]
 @pytest.mark.slow
 def test_build_import_check_catches_computed_import(
-    tmp_path, isolated_imports, monkeypatch, capsys
+    tmp_path, isolated_project_imports, monkeypatch, capsys
 ):
     repo_root = Path(__file__).parent.parent.resolve()
     host_python = f"{sys.version_info.major}.{sys.version_info.minor}"
@@ -640,7 +642,7 @@ def test_build_import_check_catches_computed_import(
 
 # @lat: [[tests#Import check platform matching]]
 def test_build_import_check_skips_non_matching_platform(
-    tmp_path, isolated_imports, monkeypatch, capsys
+    tmp_path, isolated_project_imports, monkeypatch, capsys
 ):
     project = tmp_path / "plat"
     write_project(
@@ -707,7 +709,7 @@ def test_build_import_check_skips_non_matching_platform(
 # @lat: [[tests#Import check target interpreter]]
 @pytest.mark.slow
 def test_build_import_check_uses_uv_python_find(
-    tmp_path, isolated_imports, monkeypatch, capsys
+    tmp_path, isolated_project_imports, monkeypatch, capsys
 ):
     repo_root = Path(__file__).parent.parent.resolve()
     host_python = f"{sys.version_info.major}.{sys.version_info.minor}"
@@ -802,7 +804,7 @@ def test_build_import_check_uses_uv_python_find(
 
 # @lat: [[tests#Build explain]]
 @pytest.mark.slow
-def test_build_explain(tmp_path, isolated_imports, monkeypatch, capsys):
+def test_build_explain(tmp_path, isolated_project_imports, monkeypatch, capsys):
     repo_root = Path(__file__).parent.parent.resolve()
     workspace = tmp_path / "explain-ws"
     write_project(

@@ -145,7 +145,7 @@ def inherited_project(root: Path) -> None:
 
 
 @pytest.fixture
-def inherited_serve(tmp_path, isolated_imports):
+def inherited_serve(tmp_path, isolated_project_imports):
     """``serve(factory, method, path, function, **kwargs)`` against
     ``inherited_project``, returning the response and the recorded events."""
     inherited_project(tmp_path)
@@ -246,7 +246,7 @@ def test_inherited_dependencies_skip_404_and_405(inherited_serve, factory):
 
 
 # @lat: [[tests#Inherited typed dependencies#Documented once without running]]
-def test_inherited_dependencies_schema(tmp_path, isolated_imports):
+def test_inherited_dependencies_schema(tmp_path, isolated_project_imports):
     inherited_project(tmp_path)
     schema = make_client(create_app(tmp_path / "app"))("GET", "/openapi.json").json()
     assert sys.modules["deplog"].EVENTS == []  # schema generation runs no check
@@ -391,7 +391,7 @@ def test_shared_dependency_inputs_documented_once():
 
 # @lat: [[tests#Inherited typed dependencies#Trace roots and bundling]]
 def test_inherited_dependencies_trace_roots(
-    tmp_path, isolated_imports, stub_build_install
+    tmp_path, isolated_project_imports, stub_build_install
 ):
     store_files: dict[str, str] = {}
     for dist in (
@@ -483,7 +483,7 @@ def test_async_callable_checks_block_the_handler():
 
 
 # @lat: [[tests#Inherited typed dependencies#Unhashable callable checks]]
-def test_unhashable_callable_checks(tmp_path, isolated_imports):
+def test_unhashable_callable_checks(tmp_path, isolated_project_imports):
     write_project(
         tmp_path,
         {
@@ -752,7 +752,7 @@ GENERATOR_CHECKS = [
 
 # @lat: [[tests#Inherited typed dependencies#Generator checks are rejected]]
 @pytest.mark.parametrize("check", GENERATOR_CHECKS)
-def test_generator_checks_are_rejected(tmp_path, isolated_imports, check):
+def test_generator_checks_are_rejected(tmp_path, isolated_project_imports, check):
     def handler() -> str:
         return "ok"
 

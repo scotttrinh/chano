@@ -58,7 +58,7 @@ MIDDLEWARE_ROUTE = (
 
 
 @pytest.fixture
-def middleware_project(tmp_path, isolated_imports):
+def middleware_project(tmp_path, isolated_project_imports):
     """A project with root, ``(group)`` and leaf middleware, a sibling with
     only the root's, and two dynamic routes that overlap on ``/items/x``.
 
@@ -237,7 +237,7 @@ def test_middleware_skips_dev_files(middleware_project):
         "boundary = {}\n",
     ],
 )
-def test_invalid_boundary_file(tmp_path, isolated_imports, source):
+def test_invalid_boundary_file(tmp_path, isolated_project_imports, source):
     write_project(
         tmp_path,
         {
@@ -256,7 +256,7 @@ def test_invalid_boundary_file(tmp_path, isolated_imports, source):
 
 # @lat: [[tests#Boundary#Non-response wrap result]]
 @pytest.mark.parametrize("factory", FACTORIES)
-def test_middleware_non_response(tmp_path, isolated_imports, factory):
+def test_middleware_non_response(tmp_path, isolated_project_imports, factory):
     write_project(
         tmp_path,
         {
@@ -280,7 +280,7 @@ def test_middleware_non_response(tmp_path, isolated_imports, factory):
 
 
 # @lat: [[tests#Boundary#Conflicting boundaries for one path]]
-def test_boundary_conflicting_chains(tmp_path, isolated_imports):
+def test_boundary_conflicting_chains(tmp_path, isolated_project_imports):
     boundary_src = (
         "from chano import Boundary\n"
         "async def w(request, call_next):\n    return await call_next(request)\n"
@@ -324,7 +324,7 @@ def error_source(name: str, *, sync: bool, with_wrap: bool = False) -> str:
 
 
 @pytest.fixture
-def error_project(tmp_path, isolated_imports):
+def error_project(tmp_path, isolated_project_imports):
     """Sync recover at the root and in ``admin``, async in ``(group)``,
     plus root and ``(group)`` wrap. ``/admin`` has all three boundary
     files, ``/other`` the group's and root's, ``/plain`` only the root's.
@@ -522,7 +522,7 @@ ASYNC_RESULT = (
 # @lat: [[tests#Boundary#Awaitable recover handlers]]
 @pytest.mark.filterwarnings("error::RuntimeWarning")
 @pytest.mark.parametrize("factory", FACTORIES)
-def test_error_awaitable_handlers(tmp_path, isolated_imports, factory):
+def test_error_awaitable_handlers(tmp_path, isolated_project_imports, factory):
     write_project(
         tmp_path,
         {

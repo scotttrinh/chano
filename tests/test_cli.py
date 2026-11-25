@@ -16,7 +16,7 @@ from tests.helpers import make_client, write_project
 
 # @lat: [[tests#CLI#Dev app factory]]
 def test_cli_dev_app_serves_routes_and_static(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_imports: Any
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_project_imports: Any
 ):
     project = write_project(
         tmp_path / "devproj",
@@ -36,7 +36,7 @@ def test_cli_dev_app_serves_routes_and_static(
 
 # @lat: [[tests#CLI#Dev command delegates to uvicorn]]
 def test_cli_dev_command_delegates_to_uvicorn(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_imports: Any
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_project_imports: Any
 ):
     project = write_project(
         tmp_path / "devcmd",
@@ -87,7 +87,7 @@ def test_cli_dev_propagates_non_uvicorn_import_error(
 
 # @lat: [[tests#CLI#Empty queue and schedule lists]]
 def test_cli_empty_queue_and_schedule_lists(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], isolated_imports: Any
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], isolated_project_imports: Any
 ):
     project = write_project(
         tmp_path / "emptyproj",
@@ -109,7 +109,7 @@ def test_cli_result_formatting_for_none_response_and_non_json(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    isolated_imports: Any,
+    isolated_project_imports: Any,
 ):
     none_marker = tmp_path / "none.marker"
     empty_marker = tmp_path / "empty.marker"

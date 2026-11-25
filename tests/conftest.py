@@ -18,7 +18,6 @@ from tests.helpers import (
     write_project,
 )
 
-# Never write .pyc files during test runs (e.g. when importing examples/hello).
 sys.dont_write_bytecode = True
 
 _INSTALLED_ROOTS = tuple(
@@ -53,8 +52,7 @@ def _is_installed_module(mod: object) -> bool:
 
 
 @contextmanager
-def _isolated_import_scope():
-    """Restore sys.path and evict non-installed sys.modules entries."""
+def _isolated_project_import_scope():
     before_path = list(sys.path)
     before_modules = set(sys.modules)
     try:
@@ -73,22 +71,13 @@ def _isolated_import_scope():
 
 
 @pytest.fixture
-def isolated_imports():
-    """Restore sys.path and evict non-installed modules added to sys.modules.
-
-    Modules from the installed Python environment (stdlib, site-packages,
-    built-in, and frozen, including namespace packages) are kept so native
-    extensions are never re-imported. Route modules, temp-project modules,
-    examples, and synthetic modules are evicted.
-    """
-    with _isolated_import_scope():
+def isolated_project_imports():
+    with _isolated_project_import_scope():
         yield
 
 
 @pytest.fixture
 def stub_build_install(monkeypatch: pytest.MonkeyPatch):
-    """Stub dependency installation (optionally populating fake dists) and skip
-    the post-build import check."""
 
     def apply(store_files: dict[str, str] | None = None) -> None:
         if store_files is None:
@@ -144,6 +133,6 @@ def prefixed_output(prefixed_project):
         # Same dependencies as examples/hello, which has a lock to export.
         install(EXAMPLE, vendor_dir, python, platform)
 
-    with _isolated_import_scope(), pytest.MonkeyPatch.context() as patch:
+    with _isolated_project_import_scope(), pytest.MonkeyPatch.context() as patch:
         patch.setattr(build_module, "_install_dependencies", install_like_example)
         return build(prefixed_project, python=HOST_PYTHON, platform=None)

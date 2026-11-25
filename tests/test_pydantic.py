@@ -509,7 +509,9 @@ def test_pydantic_response_and_sse_serialization():
 
 
 # @lat: [[tests#Pydantic responses and OpenAPI#Dev and build OpenAPI schemas]]
-def test_pydantic_openapi_dev_and_build(tmp_path, isolated_imports, stub_build_install):
+def test_pydantic_openapi_dev_and_build(
+    tmp_path, isolated_project_imports, stub_build_install
+):
     stub_build_install()
     project = tmp_path / "pydantic_openapi_app"
     (project / "app" / "orders").mkdir(parents=True)

@@ -309,7 +309,6 @@ def _load_workflow_registries(
     workflows: Sequence[WorkflowConfig],
     project_dir: Path,
 ) -> tuple[list[tuple[WorkflowConfig, Any, str | None]], Sequence[Any]]:
-    """Import and validate configured workflow registries plus current subscriptions."""
     project_root = str(project_dir.resolve())
     added_path = project_root not in sys.path
     if added_path:
@@ -362,7 +361,6 @@ def _collect_workflow_triggers(
     loaded_entries: Sequence[tuple[WorkflowConfig, Any, str | None]],
     all_subs: Sequence[Any],
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    """Match registered ``vercel.queue`` subscriptions to their owning registries."""
     subs_by_topic: dict[str, list[Any]] = {}
     for sub in all_subs:
         topic = getattr(sub, "topic", None)

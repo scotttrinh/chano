@@ -48,7 +48,7 @@ Verify non-table `tool` and `tool.chano` values raise `ValueError` referencing `
 
 Verify a `base_path = "/api/"` project served by `create_app` picks up the config: prefixed routes, static files, docs and `openapi.json` paths, and JSON 404s outside the prefix.
 
-Uses `isolated_imports`. Also checks raw-scope traversal rejection (httpx would normalize `..`), that `/api/` misses the root route, and that an explicit `base_path=""` overrides the config.
+Uses `isolated_project_imports`. Also checks raw-scope traversal rejection (httpx would normalize `..`), that `/api/` misses the root route, and that an explicit `base_path=""` overrides the config.
 
 ## Root path reconstruction
 
@@ -190,7 +190,7 @@ Verify a project whose `app` symlinks to `src/app` reads `base_path` from the ro
 
 Verify [[src/chano/build.py#plan_build]] on a temporary project without writing output: paths, functions, entrypoints, `.vc-config.json` overrides, generated docs, and `config.json` routes.
 
-The `isolated_imports` fixture restores `sys.path`, disables bytecode writes, and evicts non-installed modules added to `sys.modules` while keeping installed environment modules (stdlib, site-packages, built-in, and frozen).
+The `isolated_project_imports` fixture restores `sys.path` and evicts non-installed modules added to `sys.modules` while keeping installed environment modules (stdlib, site-packages, built-in, and frozen). The test session never writes bytecode.
 
 ## Build emit
 

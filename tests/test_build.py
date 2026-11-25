@@ -28,7 +28,7 @@ from tests.helpers import (
 
 
 # @lat: [[tests#Build plan]]
-def test_build_plan(tmp_path, isolated_imports):
+def test_build_plan(tmp_path, isolated_project_imports):
     project = tmp_path / "shop"
     write_project(
         project,
@@ -103,7 +103,7 @@ def test_build_plan(tmp_path, isolated_imports):
 
 # @lat: [[tests#Build emit]]
 def test_emit_build_preserves_public_and_config_isolation(
-    tmp_path, isolated_imports, stub_build_install
+    tmp_path, isolated_project_imports, stub_build_install
 ):
     project = tmp_path / "snap"
     write_project(
@@ -273,7 +273,7 @@ def test_prefixed_build_output(prefixed_project, prefixed_output):
 
 
 # @lat: [[tests#Route module isolation]]
-def test_route_module_isolation(tmp_path, isolated_imports):
+def test_route_module_isolation(tmp_path, isolated_project_imports):
     for name in ["one", "two"]:
         write_project(
             tmp_path / name,
@@ -299,7 +299,7 @@ def test_route_module_isolation(tmp_path, isolated_imports):
 
 
 # @lat: [[tests#Symlinked app directory]]
-def test_symlinked_app_directory(tmp_path, isolated_imports):
+def test_symlinked_app_directory(tmp_path, isolated_project_imports):
     project = tmp_path / "linked"
     write_project(
         project,
@@ -325,7 +325,9 @@ def test_symlinked_app_directory(tmp_path, isolated_imports):
 
 
 # @lat: [[tests#Prefixed build without public]]
-def test_prefixed_build_without_public(tmp_path, isolated_imports, stub_build_install):
+def test_prefixed_build_without_public(
+    tmp_path, isolated_project_imports, stub_build_install
+):
     stub_build_install()
     files = {
         "pyproject.toml": (
@@ -365,7 +367,7 @@ def test_prefixed_build_without_public(tmp_path, isolated_imports, stub_build_in
 
 # @lat: [[tests#Custom build output directory#Custom output directory]]
 def test_custom_build_output_directory(
-    tmp_path, isolated_imports, monkeypatch, stub_build_install, capsys
+    tmp_path, isolated_project_imports, monkeypatch, stub_build_install, capsys
 ):
     stub_build_install()
     project = tmp_path / "custom"
@@ -426,7 +428,7 @@ def test_custom_build_output_directory(
     ids=["project-root", "parent-dir", "app", "inside-app", "public", "inside-public"],
 )
 def test_build_rejects_overlapping_output_directory(
-    tmp_path, isolated_imports, relative_output
+    tmp_path, isolated_project_imports, relative_output
 ):
     project = tmp_path / "custom"
     write_project(
@@ -446,7 +448,7 @@ def test_build_rejects_overlapping_output_directory(
 
 # @lat: [[tests#Locked lockfile]]
 @pytest.mark.slow
-def test_stale_lockfile_fails_build(tmp_path, isolated_imports):
+def test_stale_lockfile_fails_build(tmp_path, isolated_project_imports):
     project = tmp_path / "stale"
     pyproject = (
         '[project]\nname = "stale"\nversion = "0.1.0"\n'
@@ -477,7 +479,9 @@ def test_stale_lockfile_fails_build(tmp_path, isolated_imports):
 
 
 # @lat: [[tests#Deterministic build output]]
-def test_deterministic_build_output(tmp_path, isolated_imports, stub_build_install):
+def test_deterministic_build_output(
+    tmp_path, isolated_project_imports, stub_build_install
+):
     stub_build_install()
     project = tmp_path / "det"
     write_project(
@@ -524,7 +528,7 @@ def test_deterministic_build_output(tmp_path, isolated_imports, stub_build_insta
 
 
 # @lat: [[tests#Workspace discovery]]
-def test_workspace_root_discovery(tmp_path, isolated_imports):
+def test_workspace_root_discovery(tmp_path, isolated_project_imports):
     # Non-workspace project falls back to project_dir, even under an ancestor
     # with pyproject.toml or [tool.uv.workspace] lacking uv.lock.
     outer = tmp_path / "outer"
@@ -645,7 +649,7 @@ def test_workspace_root_discovery(tmp_path, isolated_imports):
 
 # @lat: [[tests#Workspace build]]
 @pytest.mark.slow
-def test_workspace_build(tmp_path, isolated_imports, monkeypatch):
+def test_workspace_build(tmp_path, isolated_project_imports, monkeypatch):
     repo_root = Path(__file__).parent.parent.resolve()
     workspace = tmp_path / "workspace"
     write_project(
@@ -723,7 +727,7 @@ def test_workspace_build(tmp_path, isolated_imports, monkeypatch):
 
 # @lat: [[tests#Full-stack example build]]
 @pytest.mark.slow
-def test_fullstack_example_build(tmp_path, isolated_imports):
+def test_fullstack_example_build(tmp_path, isolated_project_imports):
     backend = FULLSTACK / "backend"
     vercel = json.loads((FULLSTACK / "vercel.json").read_text())
     assert vercel["services"]["web"] == {"root": "frontend/", "framework": "nextjs"}
@@ -920,7 +924,7 @@ def test_store_index(tmp_path, output):
 
 # @lat: [[tests#Build size report and limits]]
 def test_build_size_report_and_limits(
-    tmp_path, isolated_imports, monkeypatch, stub_build_install, capsys
+    tmp_path, isolated_project_imports, monkeypatch, stub_build_install, capsys
 ):
     assert report_module.SIZE_WARN_BYTES == 250 * 1024 * 1024
     assert report_module.SIZE_LIMIT_BYTES == 500 * 1024 * 1024
@@ -1122,7 +1126,7 @@ def test_build_size_report_and_limits(
 def test_build_ignores_root_only_preserves_nested_public_and_tests(
     tmp_path: Path,
     monkeypatch: Any,
-    isolated_imports: Any,
+    isolated_project_imports: Any,
     stub_build_install: Any,
     files: dict[str, str],
     symlinks: list[tuple[str, str]],
@@ -1157,8 +1161,6 @@ def test_build_ignores_root_only_preserves_nested_public_and_tests(
     static_rel, static_text = expected_static
     assert (out / "static" / static_rel).read_text() == static_text
 
-    # Delete the source tree and invoke the emitted entrypoint in a fresh
-    # interpreter so imports can only come from the build artifact.
     shutil.rmtree(project)
     runner = (
         "import asyncio, json, sys, httpx, index\n"

@@ -408,7 +408,7 @@ def test_after_request_cancellation_and_callback_gc():
 
 # @lat: [[tests#Background work with after()#wait_until backend and backend validation]]
 def test_after_wait_until_backend_and_validation(
-    tmp_path, isolated_imports, monkeypatch, capsys
+    tmp_path, isolated_project_imports, monkeypatch, capsys
 ):
     import contextvars
     from collections.abc import Awaitable
@@ -499,7 +499,7 @@ def test_after_wait_until_backend_and_validation(
 
 # @lat: [[tests#Background work with after()#Build entrypoint and vercel install]]
 def test_build_after_entrypoint_and_vercel_install(
-    tmp_path, isolated_imports, monkeypatch, stub_build_install
+    tmp_path, isolated_project_imports, monkeypatch, stub_build_install
 ):
     import importlib.util
     from collections.abc import Awaitable

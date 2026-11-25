@@ -231,7 +231,7 @@ def test_swagger_html_escapes_title_and_url():
 
 
 # @lat: [[tests#Prefixed dev routing]]
-def test_prefixed_dev_routing(prefixed_project, isolated_imports):
+def test_prefixed_dev_routing(prefixed_project, isolated_project_imports):
     # base_path comes from [tool.chano] beside app/, as in `chano dev`.
     app = create_app(prefixed_project / "app", public_dir=prefixed_project / "public")
     assert app.base_path == "/api"
@@ -282,7 +282,7 @@ def test_request_path_reconstruction(scope, full):
 
 
 # @lat: [[tests#Root path reconstruction#Routing with root_path]]
-def test_root_path_reconstruction(prefixed_project, isolated_imports):
+def test_root_path_reconstruction(prefixed_project, isolated_project_imports):
     app = create_app(prefixed_project / "app")
 
     # What vercel-runtime's prefix strip produces for both /api and /api/.
@@ -314,7 +314,7 @@ def test_root_path_reconstruction(prefixed_project, isolated_imports):
 
 
 # @lat: [[tests#Dev routing priority]]
-def test_dev_routing_priority(tmp_path, isolated_imports):
+def test_dev_routing_priority(tmp_path, isolated_project_imports):
     project = tmp_path / "catchall"
     write_project(
         project,
@@ -362,7 +362,7 @@ def test_dev_routing_priority(tmp_path, isolated_imports):
 
 
 # @lat: [[tests#Dev docs precedence]]
-def test_dev_docs_precedence(tmp_path, isolated_imports):
+def test_dev_docs_precedence(tmp_path, isolated_project_imports):
     project = tmp_path / "docsfiles"
     write_project(
         project,
@@ -409,7 +409,7 @@ def test_dev_docs_precedence(tmp_path, isolated_imports):
 
 
 # @lat: [[tests#Route load cache]]
-def test_route_load_cache(tmp_path, isolated_imports):
+def test_route_load_cache(tmp_path, isolated_project_imports):
     write_project(
         tmp_path,
         {
@@ -433,7 +433,7 @@ def test_route_load_cache(tmp_path, isolated_imports):
 
 
 # @lat: [[tests#Route segments]]
-def test_route_segments(tmp_path, isolated_imports):
+def test_route_segments(tmp_path, isolated_project_imports):
     write_project(
         tmp_path,
         {
@@ -476,7 +476,7 @@ def logging_segment(log: Path, name: str) -> str:
 
 
 # @lat: [[tests#Ancestor segment loading]]
-def test_route_load_segments(tmp_path, isolated_imports):
+def test_route_load_segments(tmp_path, isolated_project_imports):
     log = tmp_path / "runs.log"
     write_project(
         tmp_path,
@@ -509,7 +509,7 @@ def test_route_load_segments(tmp_path, isolated_imports):
 
 
 # @lat: [[tests#Segment module loading]]
-def test_segment_module_loading(tmp_path, isolated_imports):
+def test_segment_module_loading(tmp_path, isolated_project_imports):
     write_project(
         tmp_path,
         {

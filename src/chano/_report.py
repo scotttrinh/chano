@@ -1,5 +1,3 @@
-"""Bundle size reporting, size-limit enforcement, and ``--explain`` output."""
-
 from __future__ import annotations
 
 import os

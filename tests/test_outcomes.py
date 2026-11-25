@@ -708,7 +708,7 @@ def test_openapi_return_annotations_annotated_unions_and_dep_override(
 # @lat: [[tests#Outcomes#Queue retry on returned and raised Failure]]
 @pytest.mark.parametrize("mode", ["return", "raise"])
 def test_queue_retry_on_returned_and_raised_failure(
-    tmp_path, isolated_imports, monkeypatch, mode
+    tmp_path, isolated_project_imports, monkeypatch, mode
 ):
     app_dir = tmp_path / "app"
     q_dir = app_dir / "jobs"
@@ -753,11 +753,9 @@ def test_queue_retry_on_returned_and_raised_failure(
 
     q_client = make_client(create_queue_app(app_dir, "_queues/jobs"))
 
-    # Normal delivery succeeds (204 ack, no error raised).
     assert q_client("POST", "/_queues/jobs", json={"mode": "ok"}).status_code == 204
     assert raised_errors == []
 
-    # Both returned and raised Failure raise out of the subscriber (500 retry).
     assert q_client("POST", "/_queues/jobs", json={"mode": mode}).status_code == 500
     assert len(raised_errors) == 1
     assert isinstance(raised_errors[0], ServiceUnavailable)
@@ -992,7 +990,7 @@ def test_boundary_openapi_recover_replaces_422():
 
 
 # @lat: [[tests#Boundary#Local schedule runner ignores boundary]]
-def test_local_schedule_runner_ignores_boundary(tmp_path, isolated_imports):
+def test_local_schedule_runner_ignores_boundary(tmp_path, isolated_project_imports):
     app_dir = tmp_path / "app"
     (app_dir / "ret").mkdir(parents=True)
     (app_dir / "exc").mkdir(parents=True)

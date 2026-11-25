@@ -99,7 +99,7 @@ def test_platform_metadata_dev_fallbacks():
 
 
 # @lat: [[tests#Platform metadata through create_app]]
-def test_platform_metadata_through_create_app(tmp_path, isolated_imports):
+def test_platform_metadata_through_create_app(tmp_path, isolated_project_imports):
     write_project(
         tmp_path,
         {

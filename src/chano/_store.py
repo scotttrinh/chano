@@ -1,5 +1,3 @@
-"""Dependency store indexing from installed ``*.dist-info`` metadata."""
-
 from __future__ import annotations
 
 import csv

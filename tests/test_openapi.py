@@ -39,7 +39,7 @@ class SecretReply(msgspec.Struct):
 
 
 # @lat: [[tests#Hidden routes leave the schema]]
-def test_include_in_schema_false(tmp_path, isolated_imports):
+def test_include_in_schema_false(tmp_path, isolated_project_imports):
     project = tmp_path / "hiding"
     write_project(
         project,
@@ -97,7 +97,7 @@ def test_include_in_schema_false(tmp_path, isolated_imports):
 
 
 # @lat: [[tests#Schema with only hidden routes]]
-def test_include_in_schema_only_hidden_routes(tmp_path, isolated_imports):
+def test_include_in_schema_only_hidden_routes(tmp_path, isolated_project_imports):
     project = tmp_path / "secret"
     write_project(
         project,
@@ -143,7 +143,7 @@ def test_openapi_decorator_validation(kwargs, field):
 
 
 # @lat: [[tests#OpenAPI decorator metadata]]
-def test_openapi_decorator_metadata(tmp_path, isolated_imports):
+def test_openapi_decorator_metadata(tmp_path, isolated_project_imports):
     extra = {
         "x-rate-limit": 60,
         "responses": {"200": {"headers": {"X-Trace": {"schema": {"type": "string"}}}}},
@@ -250,7 +250,7 @@ def POST(name: str, user: str = Depends(current_user)) -> str | NotAllowed:
 
 
 # @lat: [[tests#Explicit security and responses]]
-def test_explicit_security_and_responses(tmp_path, isolated_imports):
+def test_explicit_security_and_responses(tmp_path, isolated_project_imports):
     project = tmp_path / "secure"
     write_project(
         project,
