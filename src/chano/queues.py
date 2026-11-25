@@ -40,22 +40,17 @@ from chano._pydantic import enc_hook as _pydantic_enc_hook
 from chano.app import (
     AfterBackend,
     ASGIApp,
+    Boundary,
     EndpointASGIApp,
-    ErrorHandler,
     _after_state,
     _AfterState,
-    _error_boundary,
+    _recover_candidates,
+    _run_recover,
 )
 from chano.params import Endpoint, is_generator_callable
 from chano.requests import Message, Receive, Request, Scope, Send
 from chano.responses import Failure, PlainTextResponse, Response
-from chano.routing import (
-    DEPENDENCIES_FILE,
-    ERROR_FILE,
-    load_module,
-    load_segment_dependencies,
-    load_segment_error_handlers,
-)
+from chano.routing import BOUNDARY_FILE, load_module, load_segment_boundaries
 
 QUEUE_FILE = "queue.py"
 QUEUE_FUNCTION_PREFIX = "_queues"
@@ -128,7 +123,7 @@ class LoadedQueue:
     spec: QueueConsumer
     trigger: QueueTrigger
     endpoint: Endpoint
-    error_handlers: tuple[ErrorHandler, ...]
+    boundaries: tuple[Boundary, ...]
     module: ModuleType
 
 
@@ -276,14 +271,15 @@ def load_queue(queue: QueueConsumer) -> LoadedQueue:
             "supported as queue consumers"
         )
     trigger = read_queue_trigger(module, queue.file)
-    dependencies = load_segment_dependencies(queue.load_segments(DEPENDENCIES_FILE))
-    error_handlers = tuple(load_segment_error_handlers(queue.load_segments(ERROR_FILE)))
-    endpoint = Endpoint(handler, set(), dependencies, default_source="body")
+    boundaries = load_segment_boundaries(queue.load_segments(BOUNDARY_FILE))
+    endpoint = Endpoint(
+        handler, set(), [b.guards for b in boundaries], default_source="body"
+    )
     return LoadedQueue(
         spec=queue,
         trigger=trigger,
         endpoint=endpoint,
-        error_handlers=error_handlers,
+        boundaries=boundaries,
         module=module,
     )
 
@@ -548,10 +544,8 @@ def _make_queue_subscriber(
                 if isinstance(result, Failure):
                     raise result
             except Exception as exc:
-                if loaded.error_handlers:
-                    response = await _error_boundary(
-                        loaded.error_handlers, request, exc
-                    )
+                if candidates := _recover_candidates(loaded.boundaries):
+                    response = await _run_recover(candidates, request, exc)
                     if response.status_code < 400:
                         return
                 raise
@@ -805,7 +799,7 @@ def create_queue_app(
                 EndpointASGIApp(
                     loaded.endpoint,
                     methods=("POST",),
-                    error_handlers=loaded.error_handlers,
+                    boundaries=loaded.boundaries,
                     after_backend=after_backend,
                 )
             )

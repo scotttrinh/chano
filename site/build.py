@@ -67,7 +67,7 @@ async def PUT(
 """
 
 DEPS_CODE_SAMPLE = """\
-from chano import Depends, HTTPBearer
+from chano import Boundary, Depends, HTTPBearer
 from chano.status import Forbidden
 
 bearer = HTTPBearer()
@@ -77,19 +77,21 @@ def require_admin(token: str = Depends(bearer)) -> None | Forbidden:
         return Forbidden("Admin access required")
     return None
 
-dependencies = [require_admin]
+boundary = Boundary(guards=[require_admin])
 """
 
 MIDDLEWARE_CODE_SAMPLE = """\
 import time
-from chano import Request, Response
+from chano import Boundary, CallNext, Request, Response
 
-async def middleware(request: Request, call_next) -> Response:
+async def timing(request: Request, call_next: CallNext) -> Response:
     start = time.perf_counter()
     response = await call_next(request)
     elapsed_ms = (time.perf_counter() - start) * 1000
     response.headers["x-response-time"] = f"{elapsed_ms:.2f}ms"
     return response
+
+boundary = Boundary(wrap=[timing])
 """
 
 
@@ -313,9 +315,9 @@ def render_landing(page: Page) -> str:
           <div class="vbg-custom-pillar">
             <h3 class="vbg-heading-16">Folder-scoped conventions</h3>
             <p>
-              Place <code>middleware.py</code>, <code>error.py</code>, or
-              <code>dependencies.py</code> in any folder under <code>app/</code>
-              to scope behavior to that subtree without central app wiring.
+              Place <code>boundary.py</code> in any folder under
+              <code>app/</code> to scope guards, error recovery, and HTTP
+              wrappers to that subtree without central app wiring.
             </p>
           </div>
           <div class="vbg-custom-pillar">
@@ -349,15 +351,15 @@ def render_landing(page: Page) -> str:
         <div class="vbg-custom-example-grid">
           <div class="vbg-custom-hero-code">
             <div class="vbg-custom-code-bar">
-              <span class="vbg-mono">app/(admin)/dependencies.py</span>
+              <span class="vbg-mono">app/(admin)/boundary.py</span>
               <span class="vbg-mono">Subtree auth</span>
             </div>
             {deps_code_html.strip()}
           </div>
           <div class="vbg-custom-hero-code">
             <div class="vbg-custom-code-bar">
-              <span class="vbg-mono">app/middleware.py</span>
-              <span class="vbg-mono">Root-to-leaf middleware</span>
+              <span class="vbg-mono">app/boundary.py</span>
+              <span class="vbg-mono">Root-to-leaf wrapper</span>
             </div>
             {middleware_code_html.strip()}
           </div>

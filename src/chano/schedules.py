@@ -25,20 +25,17 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from chano.app import (
     AfterBackend,
+    Boundary,
     EndpointASGIApp,
-    ErrorHandler,
     _after_state,
     _AfterState,
+    _recover_candidates,
+    _run_recover,
 )
 from chano.params import Endpoint, is_generator_callable
 from chano.requests import Message, Request, Scope
-from chano.routing import (
-    DEPENDENCIES_FILE,
-    ERROR_FILE,
-    load_module,
-    load_segment_dependencies,
-    load_segment_error_handlers,
-)
+from chano.responses import Failure
+from chano.routing import BOUNDARY_FILE, load_module, load_segment_boundaries
 
 SCHEDULE_FILE = "schedule.py"
 SCHEDULE_FUNCTION_PREFIX = "_schedules"
@@ -108,7 +105,7 @@ class LoadedSchedule:
     """Stable Vercel schedule key in ``config.json["schedules"]``."""
     trigger: ScheduleTrigger
     endpoint: Endpoint
-    error_handlers: tuple[ErrorHandler, ...]
+    boundaries: tuple[Boundary, ...]
     module: ModuleType
 
     def to_config_schedule(self) -> dict[str, str]:
@@ -302,15 +299,14 @@ def load_schedule(job: ScheduleJob) -> LoadedSchedule:
         )
     trigger = read_schedule_trigger(module, job.file)
     schedule_name = _read_schedule_name(module, job)
-    dependencies = load_segment_dependencies(job.load_segments(DEPENDENCIES_FILE))
-    error_handlers = tuple(load_segment_error_handlers(job.load_segments(ERROR_FILE)))
-    endpoint = Endpoint(handler, set(), dependencies)
+    boundaries = load_segment_boundaries(job.load_segments(BOUNDARY_FILE))
+    endpoint = Endpoint(handler, set(), [b.guards for b in boundaries])
     return LoadedSchedule(
         spec=job,
         schedule_name=schedule_name,
         trigger=trigger,
         endpoint=endpoint,
-        error_handlers=error_handlers,
+        boundaries=boundaries,
         module=module,
     )
 
@@ -406,7 +402,17 @@ async def invoke_loaded_schedule(
     token = _after_state.set(after_state)
     cancelled = False
     try:
-        return await loaded.endpoint.call(request)
+        try:
+            result = await loaded.endpoint.call(request)
+            if isinstance(result, Failure) and (
+                candidates := _recover_candidates(loaded.boundaries)
+            ):
+                return await _run_recover(candidates, request, result)
+            return result
+        except Exception as exc:
+            if candidates := _recover_candidates(loaded.boundaries):
+                return await _run_recover(candidates, request, exc)
+            raise
     except asyncio.CancelledError:
         cancelled = True
         raise
@@ -456,7 +462,7 @@ def create_schedule_app(
             return EndpointASGIApp(
                 loaded.endpoint,
                 methods=("POST", "GET"),
-                error_handlers=loaded.error_handlers,
+                boundaries=loaded.boundaries,
                 after_backend=after_backend,
             )
     raise ScheduleNotFoundError(

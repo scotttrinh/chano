@@ -86,7 +86,7 @@ Common `msgspec.Meta` constraints include:
 - **String format**: `pattern` (regular expression)
 - **OpenAPI metadata**: `title`, `description`, `examples` (published in `openapi.json`)
 
-When multiple consumers (such as an inherited check in `dependencies.py`, a `Depends(...)` helper, and the handler) read the same input, OpenAPI merges their schemas with `allOf` so every constraint is documented.
+When multiple consumers (such as an inherited guard in `boundary.py`, a `Depends(...)` helper, and the handler) read the same input, OpenAPI merges their schemas with `allOf` so every constraint is documented.
 
 ## Body decoding and coercion
 
@@ -128,7 +128,7 @@ from chano import Depends
 - If `fn` returns any `Response` (such as `Unauthorized(...)` or `SeeOther("/login")`), Chano short-circuits immediately and sends that response without running later dependencies or the handler.
 - Results are cached **per request** by callable identity, so a dependency referenced multiple times in one request executes once.
 - Async dependencies are awaited on the event loop; sync dependencies run via `asyncio.to_thread`.
-- Inherited checks in `dependencies.py` run root-to-leaf before handler arguments resolve, may short-circuit by returning a `Response`, and share the same per-request cache as `Depends(fn)` (note: generator functions are rejected in `dependencies.py`).
+- Inherited guards in `boundary.py` run root-to-leaf before handler arguments resolve, may short-circuit by returning a `Response`, and share the same per-request cache as `Depends(fn)` (note: generator functions are rejected as guards).
 
 ```python
 from typing import Annotated

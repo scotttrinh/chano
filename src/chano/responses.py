@@ -189,7 +189,7 @@ def _type_param_mapping(obj: Any, args: tuple[Any, ...]) -> dict[Any, Any]:
     mapping: dict[Any, Any] = {}
     for i, param in enumerate(params):
         if i < len(args):
-            mapping[param] = args[i]
+            mapping[param] = _substitute_typevars(args[i], mapping)
         elif hasattr(param, "has_default") and param.has_default():
             mapping[param] = _substitute_typevars(param.__default__, mapping)
         else:
@@ -318,6 +318,14 @@ class Failure[T = ErrorDetail](Outcome[T], Exception):
                 return _FailureGenericAlias(origin, args)
             return alias
 
+        def __new__(cls, *args: Any, **kwargs: Any) -> Any:
+            obj = Exception.__new__(cls)
+            alias = _active_failure_alias.get()
+            if alias is not None and get_origin(alias) is cls:
+                _active_failure_alias.set(None)
+                obj._failure_target = alias
+            return obj
+
     @overload
     def __init__(
         self: Failure[ErrorDetail],
@@ -330,12 +338,7 @@ class Failure[T = ErrorDetail](Outcome[T], Exception):
         self, content: T, *, headers: dict[str, str] | None = None
     ) -> None: ...
     def __init__(self, content: Any, *, headers: dict[str, str] | None = None) -> None:
-        alias = _active_failure_alias.get()
-        target = (
-            alias
-            if alias is not None and get_origin(alias) is type(self)
-            else type(self)
-        )
+        target = self.__dict__.pop("_failure_target", type(self))
         if (
             isinstance(content, str)
             and _unwrap_type(resolve_outcome_content(target)) is ErrorDetail

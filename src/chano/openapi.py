@@ -31,15 +31,17 @@ from chano._pydantic import pydantic_adapter
 from chano.exceptions import RequestValidationError
 from chano.params import Endpoint, RequestInput
 from chano.responses import (
+    Failure,
     Outcome,
     Response,
     _substitute_typevars,
     _type_param_mapping,
+    _unwrap_type,
     resolve_outcome_content,
 )
 
 if TYPE_CHECKING:
-    from chano.app import Chano
+    from chano.app import Boundary, Chano
 
 _REF = "#/components/schemas/{name}"
 _PYDANTIC_REF = "#/components/schemas/{model}"
@@ -363,10 +365,26 @@ def _schema(
         schema = pydantic_json_schema(adapter, ref_template=_PYDANTIC_REF, mode=mode)
         defs = schema.pop("$defs", None) or {}
         return _merge_components(schema, defs, components)
-    (schema,), definitions = msgspec.json.schema_components(
-        [annotation], ref_template=_REF
-    )
-    return _merge_components(schema, definitions, components)
+    try:
+        (schema,), definitions = msgspec.json.schema_components(
+            [annotation], ref_template=_REF
+        )
+        return _merge_components(schema, definitions, components)
+    except TypeError:
+        inner, meta = _split_annotated(annotation)
+        if get_origin(inner) not in (types.UnionType, Union):
+            raise
+        variants: list[dict[str, Any]] = []
+        for branch in get_args(inner):
+            branch_schema = _schema(branch, components, mode=mode)
+            if branch_schema not in variants:
+                variants.append(branch_schema)
+        result: dict[str, Any] = (
+            variants[0] if len(variants) == 1 else {"anyOf": variants}
+        )
+        if meta:
+            result = {**result, **msgspec.json.schema(_wrap_annotated(Any, meta))}
+        return result
 
 
 def _input_schema(
@@ -381,12 +399,83 @@ def _input_schema(
     return schemas[0] if len(schemas) == 1 else {"allOf": schemas}
 
 
+def _has_fixed_status(cls: type[Outcome[Any]] | None) -> bool:
+    status = getattr(cls, "status", None) if cls is not None else None
+    return isinstance(status, int) and not isinstance(status, bool)
+
+
+def _recover_rules(boundaries: Sequence[Boundary]) -> list[tuple[Any, Any | None]]:
+    rules: list[tuple[Any, Any | None]] = []
+    for boundary in reversed(boundaries):
+        for fn in boundary.recover:
+            sig = inspect.signature(fn, eval_str=True)
+            params = list(sig.parameters.values())
+            p_ann = (
+                Exception
+                if len(params) < 2 or params[1].annotation is inspect.Parameter.empty
+                else params[1].annotation
+            )
+            p_unwrapped = _unwrap_type(p_ann)
+            r_unwrapped = _unwrap_type(sig.return_annotation)
+            replacement = (
+                r_unwrapped
+                if _has_fixed_status(_outcome_class(p_unwrapped))
+                and _has_fixed_status(_outcome_class(r_unwrapped))
+                else None
+            )
+            rules.append((p_unwrapped, replacement))
+    return rules
+
+
+def _payload_matches(actual: Any, expected: type) -> bool:
+    actual = _unwrap_type(actual)
+    if actual is Any:
+        return expected is object
+    origin = get_origin(actual)
+    if origin in (types.UnionType, Union):
+        return all(_payload_matches(arg, expected) for arg in get_args(actual))
+    actual_cls = origin if isinstance(origin, type) else actual
+    return isinstance(actual_cls, type) and issubclass(actual_cls, expected)
+
+
+def _failure_matches_param(outcome_ann: Any, param_ann: Any) -> bool:
+    out_cls = _outcome_class(outcome_ann)
+    if out_cls is None or not issubclass(out_cls, Failure):
+        return False
+    unwrapped = _unwrap_type(param_ann)
+    if unwrapped is Any or unwrapped is object:
+        return True
+    origin = get_origin(unwrapped)
+    if origin in (types.UnionType, Union):
+        return any(_failure_matches_param(outcome_ann, a) for a in get_args(unwrapped))
+    param_cls = origin if isinstance(origin, type) else unwrapped
+    if not isinstance(param_cls, type) or not issubclass(out_cls, param_cls):
+        return False
+    if origin is not None and issubclass(param_cls, Outcome):
+        args = get_args(unwrapped)
+        if len(args) == 1:
+            expected = _unwrap_type(args[0])
+            if expected is not Any and isinstance(expected, type):
+                return _payload_matches(resolve_outcome_content(outcome_ann), expected)
+    return True
+
+
+def _apply_recover_rules(
+    annotation: Any, rules: Sequence[tuple[Any, Any | None]]
+) -> Any:
+    for param_ann, replacement in rules:
+        if _failure_matches_param(annotation, param_ann):
+            return annotation if replacement is None else replacement
+    return annotation
+
+
 def _operation(
     method: str,
     path: str,
     endpoint: Endpoint,
     components: dict[str, Any],
     security_schemes: dict[str, Any],
+    boundaries: Sequence[Boundary] = (),
 ) -> dict[str, Any]:
     info = openapi_info(endpoint.func)
     doc = inspect.getdoc(endpoint.func) or ""
@@ -449,6 +538,7 @@ def _operation(
             "content": {"application/json": {"schema": body_schema}},
         }
 
+    rules = _recover_rules(boundaries)
     responses: dict[int, dict[str, Any]] = {}
     default_200_desc = (
         info.response_description
@@ -463,7 +553,7 @@ def _operation(
         has_other_response = False
         for member in _iter_union_members(returns):
             if _outcome_class(member) is not None:
-                _add_outcome(responses, member, components)
+                _add_outcome(responses, _apply_recover_rules(member, rules), components)
             elif _is_response_type(member):
                 has_other_response = True
             else:
@@ -491,12 +581,14 @@ def _operation(
             continue
         for member in _iter_union_members(dep_returns):
             if _outcome_class(member) is not None:
-                _add_outcome(responses, member, components)
+                _add_outcome(responses, _apply_recover_rules(member, rules), components)
 
     if info is not None and info.response_description is not None and 200 in responses:
         responses[200]["description"] = info.response_description
     if fields:
-        _add_outcome(responses, RequestValidationError, components)
+        _add_outcome(
+            responses, _apply_recover_rules(RequestValidationError, rules), components
+        )
     operation["responses"] = {str(k): v for k, v in sorted(responses.items())}
 
     # All dependencies run, so every scheme is required together: one
@@ -518,9 +610,10 @@ def openapi_schema(app: Chano) -> dict[str, Any]:
     for path, _, endpoints in app.routes:
         # Components are collected only from documented operations, so a
         # schema or scheme used solely by hidden ones is left out too.
+        boundaries = app.boundaries.get(path, ())
         operations = {
             method.lower(): _operation(
-                method, path, endpoint, components, security_schemes
+                method, path, endpoint, components, security_schemes, boundaries
             )
             for method, endpoint in endpoints.items()
             if (path, method) not in app.hidden_operations

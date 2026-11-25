@@ -34,9 +34,9 @@ Chano keeps the parts of FastAPI that make Python APIs pleasant to write—typed
 | **Route registration**  | `@app.get("/items/{id}")`       | `def GET(id: int):` inside `app/items/[id]/route.py`         |
 | **Validation & JSON**   | Pydantic                        | `msgspec` (with optional `pydantic.BaseModel` support)       |
 | **Dependencies**        | `Depends(fn)`                   | `Depends(fn)` (per-request cached) + `lazy(factory)`         |
-| **Router-level checks** | `APIRouter(dependencies=[...])` | `dependencies.py` in any route folder                        |
-| **Middleware**          | `@app.middleware("http")`       | `middleware.py` in any route folder                          |
-| **Error handlers**      | `@app.exception_handler(Exc)`   | `error.py` in any route folder                               |
+| **Router-level checks** | `APIRouter(dependencies=[...])` | `Boundary(guards=[...])` in `boundary.py`                    |
+| **Middleware**          | `@app.middleware("http")`       | `Boundary(wrap=[...])` in `boundary.py`                      |
+| **Error handlers**      | `@app.exception_handler(Exc)`   | `Boundary(recover=[...])` in `boundary.py`                   |
 | **Startup / lifespan**  | `@asynccontextmanager lifespan` | `lazy(factory)` (initializes on first use per warm instance) |
 | **Background tasks**    | `BackgroundTasks`               | `after(fn, *args, **kwargs)` (`wait_until` in production)    |
 | **OpenAPI & `/docs`**   | Generated at runtime in Python  | Pre-rendered at build time to static CDN files               |
@@ -284,13 +284,25 @@ async def GET(client: httpx.AsyncClient = Depends(get_http_client)):
     return resp.json()
 ```
 
-### 3. Folder-Scoped `dependencies.py`
+### 3. Folder-Scoped `boundary.py`
 
-In FastAPI, you protect a group of endpoints with `APIRouter(dependencies=[Depends(verify_admin)])`. In Chano, drop a `dependencies.py` file into any folder under `app/`. Every `route.py` at or below that folder will run those checks before its handler:
+In FastAPI, you protect a group of endpoints with `APIRouter(dependencies=[...])`, add middleware with `@app.middleware("http")`, and register error handlers with `@app.exception_handler(...)`. In Chano, drop a `boundary.py` file into any folder under `app/` exporting `boundary = Boundary(guards=..., recover=..., wrap=...)`:
 
 ```python
-# app/(admin)/dependencies.py
-from chano import Depends, HTTPBearer
+# app/(admin)/boundary.py
+import time
+
+from chano import (
+    Boundary,
+    CallNext,
+    Depends,
+    ErrorDetail,
+    Failure,
+    HTTPBearer,
+    JSONResponse,
+    Request,
+    Response,
+)
 from chano.status import Forbidden
 
 bearer = HTTPBearer()
@@ -302,57 +314,32 @@ def require_admin(token: str = Depends(bearer)) -> None | Forbidden:
     return None
 
 
-dependencies = [require_admin]
-```
-
-Now `app/(admin)/users/route.py` is automatically protected at `/users`—and because `(admin)` is a route group, the URL stays `/users` without adding `/admin` to the path.
-
-### 4. Folder-Scoped `middleware.py`
-
-To wrap requests and responses for a subtree of routes (for timing headers, logging, or CORS), add a `middleware.py` exporting `async def middleware(request, call_next) -> Response`:
-
-```python
-# app/middleware.py
-import time
-
-from chano import Request, Response
+def format_failure(request: Request, exc: Failure[ErrorDetail]) -> Response:
+    return JSONResponse(
+        {"error": exc.content.detail, "path": request.path},
+        status_code=exc.status_code,
+        headers=exc.headers,
+    )
 
 
-async def middleware(request: Request, call_next) -> Response:
+async def timing(request: Request, call_next: CallNext) -> Response:
     start = time.perf_counter()
     response = await call_next(request)
     elapsed_ms = (time.perf_counter() - start) * 1000
     response.headers["x-response-time"] = f"{elapsed_ms:.2f}ms"
     return response
+
+
+boundary = Boundary(
+    guards=[require_admin],
+    recover=[format_failure],
+    wrap=[timing],
+)
 ```
 
-If multiple `middleware.py` files exist along a route's path (e.g., `app/middleware.py` and `app/api/middleware.py`), they run root-to-leaf (outermost to innermost).
-
-### 5. Folder-Scoped `error.py`
-
-To customize error responses for a subtree of routes, add an `error.py` exporting `handle_error(request, exc) -> Response` (sync or async):
-
-```python
-# app/api/error.py
-from chano import ErrorDetail, Failure, JSONResponse, Request, Response
-
-
-def handle_error(request: Request, exc: Exception) -> Response:
-    if isinstance(exc, Failure):
-        detail = (
-            exc.content.detail
-            if isinstance(exc.content, ErrorDetail)
-            else exc.content
-        )
-        return JSONResponse(
-            {"error": detail, "path": request.path},
-            status_code=exc.status_code,
-            headers=exc.headers,
-        )
-    raise exc  # pass unhandled exceptions to an outer error.py or default 500
-```
-
-Unlike middleware, error boundaries run **nearest-to-leaf first**. If `handle_error` re-raises, the exception bubbles up to the next ancestor `error.py`, or falls back to Chano's default error mapping.
+- **`guards`** run root-to-leaf before handler arguments resolve (sharing the per-request `Depends` cache), and a returned `Response` short-circuits the request. Because `(admin)` is a route group, `app/(admin)/users/route.py` stays at `/users`.
+- **`recover`** functions are matched by their second parameter's type annotation, running nearest-to-leaf first then in list order. Returning a `Response` is final; raising continues outward to remaining candidates or Chano's default error mapping.
+- **`wrap`** functions run root-to-leaf (outermost to innermost) on HTTP routes only.
 
 ---
 
@@ -436,7 +423,7 @@ To hide individual methods from `/openapi.json` and `/docs` (or set `tags`, `sum
 
 ### Dependency Tree-Shaking
 
-When you run `chano build`, Chano performs **static AST import tracing** starting from each `route.py` and its ancestor `middleware.py`, `error.py`, and `dependencies.py` files. Only the third-party distributions that a route actually uses (plus their transitive dependencies) are hard-linked into that function's `_vendor/` directory.
+When you run `chano build`, Chano performs **static AST import tracing** starting from each `route.py` and its ancestor `boundary.py` files. Only the third-party distributions that a route actually uses (plus their transitive dependencies) are hard-linked into that function's `_vendor/` directory.
 
 For example, if only `app/api/reports/route.py` imports `pandas` or `pillow`, only that function pays the bundle-size cost—your `/api/health` function stays tiny and cold-starts in milliseconds.
 

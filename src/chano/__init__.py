@@ -1,4 +1,4 @@
-from chano.app import Chano, after
+from chano.app import Boundary, CallNext, Chano, Guard, Recover, Wrap, after
 from chano.config import ChanoConfig, WorkflowConfig, load_config
 from chano.exceptions import RequestValidationError
 from chano.openapi import openapi
@@ -25,6 +25,8 @@ from chano.workflows import create_workflow_flow_app, create_workflow_step_app
 
 __all__ = [
     "Body",
+    "Boundary",
+    "CallNext",
     "Chano",
     "ChanoConfig",
     "Cookie",
@@ -32,6 +34,7 @@ __all__ = [
     "ErrorDetail",
     "Failure",
     "Geo",
+    "Guard",
     "HTMLResponse",
     "HTTPBearer",
     "Header",
@@ -39,6 +42,7 @@ __all__ = [
     "Outcome",
     "PlainTextResponse",
     "Query",
+    "Recover",
     "RedirectResponse",
     "Request",
     "RequestValidationError",
@@ -47,6 +51,7 @@ __all__ = [
     "ServerSentEvent",
     "StreamingResponse",
     "WorkflowConfig",
+    "Wrap",
     "after",
     "create_app",
     "create_queue_app",

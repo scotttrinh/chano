@@ -16,6 +16,8 @@ import msgspec
 import pytest
 
 from chano import (
+    Boundary,
+    CallNext,
     Chano,
     Depends,
     ErrorDetail,
@@ -24,6 +26,8 @@ from chano import (
     Outcome,
     Request,
     RequestValidationError,
+    Response,
+    create_app,
     openapi,
 )
 from chano.queues import _make_queue_subscriber, discover_queues, load_queue
@@ -107,6 +111,8 @@ type DefaultResult[T = int] = Created[T] | NotFound
 type ChainedDefault[T = int, U = T] = Created[U] | NotFound
 type AliasDetail = ErrorDetail
 type PlainUnion = int | str
+type MissingAlias = NotFound
+type ReplacementAlias = Created[str]
 
 
 class StrNotFound(NotFound[str]):
@@ -118,6 +124,26 @@ class ObservingFailure[T = ErrorDetail](NotFound[T]):
         super().__init__(content, headers=headers)
         self.seen_content = self.content
         self.seen_body_len = len(self.body)
+
+
+class NestedFailure[T = ErrorDetail](NotFound[T]):
+    def __init__(
+        self,
+        content: Any,
+        *,
+        make_inner: bool = False,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__(content, headers=headers)
+        self.inner = NestedFailure("inner") if make_inner else None
+
+
+class MultiCreated[T = str, U = T](Created[U]):
+    pass
+
+
+class MultiFailure[T = str, U = T](NotFound[U]):
+    pass
 
 
 class GenericBase[T]:
@@ -285,6 +311,19 @@ def test_outcomes_status_body_headers_cookies_and_bodyless():
     assert wrapped_alias.content == ErrorDetail(detail="gone")
     assert json.loads(wrapped_alias.body) == {"detail": "gone"}
 
+    # Nested same-class construction inside __init__ does not inherit outer alias.
+    nested_outer = NestedFailure[str]("outer", make_inner=True)
+    assert nested_outer.content == "outer"
+    assert nested_outer.body == b'"outer"'
+    assert nested_outer.inner is not None
+    assert nested_outer.inner.content == ErrorDetail(detail="inner")
+    assert nested_outer.inner.body == b'{"detail":"inner"}'
+
+    # Partially specialized class with default referencing earlier TypeVar.
+    multi_err = MultiFailure[ErrorDetail]("x")
+    assert multi_err.content == ErrorDetail(detail="x")
+    assert multi_err.body == b'{"detail":"x"}'
+
     # RequestValidationError is a Failure keeping .errors and the same wire bytes.
     rve = RequestValidationError([{"loc": ["query", "x"], "msg": "Field required"}])
     assert isinstance(rve, Failure)
@@ -313,7 +352,7 @@ def test_returned_failure_reaches_error_boundary():
         raise NotFound("exc")
 
     app = Chano(docs=False)
-    app.add_route("/x", handler, ["GET"], error_handlers=[handle_error])
+    app.add_route("/x", handler, ["GET"], boundaries=[Boundary(recover=[handle_error])])
     client = make_client(app)
 
     r1 = client("GET", "/x?mode=return")
@@ -359,7 +398,7 @@ def test_depends_short_circuit_nested_and_cached():
         return {"session": session, "user": user.name, "extra": extra}
 
     app = Chano(docs=False)
-    app.add_route("/x", handler, ["GET"], dependencies=[[check_gate]])
+    app.add_route("/x", handler, ["GET"], boundaries=[Boundary(guards=[check_gate])])
     client = make_client(app)
 
     # Normal path: shared dependency cached once.
@@ -452,6 +491,14 @@ def test_openapi_from_return_annotations():
     ]:
         return "x"
 
+    def annotated_struct_union() -> Annotated[
+        Item | User, msgspec.Meta(description="Either model")
+    ]:
+        return Item(id=1, name="x")
+
+    def multi_created() -> MultiCreated[int]:
+        return MultiCreated(1)
+
     def mixin_not_found() -> MixinNotFound:
         return MixinNotFound("gone")
 
@@ -463,9 +510,11 @@ def test_openapi_from_return_annotations():
         return Created(len(x))
 
     app = Chano()
-    app.add_route("/items/{item_id}", get_item, ["GET"], dependencies=[[guard]])
+    app.add_route(
+        "/items/{item_id}", get_item, ["GET"], boundaries=[Boundary(guards=[guard])]
+    )
     app.add_route("/items", create_item, ["POST"])
-    app.add_route("/items/{item_id}", delete_item, ["DELETE"])
+    app.add_route("/delete/{item_id}", delete_item, ["DELETE"])
     app.add_route("/multi", multi_200, ["GET"])
     app.add_route("/bearer", bare_bearer, ["GET"])
     app.add_route("/annotated-outcome", annotated_outcome, ["POST"])
@@ -476,6 +525,8 @@ def test_openapi_from_return_annotations():
     app.add_route("/chained-override", chained_override, ["POST"])
     app.add_route("/annotated-union", annotated_union, ["GET"])
     app.add_route("/annotated-plain-alias", annotated_plain_alias, ["GET"])
+    app.add_route("/annotated-struct-union", annotated_struct_union, ["GET"])
+    app.add_route("/multi-created", multi_created, ["POST"])
     app.add_route("/mixin-not-found", mixin_not_found, ["GET"])
     app.add_route("/dep-200", dep_200_override, ["POST"])
 
@@ -524,8 +575,8 @@ def test_openapi_from_return_annotations():
         "$ref": "#/components/schemas/Problem"
     }
 
-    # DELETE /items/{item_id}: 204 bodyless, 404 ErrorDetail, 422, no 200.
-    del_res = schema["paths"]["/items/{item_id}"]["delete"]["responses"]
+    # DELETE /delete/{item_id}: 204 bodyless, 404 ErrorDetail, 422, no 200.
+    del_res = schema["paths"]["/delete/{item_id}"]["delete"]["responses"]
     assert list(del_res) == ["204", "404", "422"]
     assert del_res["204"] == {"description": "No Content"}
     assert "content" not in del_res["204"]
@@ -589,6 +640,21 @@ def test_openapi_from_return_annotations():
         "description": "Alias desc",
     }
 
+    ann_structs = schema["paths"]["/annotated-struct-union"]["get"]["responses"]["200"]
+    assert ann_structs["content"]["application/json"]["schema"] == {
+        "anyOf": [
+            {"$ref": "#/components/schemas/Item"},
+            {"$ref": "#/components/schemas/User"},
+        ],
+        "description": "Either model",
+    }
+
+    multi_res = schema["paths"]["/multi-created"]["post"]["responses"]
+    assert list(multi_res) == ["201"]
+    assert multi_res["201"]["content"]["application/json"]["schema"] == {
+        "type": "integer"
+    }
+
     mixin_res = schema["paths"]["/mixin-not-found"]["get"]["responses"]
     assert list(mixin_res) == ["404"]
     assert mixin_res["404"]["content"]["application/json"]["schema"] == {
@@ -631,16 +697,259 @@ def test_queue_retry_on_returned_and_raised_failure(tmp_path):
         with pytest.raises(ServiceUnavailable):
             asyncio.run(deliver(subscriber, {"mode": mode}))
 
-    # An error.py recovering to < 400 acknowledges both returned and raised failures.
-    (app_dir / "error.py").write_text(
+    # A boundary.py recover function returning < 400 acknowledges both returned
+    # and raised failures, while wrap is never executed for queues.
+    (app_dir / "boundary.py").write_text(
+        "from chano import Boundary, Request\n"
         "from chano.status import NoContent\n\n"
-        "def handle_error(request, exc):\n"
-        "    return NoContent()\n"
+        "def recover_all(request: Request, exc: Exception):\n"
+        "    return NoContent()\n\n"
+        "async def never_wrap(request: Request, call_next):\n"
+        "    raise AssertionError('wrap must not run on queues')\n\n"
+        "boundary = Boundary(recover=[recover_all], wrap=[never_wrap])\n"
     )
     loaded_recovered = load_queue(discover_queues(app_dir)[0])
     recovered_subscriber = _make_queue_subscriber(loaded_recovered, "local")
     asyncio.run(deliver(recovered_subscriber, {"mode": "return"}))
     asyncio.run(deliver(recovered_subscriber, {"mode": "raise"}))
+
+
+class ApiUnprocessable(UnprocessableContent[Problem]):
+    """Problem-formatted validation error."""
+
+    media_type = "application/problem+json"
+
+    def __init__(self, title: str) -> None:
+        super().__init__(Problem(title=title, status=self.status))
+
+
+# @lat: [[tests#Boundary#Recover matching and order]]
+def test_boundary_recover_matching_order_and_wrappers():
+    events: list[str] = []
+
+    def recover_default_failure(
+        request: Request, exc: Failure[ErrorDetail]
+    ) -> ApiNotFound:
+        events.append("leaf:Failure[ErrorDetail]")
+        return ApiNotFound(f"reformatted:{exc.content.detail}")
+
+    async def recover_lookup(request: Request, exc: LookupError) -> ApiNotFound:
+        events.append("leaf:LookupError")
+        if str(exc) == "'pass'":
+            raise
+        return ApiNotFound(f"lookup:{exc}")
+
+    def recover_key_error(request: Request, exc: KeyError) -> BadRequest:
+        events.append("root:KeyError")
+        return BadRequest(f"root-key:{exc}")
+
+    async def wrap_root(request: Request, call_next: CallNext) -> Response:
+        events.append("wrap>")
+        if request.headers.get("x-wrap-fail"):
+            raise RuntimeError("wrap boom")
+        res = await call_next(request)
+        events.append(f"<wrap:{res.status_code}")
+        return res
+
+    def handler(mode: str = "default-fail") -> Item | NotFound | ApiNotFound:
+        if mode == "default-fail":
+            return NotFound("missing")
+        if mode == "problem-fail":
+            return ApiNotFound("already problem")
+        if mode == "key":
+            raise KeyError("k")
+        if mode == "pass":
+            raise KeyError("pass")
+        return Item(id=1, name="ok")
+
+    root_b = Boundary(recover=[recover_key_error], wrap=[wrap_root])
+    leaf_b = Boundary(recover=[recover_default_failure, recover_lookup])
+
+    app = Chano(docs=False)
+    app.add_route("/x", handler, ["GET"], boundaries=[root_b, leaf_b])
+    client = make_client(app)
+
+    # Failure[ErrorDetail] matches returned NotFound("missing")...
+    events.clear()
+    r = client("GET", "/x?mode=default-fail")
+    assert r.status_code == 404
+    assert r.headers["content-type"] == "application/problem+json"
+    assert r.json() == {"title": "reformatted:missing", "status": 404}
+    assert events == ["wrap>", "leaf:Failure[ErrorDetail]", "<wrap:404"]
+
+    # ...and leaves ApiNotFound (Failure[Problem]) alone (sent as-is).
+    events.clear()
+    r = client("GET", "/x?mode=problem-fail")
+    assert r.status_code == 404
+    assert r.json() == {"title": "already problem", "status": 404}
+    assert events == ["wrap>", "<wrap:404"]
+
+    # Async LookupError recover catches KeyError (nearest first).
+    events.clear()
+    r = client("GET", "/x?mode=key")
+    assert r.status_code == 404
+    assert r.json() == {"title": "lookup:'k'", "status": 404}
+    assert events == ["wrap>", "leaf:LookupError", "<wrap:404"]
+
+    # Bare raise in leaf passes outward to root's KeyError recover.
+    events.clear()
+    r = client("GET", "/x?mode=pass")
+    assert r.status_code == 400
+    assert r.json() == {"detail": "root-key:'pass'"}
+    assert events == ["wrap>", "leaf:LookupError", "root:KeyError", "<wrap:400"]
+
+    # Wrapper errors skip recover and get the default 500 mapping.
+    events.clear()
+    r = client("GET", "/x", headers={"x-wrap-fail": "1"})
+    assert r.status_code == 500
+    assert events == ["wrap>"]
+
+    # Failure[Any] matches any Failure without failing isinstance(..., Any).
+    def recover_any_failure(request: Request, exc: Failure[Any]) -> BadRequest:
+        return BadRequest(f"any:{exc.status_code}")
+
+    any_app = Chano(docs=False)
+    any_app.add_route(
+        "/any", handler, ["GET"], boundaries=[Boundary(recover=[recover_any_failure])]
+    )
+    any_client = make_client(any_app)
+    r_any1 = any_client("GET", "/any?mode=default-fail")
+    assert (r_any1.status_code, r_any1.json()) == (400, {"detail": "any:404"})
+    r_any2 = any_client("GET", "/any?mode=problem-fail")
+    assert (r_any2.status_code, r_any2.json()) == (400, {"detail": "any:404"})
+
+
+# @lat: [[tests#Boundary#OpenAPI recover replacement]]
+def test_boundary_openapi_recover_replaces_422():
+    def invalid(request: Request, error: RequestValidationError) -> ApiUnprocessable:
+        return ApiUnprocessable("invalid input")
+
+    def missing(request: Request, error: LookupError) -> ApiNotFound:
+        return ApiNotFound(str(error))
+
+    def handler(item: Item) -> Item:
+        return item
+
+    app = Chano()
+    app.add_route(
+        "/items", handler, ["POST"], boundaries=[Boundary(recover=[invalid, missing])]
+    )
+    schema = app.openapi()
+    responses = schema["paths"]["/items"]["post"]["responses"]
+    assert list(responses) == ["200", "422"]
+    assert responses["422"]["description"] == "Problem-formatted validation error."
+    assert responses["422"]["content"]["application/problem+json"]["schema"] == {
+        "$ref": "#/components/schemas/Problem"
+    }
+    assert "ValidationErrorDetail" not in schema["components"]["schemas"]
+
+    # Earlier non-documentable catch-all stops later NotFound -> Created rewrite,
+    # and non-Failure Outcomes (OK[str]) are never rewritten by recover.
+    def catch_all(request: Request, error: Exception) -> Forbidden:
+        return Forbidden("blocked")
+
+    def not_found_to_created(request: Request, error: NotFound) -> Created[Item]:
+        return Created(Item(id=0, name="fallback"))
+
+    def ok_to_forbidden(request: Request, error: OK[str]) -> Forbidden:
+        return Forbidden("never")
+
+    def ok_or_missing() -> OK[str] | NotFound:
+        return OK("hi")
+
+    app2 = Chano()
+    app2.add_route(
+        "/prec",
+        ok_or_missing,
+        ["GET"],
+        boundaries=[
+            Boundary(recover=[catch_all, not_found_to_created, ok_to_forbidden])
+        ],
+    )
+    prec_res = app2.openapi()["paths"]["/prec"]["get"]["responses"]
+    assert list(prec_res) == ["200", "404"]
+    assert prec_res["200"]["content"]["application/json"]["schema"] == {
+        "type": "string"
+    }
+
+    # PEP 695 aliases on recover parameter/return and union payloads
+    # (NotFound[str | None] matching NotFound[object]) rewrite OpenAPI.
+    def recover_aliased(request: Request, error: MissingAlias) -> ReplacementAlias:
+        return Created("recovered")
+
+    def missing_handler() -> NotFound:
+        return NotFound("gone")
+
+    app3 = Chano()
+    app3.add_route(
+        "/aliased",
+        missing_handler,
+        ["GET"],
+        boundaries=[Boundary(recover=[recover_aliased])],
+    )
+    aliased_res = app3.openapi()["paths"]["/aliased"]["get"]["responses"]
+    assert list(aliased_res) == ["201"]
+    assert aliased_res["201"]["content"]["application/json"]["schema"] == {
+        "type": "string"
+    }
+
+    def recover_obj_payload(request: Request, error: NotFound[object]) -> Created[str]:
+        return Created("obj")
+
+    def union_payload_handler() -> NotFound[str | None]:
+        return NotFound[str | None]("gone")
+
+    app4 = Chano()
+    app4.add_route(
+        "/union-payload",
+        union_payload_handler,
+        ["GET"],
+        boundaries=[Boundary(recover=[recover_obj_payload])],
+    )
+    union_res = app4.openapi()["paths"]["/union-payload"]["get"]["responses"]
+    assert list(union_res) == ["201"]
+    assert union_res["201"]["content"]["application/json"]["schema"] == {
+        "type": "string"
+    }
+
+
+# @lat: [[tests#Boundary#Local schedule runner applies recover]]
+def test_local_schedule_runner_applies_recover(tmp_path):
+    app_dir = tmp_path / "app"
+    (app_dir / "ret").mkdir(parents=True)
+    (app_dir / "exc").mkdir(parents=True)
+    (app_dir / "boundary.py").write_text(
+        "from chano import Boundary, Request\n"
+        "from chano.status import OK, NotFound\n\n"
+        "def recover_missing(request: Request, exc: NotFound) -> OK[dict[str, str]]:\n"
+        "    return OK({'recovered': exc.content.detail})\n\n"
+        "async def never_wrap(request: Request, call_next):\n"
+        "    raise AssertionError('wrap must not run on schedules')\n\n"
+        "boundary = Boundary(recover=[recover_missing], wrap=[never_wrap])\n"
+    )
+    (app_dir / "ret" / "schedule.py").write_text(
+        "from chano.status import NotFound\n\n"
+        'schedule = "0 * * * *"\n\n'
+        "def RUN():\n"
+        '    return NotFound("returned")\n'
+    )
+    (app_dir / "exc" / "schedule.py").write_text(
+        "from chano.status import NotFound\n\n"
+        'schedule = "0 * * * *"\n\n'
+        "def RUN():\n"
+        '    raise NotFound("raised")\n'
+    )
+
+    app = create_app(app_dir)
+    res_ret = asyncio.run(app.run_schedule("ret"))
+    assert isinstance(res_ret, Response)
+    assert res_ret.status_code == 200
+    assert json.loads(res_ret.body) == {"recovered": "returned"}
+
+    res_exc = asyncio.run(app.run_schedule("exc"))
+    assert isinstance(res_exc, Response)
+    assert res_exc.status_code == 200
+    assert json.loads(res_exc.body) == {"recovered": "raised"}
 
 
 # @lat: [[tests#Outcomes#Static typing fixtures]]

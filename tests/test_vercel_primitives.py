@@ -144,12 +144,15 @@ def test_queue_consume_sync_async_validation_and_depends(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "qval"\nversion = "0.1.0"\n',
-            "app/dependencies.py": (
+            "app/boundary.py": (
+                "from chano import Boundary\n"
                 "seen = []\n"
                 "def record_check():\n"
                 '    seen.append("checked")\n'
                 '    return "root-dep"\n'
-                "dependencies = [record_check]\n"
+                "async def never_wrap(request, call_next):\n"
+                '    raise RuntimeError("wrap must not run on queues")\n'
+                "boundary = Boundary(guards=[record_check], wrap=[never_wrap])\n"
             ),
             "app/orders/queue.py": (
                 "from typing import Annotated\n"
@@ -220,12 +223,11 @@ def test_queue_multi_consumer_dev_trigger_and_asgi_app(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "qmulti"\nversion = "0.1.0"\n',
-            "app/error.py": (
-                "from chano import JSONResponse\n"
-                "def handle_error(request, exc):\n"
-                "    if isinstance(exc, RuntimeError):\n"
-                '        return JSONResponse({"handled": str(exc)}, status_code=503)\n'
-                "    raise exc\n"
+            "app/boundary.py": (
+                "from chano import Boundary, JSONResponse, Request\n"
+                "def handle_runtime(request: Request, exc: RuntimeError):\n"
+                '    return JSONResponse({"handled": str(exc)}, status_code=503)\n'
+                "boundary = Boundary(recover=[handle_runtime])\n"
             ),
             "app/billing/queue.py": (
                 'topic = "orders"\n'
@@ -1075,11 +1077,14 @@ def test_schedule_run_sync_async_depends_and_asgi(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "srun"\nversion = "0.1.0"\n',
-            "app/dependencies.py": (
+            "app/boundary.py": (
+                "from chano import Boundary\n"
                 "log = []\n"
                 "def check():\n"
                 '    log.append("checked")\n'
-                "dependencies = [check]\n"
+                "async def never_wrap(request, call_next):\n"
+                '    raise RuntimeError("wrap must not run on schedules")\n'
+                "boundary = Boundary(guards=[check], wrap=[never_wrap])\n"
             ),
             "app/cleanup/schedule.py": (
                 "from typing import Annotated\n"

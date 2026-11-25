@@ -9,10 +9,12 @@ import mimetypes
 import re
 import sys
 import traceback
+import types
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Union, get_args, get_origin
 
 from chano.config import WorkflowConfig, normalize_base_path
 from chano.openapi import openapi_info, openapi_schema, swagger_html
@@ -22,20 +24,37 @@ from chano.responses import (
     Failure,
     HTMLResponse,
     JSONResponse,
+    Outcome,
     PlainTextResponse,
     Response,
+    _unwrap_type,
 )
 from chano.status import MethodNotAllowed, NotFound
 
 _PATH_PARAM = re.compile(r"\{(\w+)(:path)?\}")
 
-CallNext = Callable[[Request], Awaitable[Response]]
-Middleware = Callable[[Request, CallNext], Awaitable[Response]]
-ErrorHandler = Callable[[Request, Exception], Response | Awaitable[Response]]
+type CallNext = Callable[[Request], Awaitable[Response]]
+type Guard = Callable[..., object]
+type Recover = Callable[[Request, Any], Response | Awaitable[Response]]
+type Wrap = Callable[[Request, CallNext], Awaitable[Response]]
 ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
 AfterBackend = Literal["local", "wait_until"]
 
 _AFTER_BACKENDS = ("local", "wait_until")
+
+
+@dataclass(frozen=True)
+class Boundary:
+    """Folder-scoped guards, error recovery, and HTTP wrappers."""
+
+    guards: Sequence[Guard] = ()
+    recover: Sequence[Recover] = ()
+    wrap: Sequence[Wrap] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "guards", tuple(self.guards))
+        object.__setattr__(self, "recover", tuple(self.recover))
+        object.__setattr__(self, "wrap", tuple(self.wrap))
 
 
 class _AfterState:
@@ -137,9 +156,8 @@ def error_response(exc: Exception) -> Response:
     return PlainTextResponse("Internal Server Error", 500)
 
 
-def _call_sync_handler(handler: ErrorHandler, request: Request, exc: Exception) -> Any:
-    """Run a sync ``handle_error`` with ``exc`` active, so a bare ``raise``
-    in a worker thread re-raises it, and its traceback left as it was."""
+def _call_sync_handler(handler: Recover, request: Request, exc: Exception) -> Any:
+    """Run a sync recover function with ``exc`` active so a bare ``raise`` works."""
     tb = exc.__traceback__
     try:
         raise exc
@@ -155,46 +173,75 @@ def _is_async(handler: Callable[..., Any]) -> bool:
     )
 
 
-async def _error_boundary(
-    handlers: Sequence[ErrorHandler], request: Request, exc: Exception
+def _recover_annotation(fn: Recover) -> Any:
+    params = list(inspect.signature(fn, eval_str=True).parameters.values())
+    if len(params) < 2 or params[1].annotation is inspect.Parameter.empty:
+        return Exception
+    return params[1].annotation
+
+
+def _matches_recover(error: Exception, annotation: Any) -> bool:
+    annotation = _unwrap_type(annotation)
+    if annotation is Any or annotation is object:
+        return True
+    origin = get_origin(annotation)
+    if origin in (types.UnionType, Union):
+        return any(_matches_recover(error, arg) for arg in get_args(annotation))
+    if isinstance(origin, type):
+        if not isinstance(error, origin):
+            return False
+        args = get_args(annotation)
+        if issubclass(origin, Outcome) and len(args) == 1:
+            content_type = _unwrap_type(args[0])
+            if content_type is not Any and isinstance(content_type, type):
+                return isinstance(error.content, content_type)
+        return True
+    return isinstance(annotation, type) and isinstance(error, annotation)
+
+
+def _recover_candidates(boundaries: Sequence[Boundary]) -> tuple[Recover, ...]:
+    return tuple(fn for b in reversed(boundaries) for fn in b.recover)
+
+
+async def _run_recover(
+    candidates: Sequence[Recover], request: Request, exc: Exception
 ) -> Response:
-    """Hand ``exc`` to the nearest of ``handlers`` (root to leaf). Whatever
-    it raises, including a non-``Response`` result as ``TypeError``, goes
-    to the next ancestor; past the root, ``error_response`` maps it.
+    """Run matching recover functions (nearest folder first, list order)."""
+    for fn in candidates:
+        if not _matches_recover(exc, _recover_annotation(fn)):
+            continue
+        tb = exc.__traceback__
+        try:
+            try:
+                raise exc
+            except Exception:
+                exc.__traceback__ = tb
+                if _is_async(fn):
+                    response = fn(request, exc)
+                else:
+                    response = await asyncio.to_thread(
+                        _call_sync_handler, fn, request, exc
+                    )
+                if inspect.isawaitable(response):
+                    response = await response
+                if not isinstance(response, Response):
+                    name = getattr(fn, "__qualname__", repr(fn))
+                    raise TypeError(
+                        f"recover {fn.__module__}.{name} "
+                        f"returned {response!r}, not a Response"
+                    ) from None
+                return response
+        except Exception as raised:
+            exc = raised
+    return error_response(exc)
 
-    Async handlers run on the event loop; sync ones in a worker thread. An
-    awaitable result, such as a sync wrapper's coroutine, is awaited before
-    the ``Response`` check. Each ancestor runs inside the ``except`` of the
-    one below it, so a bare ``raise`` there re-raises the latest exception."""
-    if not handlers:
-        return error_response(exc)
-    *ancestors, handler = handlers
-    try:
-        if _is_async(handler):
-            response = handler(request, exc)
-        else:
-            response = await asyncio.to_thread(
-                _call_sync_handler, handler, request, exc
-            )
-        if inspect.isawaitable(response):  # still inside the caller's except
-            response = await response
-        if not isinstance(response, Response):
-            name = getattr(handler, "__qualname__", repr(handler))
-            raise TypeError(
-                f"handle_error {handler.__module__}.{name} "
-                f"returned {response!r}, not a Response"
-            )
-    except Exception as raised:
-        return await _error_boundary(ancestors, request, raised)
-    return response
 
-
-def _wrap(middleware: Middleware, call_next: CallNext) -> CallNext:
+def _wrap(wrapper: Wrap, call_next: CallNext) -> CallNext:
     async def call(request: Request) -> Response:
-        response = await middleware(request, call_next)
+        response = await wrapper(request, call_next)
         if not isinstance(response, Response):
             raise TypeError(
-                f"middleware {middleware.__module__}.{middleware.__qualname__} "
+                f"wrap {wrapper.__module__}.{wrapper.__qualname__} "
                 f"returned {response!r}, not a Response"
             )
         return response
@@ -245,10 +292,8 @@ class Chano:
         self.routes: list[tuple[str, re.Pattern[str], dict[str, Endpoint]]] = []
         self.hidden_operations: set[tuple[str, str]] = set()
         """``(path, method)`` pairs served but left out of the OpenAPI schema."""
-        self.middleware: dict[str, tuple[Middleware, ...]] = {}
-        """Each path's middleware chain, outermost first."""
-        self.error_handlers: dict[str, tuple[ErrorHandler, ...]] = {}
-        """Each path's error handlers, root to leaf; the leaf runs first."""
+        self.boundaries: dict[str, tuple[Boundary, ...]] = {}
+        """Each path's ancestor boundaries, root to leaf."""
         self._mounted_apps: dict[str, ASGIApp] = {}
         """Internal ASGI sub-apps mounted by exact path (excluded from OpenAPI)."""
         self.queues: tuple[Any, ...] = ()
@@ -311,20 +356,14 @@ class Chano:
         methods: list[str],
         *,
         include_in_schema: bool | None = None,
-        middleware: Sequence[Middleware] = (),
-        error_handlers: Sequence[ErrorHandler] = (),
-        dependencies: Sequence[Sequence[Callable[..., Any]]] = (),
+        boundaries: Sequence[Boundary] = (),
     ) -> None:
         """Register ``handler`` for ``path``; ``include_in_schema=False``
         (or ``@openapi(include_in_schema=False)`` on ``handler``) serves it
         without documenting it in OpenAPI.
 
-        ``middleware`` wraps every method of ``path``, outermost first.
-        ``error_handlers`` (root to leaf) handle its endpoint's errors,
-        nearest first. Each call for one path must pass the same chains.
-        ``dependencies`` holds one group of checks per segment, root to leaf;
-        they run in that order before ``handler``'s arguments, sharing their
-        per-request ``Depends`` cache."""
+        ``boundaries`` (root to leaf) supply guards, recover functions, and
+        wrappers for ``path``. Each call for one path must pass the same chain."""
         if include_in_schema is None:
             info = openapi_info(handler)
             include_in_schema = (
@@ -333,18 +372,15 @@ class Chano:
                 else info.include_in_schema
             )
         path_params = {m[1] for m in _PATH_PARAM.finditer(path)}
-        endpoint = Endpoint(handler, path_params, dependencies)
+        chain = tuple(boundaries)
+        endpoint = Endpoint(handler, path_params, [b.guards for b in chain])
         endpoints = next((e for p, _, e in self.routes if p == path), None)
-        chain, handlers = tuple(middleware), tuple(error_handlers)
         if endpoints is None:
             endpoints = {}
             self.routes.append((path, _compile_path(path), endpoints))
-            self.middleware[path] = chain
-            self.error_handlers[path] = handlers
-        elif self.middleware[path] != chain:
-            raise ValueError(f"conflicting middleware for route {path!r}")
-        elif self.error_handlers[path] != handlers:
-            raise ValueError(f"conflicting error handlers for route {path!r}")
+            self.boundaries[path] = chain
+        elif self.boundaries[path] != chain:
+            raise ValueError(f"conflicting boundaries for route {path!r}")
         for method in map(str.upper, methods):
             endpoints[method] = endpoint
             if include_in_schema:
@@ -424,15 +460,16 @@ class Chano:
         for path, pattern, endpoints in routes:
             if match := pattern.fullmatch(request.path):
                 request.path_params = match.groupdict()
-                call = self._endpoint_call(endpoints, self.error_handlers.get(path, ()))
-                for middleware in reversed(self.middleware.get(path, ())):
-                    call = _wrap(middleware, call)
+                boundaries = self.boundaries.get(path, ())
+                call = self._endpoint_call(endpoints, _recover_candidates(boundaries))
+                for wrapper in reversed([w for b in boundaries for w in b.wrap]):
+                    call = _wrap(wrapper, call)
                 return await call(request)
         return None
 
     @staticmethod
     def _endpoint_call(
-        endpoints: dict[str, Endpoint], error_handlers: Sequence[ErrorHandler]
+        endpoints: dict[str, Endpoint], recover: Sequence[Recover]
     ) -> CallNext:
         async def call(request: Request) -> Response:
             method = "GET" if request.method == "HEAD" else request.method
@@ -448,7 +485,7 @@ class Chano:
                     return result
                 return JSONResponse(result)
             except Exception as exc:
-                return await _error_boundary(error_handlers, request, exc)
+                return await _run_recover(recover, request, exc)
 
         return call
 
@@ -513,7 +550,7 @@ class EndpointASGIApp:
         endpoint: Endpoint,
         *,
         methods: Sequence[str] = ("POST",),
-        error_handlers: Sequence[ErrorHandler] = (),
+        boundaries: Sequence[Boundary] = (),
         after_backend: AfterBackend = "local",
     ) -> None:
         if after_backend not in _AFTER_BACKENDS:
@@ -523,7 +560,7 @@ class EndpointASGIApp:
             )
         self.endpoint = endpoint
         self.methods = tuple(dict.fromkeys(m.upper() for m in methods))
-        self.error_handlers = tuple(error_handlers)
+        self.boundaries = tuple(boundaries)
         self.after_backend: AfterBackend = after_backend
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -555,7 +592,9 @@ class EndpointASGIApp:
                 else:
                     response = JSONResponse(result)
             except Exception as exc:
-                response = await _error_boundary(self.error_handlers, request, exc)
+                response = await _run_recover(
+                    _recover_candidates(self.boundaries), request, exc
+                )
             await response(receive, send, include_body=request.method != "HEAD")
         except asyncio.CancelledError:
             cancelled = True

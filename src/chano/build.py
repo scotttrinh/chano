@@ -54,9 +54,7 @@ from chano.config import (
 from chano.openapi import swagger_html
 from chano.queues import LoadedQueue, load_all_queues
 from chano.routing import (
-    DEPENDENCIES_FILE,
-    ERROR_FILE,
-    MIDDLEWARE_FILE,
+    BOUNDARY_FILE,
     Route,
     create_app,
     discover_routes,
@@ -577,7 +575,7 @@ def _plan_function(route: Route, python: str, base_path: str) -> FunctionSpec:
         vc_config=config,
         trace_roots=(
             route.file,
-            *route.segment_files(MIDDLEWARE_FILE, ERROR_FILE, DEPENDENCIES_FILE),
+            *route.segment_files(BOUNDARY_FILE),
         ),
         include=_read_module_include(module, route.file),
         source_file=route.file,
@@ -597,7 +595,7 @@ def _plan_queue_function(loaded: LoadedQueue, python: str) -> FunctionSpec:
         vc_config=config,
         trace_roots=(
             loaded.spec.file,
-            *loaded.spec.segment_files(ERROR_FILE, DEPENDENCIES_FILE),
+            *loaded.spec.segment_files(BOUNDARY_FILE),
         ),
         include=include,
         required_distributions=(vercel_queue,),
@@ -615,7 +613,7 @@ def _plan_schedule_function(loaded: LoadedSchedule, python: str) -> FunctionSpec
         vc_config=config,
         trace_roots=(
             loaded.spec.file,
-            *loaded.spec.segment_files(ERROR_FILE, DEPENDENCIES_FILE),
+            *loaded.spec.segment_files(BOUNDARY_FILE),
         ),
         include=_read_module_include(loaded.module, loaded.spec.file),
         source_file=loaded.spec.file,

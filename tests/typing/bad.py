@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import msgspec
 
-from chano import Depends, HTTPBearer
+from chano import Boundary, CallNext, Depends, HTTPBearer, Request, Response
 from chano.status import Created, Forbidden, NotFound, Unauthorized
 
 
@@ -71,3 +71,16 @@ def raw_created_where_envelope_declared(item: Item) -> ApiCreated[Item]:
 
 def wrong_depends_param_type(user: str = Depends(current_user)) -> str:  # type-error
     return user
+
+
+def bad_recover_return(request: Request, error: Exception) -> str:
+    return str(error)
+
+
+def bad_sync_wrap(request: Request, call_next: CallNext) -> Response:
+    return NotFound("sync")
+
+
+bad_boundary_recover = Boundary(recover=[bad_recover_return])  # type-error
+bad_boundary_wrap = Boundary(wrap=[bad_sync_wrap])  # type-error
+bad_boundary_guard = Boundary(guards=[123])  # type-error

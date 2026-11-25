@@ -35,7 +35,7 @@ Dependencies are cached in a per-request dictionary keyed by callable identity (
 
 ## Inherited Checks
 
-An [[src/chano/params.py#Endpoint]] built with `dependencies` (one group of inherited checks per segment, root to leaf, from [[routing#Inherited Dependencies]]) runs them before resolving any handler argument.
+An [[src/chano/params.py#Endpoint]] built with `dependencies` (one group of inherited guards per segment, root to leaf, from [[routing#Boundary]]) runs them before resolving any handler argument.
 
 [[src/chano/params.py#Endpoint#call]] runs each check through [[src/chano/params.py#_depend]] with the same cache the handler's `Depends` uses, so a handler or nested dependency requesting a check's callable gets its cached result and the check runs once per request. A check that raises stops the request before the handler's arguments resolve; a check whose own inputs fail validation raises `RequestValidationError` right away, so no later check, handler dependency or handler runs. Check results are otherwise discarded. [[src/chano/params.py#Endpoint]] rejects a check for which [[src/chano/params.py#is_generator_callable]] holds (a sync or async generator function, or an instance whose `__call__` is one) with `TypeError`, since calling it would only create a generator. A wrapper (such as `functools.wraps`) can hide one, so [[src/chano/params.py#Endpoint#call]] also fails closed with `TypeError` when a check's result, fresh or from the shared cache, is a generator or async generator; the handler never runs. A `Depends` may still return a generator as an ordinary value.
 

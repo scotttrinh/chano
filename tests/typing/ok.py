@@ -4,7 +4,17 @@ from __future__ import annotations
 
 import msgspec
 
-from chano import Depends, ErrorDetail, HTTPBearer, Request, lazy
+from chano import (
+    Boundary,
+    CallNext,
+    Depends,
+    ErrorDetail,
+    HTTPBearer,
+    Request,
+    RequestValidationError,
+    Response,
+    lazy,
+)
 from chano.status import (
     OK,
     Accepted,
@@ -15,6 +25,7 @@ from chano.status import (
     NotModified,
     SeeOther,
     Unauthorized,
+    UnprocessableContent,
 )
 
 
@@ -128,3 +139,37 @@ def guarded(user: User = Depends(redirect_guard)) -> User:
 
 def explicit_error_detail() -> NotFound[ErrorDetail]:
     return NotFound(ErrorDetail(detail="gone"))
+
+
+class ApiUnprocessable(UnprocessableContent[Problem]):
+    def __init__(self, title: str) -> None:
+        super().__init__(Problem(title=title, status=self.status))
+
+
+def require_admin(user: User = Depends(current_user)) -> None | Forbidden:
+    if user.name != "scott":
+        return Forbidden("admins only")
+    return None
+
+
+def recover_invalid(
+    request: Request, error: RequestValidationError
+) -> ApiUnprocessable:
+    return ApiUnprocessable("bad input")
+
+
+async def recover_missing(request: Request, error: LookupError) -> ApiNotFound:
+    return ApiNotFound(str(error))
+
+
+async def request_id(request: Request, call_next: CallNext) -> Response:
+    response = await call_next(request)
+    response.headers["x-request-id"] = request.id
+    return response
+
+
+valid_boundary = Boundary(
+    guards=[require_admin],
+    recover=[recover_invalid, recover_missing],
+    wrap=[request_id],
+)

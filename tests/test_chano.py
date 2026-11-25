@@ -24,6 +24,7 @@ import pytest
 
 from chano import (
     Body,
+    Boundary,
     Chano,
     ChanoConfig,
     Cookie,
@@ -917,14 +918,15 @@ def test_segment_module_loading(tmp_path, isolated_imports):
         assert set(sys.modules) == before
 
 
-def middleware_source(name: str) -> str:
-    """Source for a ``middleware.py`` that records ``name>`` on the way in and
-    ``<name:status`` on the way out in ``mwlog.EVENTS``. ``x-stop: name``
+def middleware_source(name: str, *, include_boundary: bool = True) -> str:
+    """Source for a ``boundary.py`` wrapper that records ``name>`` on the way in
+    and ``<name:status`` on the way out in ``mwlog.EVENTS``. ``x-stop: name``
     short-circuits it with a 418; ``x-raise: name`` makes it raise
     ``x-raise-kind`` (``http``, ``validation`` or anything else)."""
+    tail = "\nboundary = Boundary(wrap=[middleware])\n" if include_boundary else ""
     return (
         "import mwlog\n"
-        "from chano import JSONResponse, RequestValidationError\n"
+        "from chano import Boundary, JSONResponse, RequestValidationError\n"
         "from chano.status import Forbidden\n\n"
         "async def middleware(request, call_next):\n"
         f"    mwlog.EVENTS.append({name + '>'!r})\n"
@@ -941,6 +943,7 @@ def middleware_source(name: str) -> str:
         f"    mwlog.EVENTS.append(f'<{name}:{{response.status_code}}')\n"
         f"    response.headers['x-seen-' + {name!r}] = str(response.status_code)\n"
         "    return response\n"
+        f"{tail}"
     )
 
 
@@ -969,14 +972,14 @@ def middleware_project(tmp_path, isolated_imports):
         tmp_path,
         {
             "mwlog.py": "EVENTS = []\n",
-            "app/middleware.py": middleware_source("root"),
-            "app/(group)/middleware.py": middleware_source("group"),
-            "app/(group)/admin/middleware.py": middleware_source("admin"),
+            "app/boundary.py": middleware_source("root"),
+            "app/(group)/boundary.py": middleware_source("group"),
+            "app/(group)/admin/boundary.py": middleware_source("admin"),
             "app/(group)/admin/route.py": MIDDLEWARE_ROUTE,
             "app/public/route.py": MIDDLEWARE_ROUTE,
-            "app/items/[id]/middleware.py": middleware_source("id"),
+            "app/items/[id]/boundary.py": middleware_source("id"),
             "app/items/[id]/route.py": MIDDLEWARE_ROUTE,
-            "app/items/[...rest]/middleware.py": middleware_source("rest"),
+            "app/items/[...rest]/boundary.py": middleware_source("rest"),
             "app/items/[...rest]/route.py": (
                 "def POST(rest: str):\n    return {'rest': rest}\n"
             ),
@@ -985,7 +988,7 @@ def middleware_project(tmp_path, isolated_imports):
     )
     app_dir = tmp_path / "app"
     dev = create_app(app_dir, public_dir=tmp_path / "public")
-    events: list[str] = sys.modules["mwlog"].EVENTS  # imported by middleware.py
+    events: list[str] = sys.modules["mwlog"].EVENTS  # imported by boundary.py
 
     def serve(
         factory, method, path, function: str | None = None, **kwargs
@@ -1134,24 +1137,24 @@ def test_middleware_skips_dev_files(middleware_project):
     assert events == []
 
 
-# @lat: [[tests#Middleware#Invalid middleware]]
+# @lat: [[tests#Boundary#Invalid boundary.py]]
 @pytest.mark.parametrize(
     "source",
     [
         "x = 1\n",
-        "middleware = 1\n",
-        "def middleware(request, call_next):\n    return call_next(request)\n",
+        "boundary = 1\n",
+        "boundary = {}\n",
     ],
 )
-def test_invalid_middleware(tmp_path, isolated_imports, source):
+def test_invalid_boundary_file(tmp_path, isolated_imports, source):
     write_project(
         tmp_path,
         {
-            "app/(group)/middleware.py": source,
+            "app/(group)/boundary.py": source,
             "app/(group)/a/route.py": "def GET():\n    return {}\n",
         },
     )
-    file = (tmp_path / "app" / "(group)" / "middleware.py").resolve()
+    file = (tmp_path / "app" / "(group)" / "boundary.py").resolve()
     for make_app in [
         lambda: create_app(tmp_path / "app"),
         lambda: create_route_app(tmp_path / "app", "a"),
@@ -1160,16 +1163,18 @@ def test_invalid_middleware(tmp_path, isolated_imports, source):
             make_app()
 
 
-# @lat: [[tests#Middleware#Non-response result]]
+# @lat: [[tests#Boundary#Non-response wrap result]]
 @pytest.mark.parametrize("factory", FACTORIES)
 def test_middleware_non_response(tmp_path, isolated_imports, factory):
     write_project(
         tmp_path,
         {
-            "app/middleware.py": (
+            "app/boundary.py": (
+                "from chano import Boundary\n\n"
                 "async def middleware(request, call_next):\n"
                 "    await call_next(request)\n"
-                "    return {'not': 'a response'}\n"
+                "    return {'not': 'a response'}\n\n"
+                "boundary = Boundary(wrap=[middleware])\n"
             ),
             "app/route.py": "def GET():\n    return {}\n",
         },
@@ -1183,29 +1188,35 @@ def test_middleware_non_response(tmp_path, isolated_imports, factory):
     assert response.text == "Internal Server Error"
 
 
-# @lat: [[tests#Middleware#Conflicting chains for one path]]
-def test_middleware_conflicting_chains(tmp_path, isolated_imports):
-    middleware = "async def middleware(request, call_next):\n    return None\n"
+# @lat: [[tests#Boundary#Conflicting boundaries for one path]]
+def test_boundary_conflicting_chains(tmp_path, isolated_imports):
+    boundary_src = (
+        "from chano import Boundary\n"
+        "async def w(request, call_next):\n    return await call_next(request)\n"
+        "boundary = Boundary(wrap=[w])\n"
+    )
     write_project(
         tmp_path,
         {
-            "app/(a)/middleware.py": middleware,
+            "app/(a)/boundary.py": boundary_src,
             "app/(a)/x/route.py": "def GET():\n    return {}\n",
             "app/(b)/x/route.py": "def POST():\n    return {}\n",
         },
     )
-    with pytest.raises(ValueError, match="conflicting middleware for route '/x'"):
+    with pytest.raises(ValueError, match="conflicting boundaries for route '/x'"):
         create_app(tmp_path / "app")
 
 
-def error_source(name: str, *, sync: bool) -> str:
-    """Source for an ``error.py`` that logs ``name!ExcType`` in ``mwlog.EVENTS``
-    and, by default, returns a JSON 503 naming itself and the exception. The
-    ``x-<name>`` header switches it to a bare ``raise`` (``reraise``), a new
-    ``Conflict(name)`` (``raise``), or returning ``None``."""
+def error_source(name: str, *, sync: bool, with_wrap: bool = False) -> str:
+    """Source for a ``boundary.py`` recover function that logs ``name!ExcType``
+    in ``mwlog.EVENTS`` and, by default, returns a JSON 503 naming itself and
+    the exception. The ``x-<name>`` header switches it to a bare ``raise``
+    (``reraise``), a new ``Conflict(name)`` (``raise``), or returning ``None``."""
+    wrap_code = middleware_source(name, include_boundary=False) if with_wrap else ""
+    wrap_arg = ", wrap=[middleware]" if with_wrap else ""
     return (
-        "import mwlog\n"
-        "from chano import JSONResponse\n"
+        wrap_code + "import mwlog\n"
+        "from chano import Boundary, JSONResponse\n"
         "from chano.status import Conflict\n\n"
         f"{'' if sync else 'async '}def handle_error(request, exc):\n"
         f"    mwlog.EVENTS.append(f'{name}!{{type(exc).__name__}}')\n"
@@ -1216,14 +1227,15 @@ def error_source(name: str, *, sync: bool) -> str:
         f"        raise Conflict({name!r})\n"
         "    if action == 'none':\n"
         "        return None\n"
-        f"    return JSONResponse({{'by': {name!r}, 'error': str(exc)}}, 503)\n"
+        f"    return JSONResponse({{'by': {name!r}, 'error': str(exc)}}, 503)\n\n"
+        f"boundary = Boundary(recover=[handle_error]{wrap_arg})\n"
     )
 
 
 @pytest.fixture
 def error_project(tmp_path, isolated_imports):
-    """Sync ``error.py`` at the root and in ``admin``, async in ``(group)``,
-    plus root and ``(group)`` middleware. ``/admin`` has all three error
+    """Sync recover at the root and in ``admin``, async in ``(group)``,
+    plus root and ``(group)`` wrap. ``/admin`` has all three boundary
     files, ``/other`` the group's and root's, ``/plain`` only the root's.
 
     Yields ``serve`` like ``middleware_project`` and the shared event log."""
@@ -1231,11 +1243,11 @@ def error_project(tmp_path, isolated_imports):
         tmp_path,
         {
             "mwlog.py": "EVENTS = []\n",
-            "app/middleware.py": middleware_source("root"),
-            "app/error.py": error_source("root", sync=True),
-            "app/(group)/middleware.py": middleware_source("group"),
-            "app/(group)/error.py": error_source("group", sync=False),
-            "app/(group)/admin/error.py": error_source("admin", sync=True),
+            "app/boundary.py": error_source("root", sync=True, with_wrap=True),
+            "app/(group)/boundary.py": error_source(
+                "group", sync=False, with_wrap=True
+            ),
+            "app/(group)/admin/boundary.py": error_source("admin", sync=True),
             "app/(group)/admin/route.py": MIDDLEWARE_ROUTE,
             "app/(group)/other/route.py": MIDDLEWARE_ROUTE,
             "app/plain/route.py": MIDDLEWARE_ROUTE,
@@ -1253,7 +1265,7 @@ def error_project(tmp_path, isolated_imports):
     return serve, events
 
 
-# @lat: [[tests#Error boundaries#Nearest error.py wins]]
+# @lat: [[tests#Error boundaries#Nearest recover wins]]
 @pytest.mark.parametrize("factory", FACTORIES)
 def test_error_nearest_wins(error_project, factory):
     serve, events = error_project
@@ -1391,7 +1403,7 @@ def test_error_unhandled_default(error_project, tmp_path, factory):
     assert (response.status_code, response.text) == (500, "Internal Server Error")
 
 
-# @lat: [[tests#Error boundaries#Middleware errors skip error.py]]
+# @lat: [[tests#Error boundaries#Wrapper errors skip recover]]
 @pytest.mark.parametrize("factory", FACTORIES)
 def test_error_skips_middleware_errors(error_project, factory):
     serve, events = error_project
@@ -1416,30 +1428,34 @@ ASYNC_RESULT = (
 )
 
 
-# @lat: [[tests#Error boundaries#Awaitable handlers]]
+# @lat: [[tests#Boundary#Awaitable recover handlers]]
 @pytest.mark.filterwarnings("error::RuntimeWarning")
 @pytest.mark.parametrize("factory", FACTORIES)
 def test_error_awaitable_handlers(tmp_path, isolated_imports, factory):
     write_project(
         tmp_path,
         {
-            "app/error.py": (
-                "from chano import JSONResponse\n\n"
+            "app/boundary.py": (
+                "from chano import Boundary, JSONResponse\n\n"
                 "def handle_error(request, exc):\n"
-                "    return JSONResponse({'by': 'root', 'error': str(exc)}, 500)\n"
+                "    return JSONResponse({'by': 'root', 'error': str(exc)}, 500)\n\n"
+                "boundary = Boundary(recover=[handle_error])\n"
             ),
-            "app/obj/error.py": ASYNC_RESULT
+            "app/obj/boundary.py": ASYNC_RESULT
             + (
+                "from chano import Boundary\n\n"
                 "class Handler:\n"
                 "    async def __call__(self, request, exc):\n"
                 "        return await respond(request, exc, 'obj')\n\n"
-                "handle_error = Handler()\n"
+                "boundary = Boundary(recover=[Handler()])\n"
             ),
             "app/obj/route.py": MIDDLEWARE_ROUTE,
-            "app/wrapper/error.py": ASYNC_RESULT
+            "app/wrapper/boundary.py": ASYNC_RESULT
             + (
+                "from chano import Boundary\n\n"
                 "def handle_error(request, exc):\n"
-                "    return respond(request, exc, 'wrapper')\n"
+                "    return respond(request, exc, 'wrapper')\n\n"
+                "boundary = Boundary(recover=[handle_error])\n"
             ),
             "app/wrapper/route.py": MIDDLEWARE_ROUTE,
             "mwlog.py": "EVENTS = []\n",
@@ -1457,39 +1473,6 @@ def test_error_awaitable_handlers(tmp_path, isolated_imports, factory):
         # A bare raise in the awaited body re-raises the original exception.
         response = client("GET", f"/{name}?fail=boom", headers={"x-reraise": "1"})
         assert response.json() == {"by": "root", "error": "boom"}
-
-
-# @lat: [[tests#Error boundaries#Invalid error.py]]
-@pytest.mark.parametrize("source", ["x = 1\n", "handle_error = 1\n"])
-def test_invalid_error_handler(tmp_path, isolated_imports, source):
-    write_project(
-        tmp_path,
-        {
-            "app/(group)/error.py": source,
-            "app/(group)/a/route.py": "def GET():\n    return {}\n",
-        },
-    )
-    file = (tmp_path / "app" / "(group)" / "error.py").resolve()
-    for make_app in [
-        lambda: create_app(tmp_path / "app"),
-        lambda: create_route_app(tmp_path / "app", "a"),
-    ]:
-        with pytest.raises(TypeError, match=re.escape(str(file))):
-            make_app()
-
-
-# @lat: [[tests#Error boundaries#Conflicting error.py for one path]]
-def test_error_conflicting_handlers(tmp_path, isolated_imports):
-    write_project(
-        tmp_path,
-        {
-            "app/(a)/error.py": "def handle_error(request, exc):\n    raise\n",
-            "app/(a)/x/route.py": "def GET():\n    return {}\n",
-            "app/(b)/x/route.py": "def POST():\n    return {}\n",
-        },
-    )
-    with pytest.raises(ValueError, match="conflicting error handlers for route '/x'"):
-        create_app(tmp_path / "app")
 
 
 # @lat: [[tests#Route module isolation]]
@@ -2682,13 +2665,15 @@ def test_trace_and_closure_edge_cases(tmp_path, isolated_imports, monkeypatch, c
 
 
 def lazy_middleware(*modules: str) -> str:
-    """Source for a pass-through ``middleware.py`` importing ``modules`` lazily,
+    """Source for a pass-through ``boundary.py`` importing ``modules`` lazily,
     so planning never needs them installed."""
     imports = "".join(f"    import {module}\n" for module in modules)
     return (
+        "from chano import Boundary\n\n"
         "async def middleware(request, call_next):\n"
         f"{imports}"
-        "    return await call_next(request)\n"
+        "    return await call_next(request)\n\n"
+        "boundary = Boundary(wrap=[middleware])\n"
     )
 
 
@@ -2720,18 +2705,23 @@ def test_segment_files_are_trace_roots(tmp_path, isolated_imports, monkeypatch, 
             "pyproject.toml": '[project]\nname = "segments"\nversion = "0"\n',
             "helpers/__init__.py": "",
             "helpers/audit.py": "import audit_pkg\n",
-            "app/middleware.py": lazy_middleware("root_mw_pkg"),
+            "app/boundary.py": lazy_middleware("root_mw_pkg"),
             "app/route.py": route,
-            "app/admin/middleware.py": lazy_middleware("admin_mw_pkg", "helpers.audit"),
-            "app/admin/error.py": (
+            "app/admin/boundary.py": (
+                "from chano import Boundary\n\n"
+                "async def middleware(request, call_next):\n"
+                "    import admin_mw_pkg\n"
+                "    import helpers.audit\n"
+                "    return await call_next(request)\n\n"
                 "def handle_error(request, exc):\n"
                 "    import admin_err_pkg\n"
-                "    raise exc\n"
+                "    raise exc\n\n"
+                "boundary = Boundary(recover=[handle_error], wrap=[middleware])\n"
             ),
             "app/admin/route.py": route,
             "app/admin/(team)/members/route.py": route,
             "app/admin/settings/[id]/route.py": route,
-            "app/public/middleware.py": lazy_middleware("public_mw_pkg"),
+            "app/public/boundary.py": lazy_middleware("public_mw_pkg"),
             "app/public/route.py": route,
             "app/(site)/about/route.py": route,
         },
@@ -2741,9 +2731,8 @@ def test_segment_files_are_trace_roots(tmp_path, isolated_imports, monkeypatch, 
     plan = plan_build(project, platform=None)
     by_name = {spec.name: spec for spec in plan.functions}
     admin_segments = (
-        app / "middleware.py",
-        app / "admin" / "middleware.py",
-        app / "admin" / "error.py",
+        app / "boundary.py",
+        app / "admin" / "boundary.py",
     )
     for name in ("admin", "admin/members", "admin/settings/[id]"):
         spec = by_name[name]
@@ -2751,13 +2740,13 @@ def test_segment_files_are_trace_roots(tmp_path, isolated_imports, monkeypatch, 
         assert spec.trace_roots == (spec.route.file, *admin_segments)
     assert by_name["public"].trace_roots == (
         app / "public" / "route.py",
-        app / "middleware.py",
-        app / "public" / "middleware.py",
+        app / "boundary.py",
+        app / "public" / "boundary.py",
     )
     for name in ("index", "about"):
         spec = by_name[name]
         assert spec.route is not None
-        assert spec.trace_roots == (spec.route.file, app / "middleware.py")
+        assert spec.trace_roots == (spec.route.file, app / "boundary.py")
 
     out = build(
         project, platform=None, output=tmp_path / "out", explain="admin/members"
@@ -2780,11 +2769,11 @@ def test_segment_files_are_trace_roots(tmp_path, isolated_imports, monkeypatch, 
         line.split()[0]: line for line in explain_out.splitlines() if "traced" in line
     }
     assert reasons.keys() == {"root-mw-pkg"} | admin_only
-    assert reasons["root-mw-pkg"].endswith("traced from app/middleware.py")
-    assert reasons["admin-mw-pkg"].endswith("traced from app/admin/middleware.py")
-    assert reasons["admin-err-pkg"].endswith("traced from app/admin/error.py")
+    assert reasons["root-mw-pkg"].endswith("traced from app/boundary.py")
+    assert reasons["admin-mw-pkg"].endswith("traced from app/admin/boundary.py")
+    assert reasons["admin-err-pkg"].endswith("traced from app/admin/boundary.py")
     assert reasons["audit-pkg"].endswith(
-        "traced from app/admin/middleware.py -> helpers/audit.py"
+        "traced from app/admin/boundary.py -> helpers/audit.py"
     )
     excluded = explain_out.split("Excluded (", 1)[1].split()
     assert "public-mw-pkg" in excluded
@@ -4739,14 +4728,19 @@ def inherited_project(root: Path) -> None:
             "pyproject.toml": '[project]\nname = "inherited"\nversion = "0"\n',
             "deplog.py": "EVENTS = []\n",
             "checks.py": INHERITED_CHECKS,
-            "app/(group)/dependencies.py": (
+            "app/(group)/boundary.py": (
+                "from chano import Boundary\n"
                 "from checks import group_area, require_user\n\n"
-                "dependencies = [group_area, require_user]\n"
+                + INHERITED_GROUP_ERROR
+                + "\nboundary = Boundary(\n"
+                "    guards=[group_area, require_user],\n"
+                "    recover=[handle_error],\n"
+                ")\n"
             ),
-            "app/(group)/error.py": INHERITED_GROUP_ERROR,
-            "app/(group)/admin/dependencies.py": (
+            "app/(group)/admin/boundary.py": (
+                "from chano import Boundary\n"
                 "from checks import admin_area, require_admin\n\n"
-                "dependencies = (admin_area, require_admin)\n"
+                "boundary = Boundary(guards=(admin_area, require_admin))\n"
             ),
             "app/(group)/admin/route.py": (
                 "import deplog\n"
@@ -4854,7 +4848,7 @@ def test_inherited_dependency_validation_stops_handler():
         return m
 
     app = Chano(docs=False)
-    app.add_route("/", handler, methods=["GET"], dependencies=[[check]])
+    app.add_route("/", handler, methods=["GET"], boundaries=[Boundary(guards=[check])])
     response = make_client(app)("GET", "/?n=x&m=1")
     assert response.status_code == 422
     assert [e["loc"] for e in response.json()["detail"]] == [["query", "n"]]
@@ -4971,7 +4965,13 @@ def test_inherited_dependency_response_precedence():
 
     app = Chano()
     app.add_route(
-        "/", handler, methods=["GET"], dependencies=[[root], [leaf_first, leaf_second]]
+        "/",
+        handler,
+        methods=["GET"],
+        boundaries=[
+            Boundary(guards=[root]),
+            Boundary(guards=[leaf_first, leaf_second]),
+        ],
     )
     responses = app.openapi()["paths"]["/"]["get"]["responses"]
     # Handler, then its direct dependencies, then checks nearest segment
@@ -5009,38 +5009,13 @@ def test_shared_dependency_inputs_documented_once():
         return a + b + q
 
     app = Chano()
-    app.add_route("/", handler, methods=["GET"], dependencies=[[shared]])
+    app.add_route("/", handler, methods=["GET"], boundaries=[Boundary(guards=[shared])])
     parameters = app.openapi()["paths"]["/"]["get"]["parameters"]
     assert [(p["name"], p["in"]) for p in parameters] == [
         ("q", "query"),
         ("x-key", "header"),
     ]
     assert make_client(app)("GET", "/?q=2", headers={"x-key": "k"}).json() == 6
-
-
-# @lat: [[tests#Inherited typed dependencies#Invalid dependencies.py]]
-@pytest.mark.parametrize(
-    "source",
-    [
-        "",
-        "dependencies = 'check'\n",
-        "dependencies = [1]\n",
-        "dependencies = {check}\n",
-        "from chano import Depends\ndependencies = [Depends(check)]\n",
-    ],
-)
-def test_invalid_dependencies_file(tmp_path, isolated_imports, source):
-    write_project(
-        tmp_path,
-        {
-            "app/dependencies.py": "def check():\n    return None\n\n" + source,
-            "app/route.py": "def GET():\n    return {}\n",
-        },
-    )
-    with pytest.raises(TypeError, match=r"dependencies.*dependencies\.py"):
-        create_app(tmp_path / "app")
-    with pytest.raises(TypeError, match=r"dependencies.*dependencies\.py"):
-        create_route_app(tmp_path / "app", "index")
 
 
 # @lat: [[tests#Inherited typed dependencies#Trace roots and bundling]]
@@ -5064,14 +5039,14 @@ def test_inherited_dependencies_trace_roots(tmp_path, isolated_imports, monkeypa
         project,
         {
             "pyproject.toml": '[project]\nname = "checks"\nversion = "0"\n',
-            "app/(group)/dependencies.py": (
+            "app/(group)/boundary.py": (
                 "from typing import Annotated\n"
-                "from chano import Header\n"
+                "from chano import Boundary, Header\n"
                 "from chano.status import Forbidden\n\n"
                 "def check(x_key: Annotated[str, Header()]) -> str | Forbidden:\n"
                 "    import check_pkg\n"
                 "    return x_key\n\n"
-                "dependencies = [check]\n"
+                "boundary = Boundary(guards=[check])\n"
             ),
             "app/(group)/admin/route.py": "def GET():\n    return {}\n",
             "app/public/route.py": "def GET():\n    return {}\n",
@@ -5082,7 +5057,7 @@ def test_inherited_dependencies_trace_roots(tmp_path, isolated_imports, monkeypa
     by_name = {spec.name: spec for spec in plan.functions}
     assert by_name["admin"].trace_roots == (
         app / "(group)" / "admin" / "route.py",
-        app / "(group)" / "dependencies.py",
+        app / "(group)" / "boundary.py",
     )
     assert by_name["public"].trace_roots == (app / "public" / "route.py",)
 
@@ -5125,7 +5100,9 @@ def test_async_callable_checks_block_the_handler():
 
     for check in (Deny(), lambda: deny_later()):
         app = Chano(docs=False)
-        app.add_route("/", handler, methods=["GET"], dependencies=[[check]])
+        app.add_route(
+            "/", handler, methods=["GET"], boundaries=[Boundary(guards=[check])]
+        )
         calls.clear()
         response = make_client(app)("GET", "/")
         assert response.status_code == 403
@@ -5159,8 +5136,10 @@ def test_unhashable_callable_checks(tmp_path, isolated_imports):
                 "        return x_role\n\n"
                 "admin = Role('admin')  # eq=True without frozen: unhashable\n"
             ),
-            "app/dependencies.py": (
-                "from roles import admin\n\ndependencies = [admin]\n"
+            "app/boundary.py": (
+                "from chano import Boundary\n"
+                "from roles import admin\n\n"
+                "boundary = Boundary(guards=[admin])\n"
             ),
             "app/route.py": (
                 "from typing import Annotated\n"
@@ -5200,7 +5179,7 @@ def test_shared_input_required_by_any_consumer():
         return q
 
     app = Chano()
-    app.add_route("/", handler, methods=["GET"], dependencies=[[check]])
+    app.add_route("/", handler, methods=["GET"], boundaries=[Boundary(guards=[check])])
     client = make_client(app)
     (parameter,) = client("GET", "/openapi.json").json()["paths"]["/"]["get"][
         "parameters"
@@ -5230,7 +5209,9 @@ def test_body_consumers_across_checks():
         return [x, b.y]
 
     app = Chano()
-    app.add_route("/", handler, methods=["POST"], dependencies=[[embedded_check]])
+    app.add_route(
+        "/", handler, methods=["POST"], boundaries=[Boundary(guards=[embedded_check])]
+    )
     client = make_client(app)
     schema = client("GET", "/openapi.json").json()
     body = schema["paths"]["/"]["post"]["requestBody"]
@@ -5284,7 +5265,12 @@ def test_distinct_equal_callables_each_run():
         return "ok"
 
     app = Chano(docs=False)
-    app.add_route("/", handler, methods=["GET"], dependencies=[[first], [second]])
+    app.add_route(
+        "/",
+        handler,
+        methods=["GET"],
+        boundaries=[Boundary(guards=[first]), Boundary(guards=[second])],
+    )
     response = make_client(app)("GET", "/")
     assert response.status_code == 403
     assert calls == ["gate:False", "gate:True"]
@@ -5307,7 +5293,9 @@ def test_bound_method_check_runs_once():
         return value
 
     app = Chano(docs=False)
-    app.add_route("/", handler, methods=["GET"], dependencies=[[guard.check]])
+    app.add_route(
+        "/", handler, methods=["GET"], boundaries=[Boundary(guards=[guard.check])]
+    )
     assert make_client(app)("GET", "/").json() == 1
     assert guard.calls == 1
 
@@ -5333,7 +5321,12 @@ def test_shared_inputs_keep_every_constraint():
         return None
 
     app = Chano()
-    app.add_route("/", handler, methods=["POST"], dependencies=[[check], [same_check]])
+    app.add_route(
+        "/",
+        handler,
+        methods=["POST"],
+        boundaries=[Boundary(guards=[check]), Boundary(guards=[same_check])],
+    )
     client = make_client(app)
     operation = client("GET", "/openapi.json").json()["paths"]["/"]["post"]
     both = {
@@ -5395,7 +5388,9 @@ def test_generator_checks_are_rejected(tmp_path, isolated_imports, check):
         return "ok"
 
     with pytest.raises(TypeError, match="generator"):
-        Chano().add_route("/", handler, methods=["GET"], dependencies=[[check]])
+        Chano().add_route(
+            "/", handler, methods=["GET"], boundaries=[Boundary(guards=[check])]
+        )
 
     sources = {
         "sync": "def check():\n    yield\n",
@@ -5406,13 +5401,17 @@ def test_generator_checks_are_rejected(tmp_path, isolated_imports, check):
         write_project(
             project,
             {
-                "app/dependencies.py": source + "\ndependencies = [check]\n",
+                "app/boundary.py": (
+                    "from chano import Boundary\n\n"
+                    + source
+                    + "\nboundary = Boundary(guards=[check])\n"
+                ),
                 "app/route.py": "def GET():\n    return {}\n",
             },
         )
-        with pytest.raises(TypeError, match=r"generator.*dependencies\.py"):
+        with pytest.raises(TypeError, match="generator"):
             create_app(project / "app")
-        with pytest.raises(TypeError, match=r"generator.*dependencies\.py"):
+        with pytest.raises(TypeError, match="generator"):
             create_route_app(project / "app", "index")
 
 
@@ -5425,7 +5424,7 @@ def test_mixed_list_and_scalar_query_inputs_are_rejected():
         return q
 
     app = Chano()
-    app.add_route("/", handler, methods=["GET"], dependencies=[[check]])
+    app.add_route("/", handler, methods=["GET"], boundaries=[Boundary(guards=[check])])
     with pytest.raises(ValueError, match="'q'"):
         app.openapi()
 
@@ -5434,7 +5433,7 @@ def test_mixed_list_and_scalar_query_inputs_are_rejected():
         return q
 
     same = Chano()
-    same.add_route("/", lists, methods=["GET"], dependencies=[[check]])
+    same.add_route("/", lists, methods=["GET"], boundaries=[Boundary(guards=[check])])
     (parameter,) = same.openapi()["paths"]["/"]["get"]["parameters"]
     assert parameter["schema"] == {"type": "array", "items": {"type": "integer"}}
 
@@ -5450,7 +5449,7 @@ def test_header_inputs_merge_case_insensitively():
         return key
 
     app = Chano()
-    app.add_route("/", handler, methods=["GET"], dependencies=[[check]])
+    app.add_route("/", handler, methods=["GET"], boundaries=[Boundary(guards=[check])])
     client = make_client(app)
     (parameter,) = client("GET", "/openapi.json").json()["paths"]["/"]["get"][
         "parameters"
@@ -5476,7 +5475,7 @@ def test_keyed_body_list_and_any_consumers():
         return value
 
     app = Chano()
-    app.add_route("/", handler, methods=["POST"], dependencies=[[check]])
+    app.add_route("/", handler, methods=["POST"], boundaries=[Boundary(guards=[check])])
     client = make_client(app)
     operation = client("GET", "/openapi.json").json()["paths"]["/"]["post"]
     body = operation["requestBody"]["content"]["application/json"]["schema"]
@@ -5520,9 +5519,14 @@ def test_checks_returning_generators_fail_closed():
         # The earlier check's Depends puts the generator in the shared cache.
         [[needs_wrapped], [wrapped]],
     ]
-    for dependencies in cases:
+    for guards_groups in cases:
         app = Chano(docs=False)
-        app.add_route("/", handler, methods=["GET"], dependencies=dependencies)
+        app.add_route(
+            "/",
+            handler,
+            methods=["GET"],
+            boundaries=[Boundary(guards=g) for g in guards_groups],
+        )
         calls.clear()
         response = make_client(app)("GET", "/")
         assert response.status_code == 500

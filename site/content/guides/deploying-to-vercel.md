@@ -48,7 +48,7 @@ To exclude an individual method from `/openapi.json` and `/docs` while still ser
 
 ## Dependency tree-shaking and `--explain`
 
-During `chano build`, Chano performs static AST import tracing starting from each `route.py` and its ancestor `middleware.py`, `error.py`, and `dependencies.py` files. Only the third-party distributions a route actually imports (plus their transitive dependencies) are hard-linked into that function's `_vendor/` directory.
+During `chano build`, Chano performs static AST import tracing starting from each `route.py` and its ancestor `boundary.py` files. Only the third-party distributions a route actually imports (plus their transitive dependencies) are hard-linked into that function's `_vendor/` directory.
 
 If only `app/api/reports/route.py` imports a heavy library, only that function pays the bundle-size cost. Lightweight endpoints like `/api/health` stay minimal.
 

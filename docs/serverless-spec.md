@@ -383,6 +383,8 @@ This feature applies to ordinary handler dependencies independently of inheritan
 
 ## 7. Segment files
 
+> **Superseded:** `middleware.py`, `error.py`, and `dependencies.py` have been replaced by a single typed `boundary.py` exporting `boundary = Boundary(guards=..., recover=..., wrap=...)` (see `docs/outcomes-and-boundary.md` §3 and `lat.md/routing.md`).
+
 Segment files apply to the routes in their directory and below. Each route composes only the files on its own ancestor path.
 
 ### 7.1 Discovery
