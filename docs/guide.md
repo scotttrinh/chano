@@ -52,7 +52,7 @@ Chano uses [`msgspec`](https://jcristharif.com/msgspec/) for request decoding, v
 
 ## 3. Project Setup and Layout
 
-Chano targets **Python 3.12+** and works with [`uv`](https://docs.astral.sh/uv/).
+Chano targets **Python 3.13+** and works with [`uv`](https://docs.astral.sh/uv/).
 
 A minimal project looks like this:
 
@@ -75,7 +75,7 @@ In `pyproject.toml`, declare `chano` as a runtime dependency and `chano[dev]` in
 [project]
 name = "my-app"
 version = "0.1.0"
-requires-python = ">=3.12"
+requires-python = ">=3.13"
 dependencies = ["chano"]
 
 [dependency-groups]
@@ -136,9 +136,9 @@ Like FastAPI, Chano reads your handler's signature and type annotations to deter
 
 For each parameter in a handler (or a `Depends` function):
 
-1. **`Depends(fn)`** (inside `Annotated[T, Depends(fn)]`) — calls `fn`, resolving its own signature recursively.
+1. **`Depends(fn)`** (as a default value: `user: User = Depends(fn)`) — calls `fn`, resolving its own signature recursively and short-circuiting if `fn` returns a `Response`.
 2. **`Request` annotation** — injects the raw `chano.Request` object.
-3. **Explicit markers** — `Query()`, `Header()`, `Cookie()`, or `Body()` inside `Annotated[...]` override automatic inference. Using a marker or `Depends()` as a default value raises `TypeError`.
+3. **Explicit markers** — `Query()`, `Header()`, `Cookie()`, or `Body()` inside `Annotated[...]` override automatic inference. Using a source marker as a default value raises `TypeError`.
    - `Header()` automatically maps Python underscores to HTTP hyphens (e.g., `x_request_id: Annotated[str | None, Header()] = None` reads `x-request-id`) unless you specify `Header(alias=...)`.
 4. **Path parameter** — if the parameter name matches a `[segment]` in the route's directory path, it comes from the URL path.
 5. **Request body model** — if the type is a `msgspec.Struct`, `dataclass`, `attrs` class, or `pydantic.BaseModel`, it is decoded from the JSON request body.
@@ -214,10 +214,10 @@ Because Chano deploys each `route.py` as an independent function, there is no ce
 
 ### 1. `Depends()` and `HTTPBearer()`
 
-`Annotated[T, Depends(fn)]` works like FastAPI's dependency injection:
-- Dependencies can declare their own parameters (queries, headers, cookies, bodies, or other `Depends`).
+`user: User = Depends(fn)` works like FastAPI's dependency injection, with static type checking:
+- Dependencies can declare their own parameters (queries, headers, cookies, bodies, or other `Depends`) and return `Outcome`/`Failure` responses to short-circuit the request.
 - Results are cached **per request** by callable identity, so if two dependencies both depend on `get_db`, `get_db` runs once for that request.
-- Because `Depends(...)` lives inside `Annotated[...]`, required dependencies have no default value and follow normal Python parameter ordering (place them before parameters with defaults).
+- Because `Depends(...)` is a default value, place dependency parameters after required path/body parameters (or use `*`).
 
 Dependencies can be plain functions, `async` functions, or callable instances—for example, sharing pagination or auth across handlers:
 
@@ -226,7 +226,8 @@ from typing import Annotated
 
 from msgspec import Meta, Struct
 
-from chano import Depends, HTTPBearer, HTTPException, Query, raises
+from chano import Depends, HTTPBearer, Query
+from chano.status import Unauthorized
 
 bearer = HTTPBearer()
 
@@ -243,22 +244,21 @@ def pagination(
     return PageParams(skip=skip, limit=limit)
 
 
-@raises(401, "Not authenticated")
-def current_user(token: Annotated[str, Depends(bearer)]) -> str:
+def current_user(token: str = Depends(bearer)) -> str | Unauthorized:
     if token != "secret":
-        raise HTTPException(401, "Not authenticated")
+        return Unauthorized("Not authenticated")
     return "alice"
 
 
 def GET(
-    user: Annotated[str, Depends(current_user)],
-    page: Annotated[PageParams, Depends(pagination)],
+    user: str = Depends(current_user),
+    page: PageParams = Depends(pagination),
 ):
     return {"user": user, "skip": page.skip, "limit": page.limit}
 ```
 
-- `Annotated[str, Depends(bearer)]` extracts the token from `Authorization: Bearer <token>`, returns `401` with `WWW-Authenticate: Bearer` if missing, and registers an HTTP Bearer security scheme in `openapi.json`.
-- `@raises(status, description)` documents error responses in `openapi.json` for any handler or dependency that uses it (note: it is documentation-only; your code still raises `HTTPException`).
+- `token: str = Depends(bearer)` extracts the token from `Authorization: Bearer <token>`, returns `Unauthorized` (`401` with `WWW-Authenticate: Bearer`) if missing, and registers an HTTP Bearer security scheme and `401` response in `openapi.json`.
+- Any `Outcome` or `Failure` in a handler's or dependency's return union is automatically documented in `openapi.json`.
 
 ### 2. `lazy()` Instead of Startup/Lifespan Hooks
 
@@ -267,8 +267,6 @@ In FastAPI, you create database pools or HTTP clients in a `lifespan` function a
 Use `lazy(factory)` to create a process-wide singleton on first call (thread-safe for sync factories, task-safe for async factories), which is then reused across warm invocations:
 
 ```python
-from typing import Annotated
-
 import httpx
 
 from chano import Depends, lazy
@@ -281,7 +279,7 @@ def create_http_client() -> httpx.AsyncClient:
 get_http_client = lazy(create_http_client)
 
 
-async def GET(client: Annotated[httpx.AsyncClient, Depends(get_http_client)]):
+async def GET(client: httpx.AsyncClient = Depends(get_http_client)):
     resp = await client.get("https://httpbin.org/uuid")
     return resp.json()
 ```
@@ -292,17 +290,16 @@ In FastAPI, you protect a group of endpoints with `APIRouter(dependencies=[Depen
 
 ```python
 # app/(admin)/dependencies.py
-from typing import Annotated
-
-from chano import Depends, HTTPBearer, HTTPException, raises
+from chano import Depends, HTTPBearer
+from chano.status import Forbidden
 
 bearer = HTTPBearer()
 
 
-@raises(403, "Admin access required")
-def require_admin(token: Annotated[str, Depends(bearer)]) -> None:
+def require_admin(token: str = Depends(bearer)) -> None | Forbidden:
     if token != "admin-secret":
-        raise HTTPException(403, "Admin access required")
+        return Forbidden("Admin access required")
+    return None
 
 
 dependencies = [require_admin]
@@ -337,13 +334,18 @@ To customize error responses for a subtree of routes, add an `error.py` exportin
 
 ```python
 # app/api/error.py
-from chano import HTTPException, JSONResponse, Request, Response
+from chano import ErrorDetail, Failure, JSONResponse, Request, Response
 
 
 def handle_error(request: Request, exc: Exception) -> Response:
-    if isinstance(exc, HTTPException):
+    if isinstance(exc, Failure):
+        detail = (
+            exc.content.detail
+            if isinstance(exc.content, ErrorDetail)
+            else exc.content
+        )
         return JSONResponse(
-            {"error": exc.detail, "path": request.path},
+            {"error": detail, "path": request.path},
             status_code=exc.status_code,
             headers=exc.headers,
         )

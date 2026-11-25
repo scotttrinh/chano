@@ -2,7 +2,8 @@ from typing import Annotated
 
 from msgspec import Meta, Struct
 
-from chano import Depends, HTTPBearer, HTTPException, raises
+from chano import Depends, HTTPBearer
+from chano.status import Unauthorized
 
 # Per-function settings, like Next.js route segment config.
 max_duration = 10
@@ -16,10 +17,9 @@ class Item(Struct):
 bearer = HTTPBearer()
 
 
-@raises(401, "Not authenticated")
-def current_user(token: Annotated[str, Depends(bearer)]) -> str:
+def current_user(token: str = Depends(bearer)) -> str | Unauthorized:
     if token != "secret":
-        raise HTTPException(401, "Not authenticated")
+        return Unauthorized("Not authenticated")
     return "scott"
 
 
@@ -28,8 +28,6 @@ def GET(item_id: int, verbose: bool = False):
     return {"item_id": item_id, "verbose": verbose}
 
 
-async def PUT(
-    item_id: int, item: Item, user: Annotated[str, Depends(current_user)]
-) -> Item:
+async def PUT(item_id: int, item: Item, user: str = Depends(current_user)) -> Item:
     """Replace an item. Requires `Authorization: Bearer secret`."""
     return item

@@ -9,31 +9,29 @@ nav_title: Application structure
 
 ## Dependencies and authentication
 
-`Annotated[T, Depends(fn)]` resolves dependencies recursively and caches results **per request** by callable identity. If two dependencies both request `get_user`, it runs once for that request.
+`user: User = Depends(fn)` resolves dependencies recursively, checks the parameter type against `fn`'s return type, and caches results **per request** by callable identity. If two dependencies both request `get_user`, it runs once for that request.
 
-Dependencies can declare their own validated parameters (queries, headers, cookies, bodies) and other dependencies. For Bearer authentication, combine `HTTPBearer()` with `@raises`:
+Dependencies can declare their own validated parameters (queries, headers, cookies, bodies), other dependencies, and failure or redirect outcomes in their return annotation. For Bearer authentication, combine `HTTPBearer()` with `chano.status`:
 
 ```python
-from typing import Annotated
-
-from chano import Depends, HTTPBearer, HTTPException, raises
+from chano import Depends, HTTPBearer
+from chano.status import Unauthorized
 
 bearer = HTTPBearer()
 
 
-@raises(401, "Not authenticated")
-def current_user(token: Annotated[str, Depends(bearer)]) -> str:
+def current_user(token: str = Depends(bearer)) -> str | Unauthorized:
     if token != "secret":
-        raise HTTPException(401, "Not authenticated")
+        return Unauthorized("Not authenticated")
     return "alice"
 
 
-def GET(user: Annotated[str, Depends(current_user)]):
+def GET(user: str = Depends(current_user)):
     return {"user": user}
 ```
 
-- `Annotated[str, Depends(bearer)]` reads `Authorization: Bearer <token>`, returns `401` with `WWW-Authenticate: Bearer` when missing, and registers an HTTP Bearer security scheme in `openapi.json`.
-- `@raises(status, description)` documents error responses in `openapi.json` for every handler or dependency that uses it. It is documentation-only; your code still raises `HTTPException`.
+- `token: str = Depends(bearer)` reads `Authorization: Bearer <token>`, returns `Unauthorized` (`401` with `WWW-Authenticate: Bearer`) when missing, registers an HTTP Bearer security scheme in `openapi.json`, and documents `401` automatically.
+- Returning any `Response` (such as `Unauthorized(...)` or `SeeOther("/login")`) from a dependency short-circuits the request before later dependencies or the handler run.
 
 You can also extract reusable, validated inputs into a dependency:
 
@@ -57,7 +55,7 @@ def pagination(
     return Pagination(skip=skip, limit=limit)
 
 
-def GET(page: Annotated[Pagination, Depends(pagination)]):
+def GET(page: Pagination = Depends(pagination)):
     return {"skip": page.skip, "limit": page.limit}
 ```
 
@@ -67,17 +65,20 @@ To protect a subtree of routes without repeating `Depends(...)` in every handler
 
 ```python
 # app/(admin)/dependencies.py
-from typing import Annotated
-
-from chano import Depends, HTTPBearer, HTTPException, raises
+from chano import Depends, HTTPBearer
+from chano.status import Forbidden
 
 bearer = HTTPBearer()
 
 
-@raises(403, "Admin access required")
-def require_admin(token: Annotated[str, Depends(bearer)]) -> None:
+class AdminRequired(Forbidden):
+    """Admin access required"""
+
+
+def require_admin(token: str = Depends(bearer)) -> None | AdminRequired:
     if token != "admin-secret":
-        raise HTTPException(403, "Admin access required")
+        return AdminRequired("Admin access required")
+    return None
 
 
 dependencies = [require_admin]
@@ -112,13 +113,18 @@ Add an `error.py` exporting `handle_error(request, exc) -> Response` (sync or as
 
 ```python
 # app/api/error.py
-from chano import HTTPException, JSONResponse, Request, Response
+from chano import ErrorDetail, Failure, JSONResponse, Request, Response
 
 
 def handle_error(request: Request, exc: Exception) -> Response:
-    if isinstance(exc, HTTPException):
+    if isinstance(exc, Failure):
+        detail = (
+            exc.content.detail
+            if isinstance(exc.content, ErrorDetail)
+            else exc.content
+        )
         return JSONResponse(
-            {"error": exc.detail, "path": request.path},
+            {"error": detail, "path": request.path},
             status_code=exc.status_code,
             headers=exc.headers,
         )
@@ -132,8 +138,6 @@ Error boundaries run **leaf-to-root** (nearest wins). If `handle_error` re-raise
 With Vercel Functions, there is no global app startup. Use `lazy(factory)` to initialize a process-wide client or pool on first call and reuse it across warm invocations:
 
 ```python
-from typing import Annotated
-
 import httpx
 
 from chano import Depends, lazy
@@ -146,7 +150,7 @@ def create_http_client() -> httpx.AsyncClient:
 get_http_client = lazy(create_http_client)
 
 
-async def GET(client: Annotated[httpx.AsyncClient, Depends(get_http_client)]):
+async def GET(client: httpx.AsyncClient = Depends(get_http_client)):
     resp = await client.get("https://httpbin.org/uuid")
     return resp.json()
 ```

@@ -16,7 +16,7 @@ Verify `422` `RequestValidationError` responses and `loc` paths for invalid path
 
 ## Body and dependencies
 
-Verify JSON body decoding alongside `Depends` and `HTTPBearer` resolution, a missing credential's `401` with `WWW-Authenticate: Bearer`, and a wrong token's `HTTPException` `401`.
+Verify JSON body decoding alongside `Depends` and `HTTPBearer` resolution, a missing credential's `401` with `WWW-Authenticate: Bearer`, and a wrong token's `Unauthorized` `401`.
 
 ## Dev docs and static files
 
@@ -84,11 +84,11 @@ A middleware that returns a response without calling `call_next` skips inner mid
 
 ### Sees the error response
 
-A handler's `HTTPException` 401 (with headers), a query `RequestValidationError` 422, and an unhandled 500 reach every middleware as a `Response` from `call_next`, which can still edit it.
+A handler's `Unauthorized` 401 (with headers), a query `RequestValidationError` 422, and an unhandled 500 reach every middleware as a `Response` from `call_next`, which can still edit it.
 
 ### Middleware errors get the default mapping
 
-`HTTPException`, `RequestValidationError` and other exceptions raised by middleware propagate past the outer middleware and become JSON 403 with headers, JSON 422, and plain-text 500.
+`Failure`, `RequestValidationError` and other exceptions raised by middleware propagate past the outer middleware and become JSON 403 with headers, JSON 422, and plain-text 500.
 
 ### Skips unmatched paths but runs on 405
 
@@ -210,7 +210,7 @@ Verify [[src/chano/build.py#build]] on a uv workspace with `apps/api`, `packages
 
 ## Full-stack example build
 
-Verify [[examples/fullstack]] declares the Vercel Services config and Python 3.12 pin, builds [[examples/fullstack/backend]] as a uv workspace member under `/api`, emits prefixed docs/static/functions without `uvicorn` in `_vendor/`, and invokes each built function standalone.
+Verify [[examples/fullstack]] declares the Vercel Services config and Python 3.13 pin, builds [[examples/fullstack/backend]] as a uv workspace member under `/api`, emits prefixed docs/static/functions without `uvicorn` in `_vendor/`, and invokes each built function standalone.
 
 ## Dev requires uvicorn
 
@@ -366,9 +366,9 @@ Verify [[src/chano/openapi.py#openapi]] sets `summary`, `description`, `operatio
 
 ## Explicit security and responses
 
-Verify a protected operation references one `HTTPBearer` scheme in `security` with no credential header parameter, a public sibling has no `security`, and only `raises`-declared `401`/`403` join `200`/`422`.
+Verify a protected operation references one `HTTPBearer` scheme in `security` with no credential header parameter, a public sibling has no `security`, and `Outcome` return annotations document `401`/`403` alongside `200`/`422`.
 
-The same project checks that a dependency raising if called still documents its scheme, that a hidden protected route leaks no scheme into `components.securitySchemes`, that the build's static `openapi.json` matches dev, and that the protected route enforces its token.
+The same project checks that a dependency raising if called still documents its scheme and `HTTPBearer`'s `401`, that a hidden protected route leaks no scheme into `components.securitySchemes`, that the build's static `openapi.json` matches dev, and that the protected route enforces its token.
 
 ## HTTP bearer credentials
 
@@ -380,15 +380,7 @@ Verify `HTTPBearer` names outside the OpenAPI component-name pattern (empty, spa
 
 ## Declared response precedence
 
-Verify through the generated schema that the outermost stacked `raises` wins, a handler beats its dependencies, and a direct dependency beats a nested one in an earlier parameter.
-
-## Declared responses must be errors
-
-Verify `raises` rejects success, redirect-boundary and out-of-range statuses with `ValueError`, so only error responses can be declared.
-
-## Declared response statuses must be integers
-
-Verify `raises` rejects non-`int` statuses (`401.5`, `"401"`, `True`, `None`) with `TypeError`, so a response key such as `"401.5"` never reaches the schema.
+Verify through the generated schema that a handler's outcome docstring beats its dependencies, and a direct dependency beats a nested one in an earlier parameter.
 
 ## Inherited typed dependencies
 
@@ -418,7 +410,7 @@ The build's `openapi.json` matches dev, and the public sibling documents no secu
 
 ### Declared response precedence
 
-Verify a repeated `raises` status prefers the handler, then its direct dependency, then inherited checks nearest segment first and, within a segment, the first declared.
+Verify a repeated outcome status prefers the handler, then its direct dependency, then inherited checks nearest segment first and, within a segment, the first declared.
 
 ### Async callable checks
 
@@ -739,3 +731,35 @@ Verify multi-namespace `Workflows` registries mount `/.well-known/workflow/v1/fl
 ## Combined Vercel primitives
 
 Verify a single project combining HTTP `route.py`, `queue.py`, `schedule.py`, and `[[tool.vercel.workflows]]` builds cleanly with all functions, `config.json` sections, and isolated OpenAPI output.
+
+## Outcomes
+
+Tests for [[src/chano/responses.py#Outcome]], [[src/chano/responses.py#Failure]], [[src/chano/status.py]], OpenAPI return-annotation schemas, queue retries, and static typing fixtures.
+
+### Returned and raised outcomes
+
+Verify status, body, headers, cookies, and bodyless framing (`1xx`, `204`, `304`, `None`) for returned and raised outcomes, `TypeError` on abstract `Outcome`/`Failure`, and `RequestValidationError` as a `Failure`.
+
+### Returned failures reach error boundaries
+
+Verify a returned `Failure` passes through `error.py` identically to a raised `Failure`.
+
+### OpenAPI from return annotations
+
+Verify union branches, PEP 695 aliases, generic envelope subclasses, custom media types, dependency and guard outcomes, same-status `anyOf`, docstring vs HTTP reason descriptions, `HTTPBearer`'s automatic `401`, and `422` on request inputs.
+
+### Queue retry on returned and raised Failure
+
+Verify a queue consumer returning or raising a `Failure` triggers a retry unless an inherited `error.py` recovers it to a status below `400`.
+
+### Static typing fixtures
+
+Verify `ty check` passes on [[tests/typing/ok.py]] and reports errors on the exact marked lines of [[tests/typing/bad.py]].
+
+## Checked Depends
+
+Tests for default-value [[src/chano/params.py#Depends]] short-circuiting and caching.
+
+### Short-circuiting and caching
+
+Verify a dependency or inherited check returning a `Failure` or `SeeOther` short-circuits later dependencies and the handler, while a shared dependency returning a value is cached once per request.

@@ -2,25 +2,18 @@ from __future__ import annotations
 
 from typing import Any
 
+import msgspec
 
-class HTTPException(Exception):
-    """Raise from a handler or dependency to return an error response."""
-
-    def __init__(
-        self,
-        status_code: int,
-        detail: Any = None,
-        headers: dict[str, str] | None = None,
-    ) -> None:
-        self.status_code = status_code
-        self.detail = detail
-        self.headers = headers
-        super().__init__(f"{status_code}: {detail}")
+from chano.status import UnprocessableContent
 
 
-class RequestValidationError(Exception):
-    """The request's parameters or body did not match the handler signature."""
+class ValidationErrorDetail(msgspec.Struct):
+    detail: list[dict[str, Any]]
+
+
+class RequestValidationError(UnprocessableContent[ValidationErrorDetail]):
+    """Validation Error"""
 
     def __init__(self, errors: list[dict[str, Any]]) -> None:
         self.errors = errors
-        super().__init__(errors)
+        super().__init__(ValidationErrorDetail(detail=errors))

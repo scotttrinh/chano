@@ -38,6 +38,17 @@ Annotate any handler or dependency parameter with `request: Request` to receive 
 
 Outside Vercel, `x-vercel-*` and `x-forwarded-for` headers are client-supplied and must not be trusted for authorization.
 
+## Outcomes and `chano.status`
+
+`Outcome[T]`, `Failure[T = ErrorDetail]`, and `ErrorDetail` are exported from `chano`. `Outcome` is a `Response` whose status is fixed by its class and whose payload is JSON-encoded (`None` and bodyless statuses `1xx`, `204`, `304` send no body). `Failure` is both an `Outcome` and an `Exception`—return it for static type checking or raise it from deep code.
+
+Named statuses in `chano.status`:
+
+| Category | Classes |
+| --- | --- |
+| Success / redirect | `OK` (200), `Created` (201), `Accepted` (202), `NoContent` (204), `SeeOther` (303), `NotModified` (304) |
+| Failures | `BadRequest` (400), `Unauthorized` (401), `Forbidden` (403), `NotFound` (404), `MethodNotAllowed` (405), `Conflict` (409), `Gone` (410), `UnprocessableContent` (422), `TooManyRequests` (429), `InternalServerError` (500), `ServiceUnavailable` (503) |
+
 ## Buffered responses
 
 | Class | Default status | Default `Content-Type` | Notes |

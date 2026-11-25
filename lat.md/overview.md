@@ -12,6 +12,7 @@ In production builds ([[src/chano/build.py#build]]), each `route.py` becomes an 
 
 Chano intentionally replaces general-purpose ASGI/validation stacks with a minimal core tailored to cold-start size and build-time generation.
 
+- **Typed outcomes and checked `Depends`**: [[src/chano/responses.py#Outcome]] and [[src/chano/responses.py#Failure]] (with named statuses in [[src/chano/status.py]]) put status codes and error payloads into handler and dependency return unions, checked statically by `ty` and read directly by OpenAPI. Dependencies use default-value [[src/chano/params.py#Depends]] so parameter types are verified against dependency return types and any returned [[src/chano/responses.py#Response]] short-circuits the request.
 - **Minimal ASGI core**: [[src/chano/app.py#Chano]] implements ASGI HTTP and no-op lifespan handling directly instead of depending on FastAPI or Starlette, keeping vendored function payloads small.
 - **msgspec over Pydantic**: Request body decoding, parameter conversion, JSON serialization ([[src/chano/responses.py#JSONResponse]]), and OpenAPI 3.1 schema generation ([[src/chano/openapi.py#openapi_schema]]) all use `msgspec` for single-pass validation without Pydantic.
 - **Config without imports**: `[tool.chano]` is parsed with `tomllib` before any route loads; its `base_path` prefixes every URL in dev and in the build ([[config]]).

@@ -3,7 +3,7 @@ title: Deploying to Vercel
 description: Build Vercel Build Output API v3 artifacts, tune per-route function settings, inspect tree-shaking, and deploy to production.
 lede: Compile your Chano app into isolated Vercel Functions and static CDN assets, inspect bundle sizes, and deploy with the Vercel CLI.
 section: guides
-order: 4
+order: 5
 nav_title: Deploying to Vercel
 ---
 

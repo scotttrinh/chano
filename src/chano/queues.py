@@ -48,7 +48,7 @@ from chano.app import (
 )
 from chano.params import Endpoint, is_generator_callable
 from chano.requests import Message, Receive, Request, Scope, Send
-from chano.responses import PlainTextResponse, Response
+from chano.responses import Failure, PlainTextResponse, Response
 from chano.routing import (
     DEPENDENCIES_FILE,
     ERROR_FILE,
@@ -545,6 +545,8 @@ def _make_queue_subscriber(
         try:
             try:
                 result = await loaded.endpoint.call(request)
+                if isinstance(result, Failure):
+                    raise result
             except Exception as exc:
                 if loaded.error_handlers:
                     response = await _error_boundary(

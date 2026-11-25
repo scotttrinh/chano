@@ -5,8 +5,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from chano.exceptions import HTTPException
 from chano.requests import Request
+from chano.status import Unauthorized
 
 # OpenAPI 3.1 requires component names to match this.
 _COMPONENT_NAME = re.compile(r"[a-zA-Z0-9._-]+")
@@ -15,10 +15,10 @@ _COMPONENT_NAME = re.compile(r"[a-zA-Z0-9._-]+")
 class HTTPBearer:
     """A dependency returning the token from ``Authorization: Bearer <token>``.
 
-    Use it as ``token: Annotated[str, Depends(bearer)]``. A missing or non-bearer
-    credential gets a ``401`` with ``WWW-Authenticate: Bearer``. OpenAPI
-    documents it once under ``components.securitySchemes[name]`` and lists it
-    in the ``security`` of every operation that depends on it.
+    Use it as ``token: str = Depends(bearer)``. A missing or non-bearer
+    credential returns ``Unauthorized`` with ``WWW-Authenticate: Bearer``.
+    OpenAPI documents it once under ``components.securitySchemes[name]`` and
+    lists it in the ``security`` of every operation that depends on it.
     """
 
     def __init__(self, name: str = "HTTPBearer") -> None:
@@ -32,11 +32,11 @@ class HTTPBearer:
     def openapi(self) -> dict[str, Any]:
         return {"type": "http", "scheme": "bearer"}
 
-    def __call__(self, request: Request) -> str:
+    def __call__(self, request: Request) -> str | Unauthorized:
         scheme, _, token = request.headers.get("authorization", "").partition(" ")
         token = token.strip()
         if scheme.lower() != "bearer" or not token:
-            raise HTTPException(
-                401, "Not authenticated", {"www-authenticate": "Bearer"}
+            return Unauthorized(
+                "Not authenticated", headers={"www-authenticate": "Bearer"}
             )
         return token

@@ -35,10 +35,10 @@ from typing import Any
 
 from chano.app import AfterBackend, Chano, ErrorHandler, Middleware
 from chano.config import normalize_base_path, project_base_path, project_config
-from chano.exceptions import HTTPException
 from chano.params import is_generator_callable
 from chano.requests import Request
 from chano.responses import Response
+from chano.status import NotFound
 
 HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 ROUTE_FILE = "route.py"
@@ -305,7 +305,7 @@ def create_app(
             try:
                 matches = resolve_queues(queues, topic, consumer=consumer)
             except QueueNotFoundError as exc:
-                raise HTTPException(404, str(exc)) from None
+                raise NotFound(str(exc)) from None
             body = await request.body()
             result = await invoke_resolved_queues(
                 matches,
@@ -348,7 +348,7 @@ def create_app(
             try:
                 resolved = resolve_schedule(schedules, target)
             except ScheduleNotFoundError as exc:
-                raise HTTPException(404, str(exc)) from None
+                raise NotFound(str(exc)) from None
             result = await invoke_loaded_schedule(resolved, headers=request.headers)
             if isinstance(result, Response):
                 return result

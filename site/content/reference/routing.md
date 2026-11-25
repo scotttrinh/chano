@@ -103,8 +103,8 @@ Exports `async def middleware(request: Request, call_next) -> Response`:
 Exports `def handle_error(request: Request, exc: Exception) -> Response` or `async def handle_error(...)`:
 
 - Executes **leaf-to-root** (nearest directory first) inside the innermost middleware.
-- Handles `HTTPException`, `RequestValidationError`, `405` method mismatches, and unhandled endpoint exceptions.
-- Re-raising (a bare `raise` or a new exception) passes the exception to the next ancestor `error.py`, then to Chano's default error mapping (`422` for validation, `HTTPException` JSON, or `500` plain text).
+- Handles returned and raised `Failure` outcomes, `RequestValidationError`, `405` method mismatches, and unhandled endpoint exceptions.
+- Re-raising (a bare `raise` or a new exception) passes the exception to the next ancestor `error.py`, then to Chano's default error mapping (`Failure` sent as-is, or `500` plain text).
 - Exceptions raised by middleware bypass `error.py` and use Chano's default error mapping.
 
 ### `dependencies.py`
@@ -114,7 +114,7 @@ Exports `dependencies: list[Callable] | tuple[Callable, ...]`:
 - Executes **root-to-leaf** in declared order before any handler argument is resolved.
 - Each item is a bare callable (not wrapped in `Depends(...)`) and must not be a generator or async generator.
 - Shares the per-request dependency cache with handler `Depends(...)`, so a callable listed in `dependencies.py` and requested via `Depends()` runs once per request.
-- Any `HTTPBearer` or `@raises` declarations on inherited checks are included in generated OpenAPI schemas.
+- Any `HTTPBearer` or `Outcome` return annotations on inherited checks are included in generated OpenAPI schemas.
 
 ## Private Vercel primitive files
 

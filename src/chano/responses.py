@@ -1,13 +1,29 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import math
+import operator
 import re
+import types
 from collections.abc import AsyncIterable, AsyncIterator, Coroutine, Iterable
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from email.utils import format_datetime
 from http.cookies import CookieError, SimpleCookie
-from typing import Any, Literal
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    ClassVar,
+    Literal,
+    TypeAliasType,
+    TypeVar,
+    Union,
+    get_args,
+    get_origin,
+    overload,
+)
 
 import msgspec
 
@@ -160,6 +176,174 @@ class Response:
         await send(self._start_message())
         body = self.body if include_body else b""
         await send({"type": "http.response.body", "body": body})
+
+
+class ErrorDetail(msgspec.Struct):
+    """Default JSON payload for ``Failure`` instances created with a ``str``."""
+
+    detail: str
+
+
+def _type_param_mapping(obj: Any, args: tuple[Any, ...]) -> dict[Any, Any]:
+    params = getattr(obj, "__type_params__", ()) or getattr(obj, "__parameters__", ())
+    mapping: dict[Any, Any] = {}
+    for i, param in enumerate(params):
+        if i < len(args):
+            mapping[param] = args[i]
+        elif hasattr(param, "has_default") and param.has_default():
+            mapping[param] = _substitute_typevars(param.__default__, mapping)
+        else:
+            mapping[param] = Any
+    return mapping
+
+
+def _unwrap_type(annotation: Any) -> Any:
+    while True:
+        origin = get_origin(annotation)
+        if origin is Annotated:
+            annotation = get_args(annotation)[0]
+        elif isinstance(annotation, TypeAliasType):
+            annotation = _substitute_typevars(
+                annotation.__value__, _type_param_mapping(annotation, ())
+            )
+        elif isinstance(origin, TypeAliasType):
+            annotation = _substitute_typevars(
+                origin.__value__, _type_param_mapping(origin, get_args(annotation))
+            )
+        else:
+            return annotation
+
+
+def _substitute_typevars(annotation: Any, mapping: dict[Any, Any]) -> Any:
+    if not mapping:
+        return annotation
+    if isinstance(annotation, TypeVar):
+        return mapping.get(annotation, annotation)
+    if isinstance(annotation, TypeAliasType):
+        return _substitute_typevars(annotation.__value__, mapping)
+    origin = get_origin(annotation)
+    args = get_args(annotation) if origin is not None else ()
+    if not args:
+        return annotation
+    if origin is Annotated:
+        base, *meta = args
+        return Annotated[_substitute_typevars(base, mapping), *meta]
+    new_args = tuple(_substitute_typevars(arg, mapping) for arg in args)
+    if new_args == args:
+        return annotation
+    if origin in (types.UnionType, Union):
+        return functools.reduce(operator.or_, new_args)
+    if isinstance(origin, TypeAliasType):
+        return _substitute_typevars(
+            origin.__value__, _type_param_mapping(origin, new_args)
+        )
+    return origin[new_args] if len(new_args) > 1 else origin[new_args[0]]
+
+
+def resolve_outcome_content(annotation: Any) -> Any:
+    """Resolve ``T`` in ``Outcome[T]`` for an ``Outcome`` subclass or alias."""
+    while get_origin(annotation) is Annotated:
+        annotation = get_args(annotation)[0]
+    origin = get_origin(annotation)
+    cls = origin or annotation
+    args = get_args(annotation) if origin is not None else ()
+    if cls is Outcome:
+        return args[0] if args else Any
+    mapping = _type_param_mapping(cls, args)
+    for base in types.get_original_bases(cls):
+        base_cls = get_origin(base) or base
+        if isinstance(base_cls, type) and issubclass(base_cls, Outcome):
+            return resolve_outcome_content(_substitute_typevars(base, mapping))
+    return Any
+
+
+def _is_bodyless_status(status: int) -> bool:
+    return 100 <= status < 200 or status in (204, 304)
+
+
+class Outcome[T](Response):
+    """A ``Response`` whose status is fixed by its class and whose payload is typed."""
+
+    status: ClassVar[int]
+    media_type: str | None = "application/json"
+    content: T
+
+    def __init__(self, content: T, *, headers: dict[str, str] | None = None) -> None:
+        status = getattr(type(self), "status", None)
+        if not isinstance(status, int) or isinstance(status, bool):
+            raise TypeError(
+                f"{type(self).__name__} has no `status`; instantiate a subclass"
+            )
+        self.content = content
+        self.status_code = status
+        bodyless_status = _is_bodyless_status(status)
+        bodyless = bodyless_status or content is None
+        self.body = b"" if bodyless else self.render(content)
+        self.headers = _header_dict(headers, None if bodyless else self.media_type)
+        self._appended_headers = []
+        if not bodyless_status:
+            self.headers["content-length"] = str(len(self.body))
+
+    def render(self, content: Any) -> bytes:
+        return msgspec.json.encode(content, enc_hook=_pydantic_enc_hook)
+
+
+_active_failure_alias: ContextVar[Any] = ContextVar(
+    "chano_active_failure_alias", default=None
+)
+
+
+class _FailureGenericAlias(types.GenericAlias):
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        origin = self.__origin__
+        assert isinstance(origin, type)
+        token = _active_failure_alias.set(self)
+        try:
+            result = origin(*args, **kwargs)
+        finally:
+            _active_failure_alias.reset(token)
+        result.__orig_class__ = self
+        return result
+
+
+class Failure[T = ErrorDetail](Outcome[T], Exception):
+    """A 4xx or 5xx outcome. Return it (checked) or raise it (from deep code)."""
+
+    if not TYPE_CHECKING:
+
+        def __class_getitem__(cls, item: Any) -> Any:
+            alias = super().__class_getitem__(item)
+            origin, args = get_origin(alias), get_args(alias)
+            if origin is cls and args:
+                return _FailureGenericAlias(origin, args)
+            return alias
+
+    @overload
+    def __init__(
+        self: Failure[ErrorDetail],
+        content: str,
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> None: ...
+    @overload
+    def __init__(
+        self, content: T, *, headers: dict[str, str] | None = None
+    ) -> None: ...
+    def __init__(self, content: Any, *, headers: dict[str, str] | None = None) -> None:
+        alias = _active_failure_alias.get()
+        target = (
+            alias
+            if alias is not None and get_origin(alias) is type(self)
+            else type(self)
+        )
+        if (
+            isinstance(content, str)
+            and _unwrap_type(resolve_outcome_content(target)) is ErrorDetail
+        ):
+            content = ErrorDetail(detail=content)
+        Outcome.__init__(self, content, headers=headers)
+        detail = content.detail if isinstance(content, ErrorDetail) else content
+        Exception.__init__(self, f"{self.status_code}: {detail}")
 
 
 class JSONResponse(Response):

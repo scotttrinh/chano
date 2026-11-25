@@ -15,11 +15,17 @@ from pathlib import Path
 from typing import Any, Literal
 
 from chano.config import WorkflowConfig, normalize_base_path
-from chano.exceptions import HTTPException, RequestValidationError
 from chano.openapi import openapi_info, openapi_schema, swagger_html
 from chano.params import Endpoint
 from chano.requests import Receive, Request, Scope, Send
-from chano.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from chano.responses import (
+    Failure,
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    Response,
+)
+from chano.status import MethodNotAllowed, NotFound
 
 _PATH_PARAM = re.compile(r"\{(\w+)(:path)?\}")
 
@@ -123,12 +129,10 @@ def _make_after_task(
 
 
 def error_response(exc: Exception) -> Response:
-    """The default mapping: ``HTTPException`` -> JSON, ``RequestValidationError``
-    -> JSON 422, anything else is logged and becomes a plain-text 500."""
-    if isinstance(exc, HTTPException):
-        return JSONResponse({"detail": exc.detail}, exc.status_code, exc.headers)
-    if isinstance(exc, RequestValidationError):
-        return JSONResponse({"detail": exc.errors}, 422)
+    """The default mapping: ``Failure`` is sent as-is, anything else is logged
+    and becomes a plain-text 500."""
+    if isinstance(exc, Failure):
+        return exc
     traceback.print_exception(exc, file=sys.stderr)
     return PlainTextResponse("Internal Server Error", 500)
 
@@ -402,7 +406,7 @@ class Chano:
         dynamic = [route for route in self.routes if route[1].groups]
         if response := await self._dispatch(request, dynamic):
             return response
-        raise HTTPException(404, "Not Found")
+        raise NotFound("Not Found")
 
     async def _dispatch(
         self,
@@ -436,8 +440,10 @@ class Chano:
             try:
                 if endpoint is None:
                     headers = {"allow": ", ".join(sorted(endpoints))}
-                    raise HTTPException(405, "Method Not Allowed", headers)
+                    raise MethodNotAllowed("Method Not Allowed", headers=headers)
                 result = await endpoint.call(request)
+                if isinstance(result, Failure):
+                    raise result
                 if isinstance(result, Response):
                     return result
                 return JSONResponse(result)
@@ -472,7 +478,7 @@ class Chano:
     @staticmethod
     def _require_get(request: Request) -> None:
         if request.method not in ("GET", "HEAD"):
-            raise HTTPException(405, "Method Not Allowed", {"allow": "GET, HEAD"})
+            raise MethodNotAllowed("Method Not Allowed", headers={"allow": "GET, HEAD"})
 
     def _static_file(self, path: str, method: str = "GET") -> Response | None:
         if self.public_dir is None or path.endswith("/"):
@@ -489,7 +495,7 @@ class Chano:
         except (OSError, RuntimeError, ValueError):  # symlink loops, NUL bytes
             return None
         if method not in ("GET", "HEAD"):
-            raise HTTPException(405, "Method Not Allowed", {"allow": "GET, HEAD"})
+            raise MethodNotAllowed("Method Not Allowed", headers={"allow": "GET, HEAD"})
         media_type = mimetypes.guess_type(file.name)[0] or "application/octet-stream"
         return Response(file.read_bytes(), media_type=media_type)
 
@@ -538,8 +544,10 @@ class EndpointASGIApp:
             try:
                 if request.method not in self.methods:
                     headers = {"allow": ", ".join(sorted(self.methods))}
-                    raise HTTPException(405, "Method Not Allowed", headers)
+                    raise MethodNotAllowed("Method Not Allowed", headers=headers)
                 result = await self.endpoint.call(request)
+                if isinstance(result, Failure):
+                    raise result
                 if isinstance(result, Response):
                     response = result
                 elif result is None:

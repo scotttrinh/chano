@@ -31,7 +31,6 @@ from chano import (
     Geo,
     Header,
     HTTPBearer,
-    HTTPException,
     JSONResponse,
     Query,
     Request,
@@ -44,7 +43,6 @@ from chano import (
     lazy,
     load_config,
     openapi,
-    raises,
 )
 from chano import build as build_module
 from chano import params as params_module
@@ -54,6 +52,13 @@ from chano.cli import main as cli_main
 from chano.config import normalize_base_path
 from chano.openapi import swagger_html
 from chano.routing import discover_routes, load_module
+from chano.status import (
+    Conflict,
+    Forbidden,
+    Gone,
+    NotFound,
+    Unauthorized,
+)
 
 EXAMPLE = Path(__file__).parent.parent / "examples" / "hello"
 FULLSTACK = Path(__file__).parent.parent / "examples" / "fullstack"
@@ -187,7 +192,12 @@ def test_dev_docs_and_static_files(client, example_app):
         "HTTPBearer": {"type": "http", "scheme": "bearer"}
     }
     assert list(put["responses"]) == ["200", "401", "422"]
-    assert put["responses"]["401"] == {"description": "Not authenticated"}
+    assert put["responses"]["401"] == {
+        "description": "Unauthorized",
+        "content": {
+            "application/json": {"schema": {"$ref": "#/components/schemas/ErrorDetail"}}
+        },
+    }
     assert "security" not in schema["paths"]["/api/items/{item_id}"]["get"]
     ref = {"$ref": "#/components/schemas/Item"}
     assert put["requestBody"]["content"]["application/json"]["schema"] == ref
@@ -397,7 +407,7 @@ def test_build_output_layout(output):
     func = functions / "api" / "items" / "[item_id].func"
     vc_config = json.loads((func / ".vc-config.json").read_text())
     assert vc_config["runtime"] == f"python{HOST_PYTHON}"
-    assert plan_build(EXAMPLE).python == "3.12"
+    assert plan_build(EXAMPLE).python == "3.13"
     assert vc_config["handler"] == "vc__handler__python.vc_handler"
     assert vc_config["maxDuration"] == 10
     assert (func / "_vendor" / "chano").is_dir()
@@ -914,7 +924,8 @@ def middleware_source(name: str) -> str:
     ``x-raise-kind`` (``http``, ``validation`` or anything else)."""
     return (
         "import mwlog\n"
-        "from chano import HTTPException, JSONResponse, RequestValidationError\n\n"
+        "from chano import JSONResponse, RequestValidationError\n"
+        "from chano.status import Forbidden\n\n"
         "async def middleware(request, call_next):\n"
         f"    mwlog.EVENTS.append({name + '>'!r})\n"
         f"    if request.headers.get('x-stop') == {name!r}:\n"
@@ -922,7 +933,7 @@ def middleware_source(name: str) -> str:
         f"    if request.headers.get('x-raise') == {name!r}:\n"
         "        kind = request.headers.get('x-raise-kind')\n"
         "        if kind == 'http':\n"
-        f"            raise HTTPException(403, {name!r}, {{'x-why': 'mw'}})\n"
+        f"            raise Forbidden({name!r}, headers={{'x-why': 'mw'}})\n"
         "        if kind == 'validation':\n"
         f"            raise RequestValidationError([{{'msg': {name!r}}}])\n"
         f"        raise RuntimeError({name!r})\n"
@@ -935,11 +946,11 @@ def middleware_source(name: str) -> str:
 
 MIDDLEWARE_ROUTE = (
     "import mwlog\n"
-    "from chano import HTTPException\n\n"
+    "from chano.status import Unauthorized\n\n"
     "def GET(n: int = 0, fail: str = ''):\n"
     "    mwlog.EVENTS.append('handler')\n"
     "    if fail == '401':\n"
-    "        raise HTTPException(401, 'nope', {'www-authenticate': 'Bearer'})\n"
+    "        raise Unauthorized('nope', headers={'www-authenticate': 'Bearer'})\n"
     "    if fail == 'boom':\n"
     "        raise RuntimeError('boom')\n"
     "    return {'n': n}\n"
@@ -1191,17 +1202,18 @@ def error_source(name: str, *, sync: bool) -> str:
     """Source for an ``error.py`` that logs ``name!ExcType`` in ``mwlog.EVENTS``
     and, by default, returns a JSON 503 naming itself and the exception. The
     ``x-<name>`` header switches it to a bare ``raise`` (``reraise``), a new
-    ``HTTPException(409, name)`` (``raise``), or returning ``None``."""
+    ``Conflict(name)`` (``raise``), or returning ``None``."""
     return (
         "import mwlog\n"
-        "from chano import HTTPException, JSONResponse\n\n"
+        "from chano import JSONResponse\n"
+        "from chano.status import Conflict\n\n"
         f"{'' if sync else 'async '}def handle_error(request, exc):\n"
         f"    mwlog.EVENTS.append(f'{name}!{{type(exc).__name__}}')\n"
         f"    action = request.headers.get('x-{name}')\n"
         "    if action == 'reraise':\n"
         "        raise\n"
         "    if action == 'raise':\n"
-        f"        raise HTTPException(409, {name!r})\n"
+        f"        raise Conflict({name!r})\n"
         "    if action == 'none':\n"
         "        return None\n"
         f"    return JSONResponse({{'by': {name!r}, 'error': str(exc)}}, 503)\n"
@@ -1274,7 +1286,7 @@ def test_error_nearest_wins(error_project, factory):
         "root>",
         "group>",
         "handler",
-        "group!HTTPException",
+        "group!Unauthorized",
         "<group:503",
         "<root:503",
     ]
@@ -1303,18 +1315,18 @@ def test_error_nearest_wins(error_project, factory):
         # in the async group or the sync root.
         (
             {"admin": "raise"},
-            ["admin!RuntimeError", "group!HTTPException"],
+            ["admin!RuntimeError", "group!Conflict"],
             {"by": "group", "error": "409: admin"},
         ),
         (
             {"admin": "raise", "group": "reraise"},
-            ["admin!RuntimeError", "group!HTTPException", "root!HTTPException"],
+            ["admin!RuntimeError", "group!Conflict", "root!Conflict"],
             {"by": "root", "error": "409: admin"},
         ),
         # Past the root the default mapping applies to the last exception.
         (
             {"admin": "reraise", "group": "raise", "root": "reraise"},
-            ["admin!RuntimeError", "group!RuntimeError", "root!HTTPException"],
+            ["admin!RuntimeError", "group!RuntimeError", "root!Conflict"],
             {"detail": "group"},
         ),
     ],
@@ -1852,7 +1864,7 @@ def test_workspace_build(tmp_path, isolated_imports, monkeypatch):
             ),
             "packages/core/pyproject.toml": (
                 '[project]\nname = "core"\nversion = "0.1.0"\n'
-                'requires-python = ">=3.12"\ndependencies = []\n\n'
+                'requires-python = ">=3.13"\ndependencies = []\n\n'
                 '[build-system]\nrequires = ["hatchling"]\n'
                 'build-backend = "hatchling.build"\n'
             ),
@@ -1861,19 +1873,19 @@ def test_workspace_build(tmp_path, isolated_imports, monkeypatch):
             ),
             "packages/unused/pyproject.toml": (
                 '[project]\nname = "unused"\nversion = "0.1.0"\n'
-                'requires-python = ">=3.12"\ndependencies = []\n\n'
+                'requires-python = ">=3.13"\ndependencies = []\n\n'
                 '[build-system]\nrequires = ["hatchling"]\n'
                 'build-backend = "hatchling.build"\n'
             ),
             "packages/unused/src/unused/__init__.py": "VALUE = 1\n",
             "apps/worker/pyproject.toml": (
                 '[project]\nname = "worker"\nversion = "0.1.0"\n'
-                'requires-python = ">=3.12"\ndependencies = ["unused"]\n\n'
+                'requires-python = ">=3.13"\ndependencies = ["unused"]\n\n'
                 "[tool.uv.sources]\nunused = { workspace = true }\n"
             ),
             "apps/api/pyproject.toml": (
                 '[project]\nname = "api"\nversion = "0.1.0"\n'
-                'requires-python = ">=3.12"\n'
+                'requires-python = ">=3.13"\n'
                 'dependencies = ["chano", "core"]\n\n'
                 '[build-system]\nrequires = ["hatchling"]\n'
                 'build-backend = "hatchling.build"\n\n'
@@ -1932,8 +1944,8 @@ def test_fullstack_example_build(tmp_path, isolated_imports):
         {"source": "/api/:path*", "destination": {"service": "api"}},
         {"source": "/(.*)", "destination": {"service": "web"}},
     ]
-    assert (FULLSTACK / ".python-version").read_text().strip() == "3.12"
-    assert (backend / ".python-version").read_text().strip() == "3.12"
+    assert (FULLSTACK / ".python-version").read_text().strip() == "3.13"
+    assert (backend / ".python-version").read_text().strip() == "3.13"
 
     out = tmp_path / "output"
     plan = plan_build(backend, platform=None, output=out)
@@ -2239,7 +2251,7 @@ def _write_workspace_pkg(
         {
             "pyproject.toml": (
                 f'[project]\nname = "{dist_name}"\nversion = "0.1.0"\n'
-                f'requires-python = ">=3.12"\n'
+                f'requires-python = ">=3.13"\n'
                 f"dependencies = {json.dumps(dep_list)}\n\n"
                 '[build-system]\nrequires = ["hatchling"]\n'
                 'build-backend = "hatchling.build"\n'
@@ -2296,7 +2308,7 @@ def test_tree_shaking_workspace_build(tmp_path, isolated_imports, monkeypatch, c
 
     base_pyproject = (
         '[project]\nname = "api"\nversion = "0.1.0"\n'
-        'requires-python = ">=3.12"\n'
+        'requires-python = ">=3.13"\n'
         'dependencies = ["chano", "pkg-a", "pkg-b", "pkg-c", "pkg-d"]\n\n'
         "[tool.uv.sources]\n"
         f"chano = {{ path = {json.dumps(repo_root.as_posix())}, editable = true }}\n"
@@ -2799,7 +2811,7 @@ def test_build_import_check_catches_computed_import(
 
     base_pyproject = (
         '[project]\nname = "api"\nversion = "0.1.0"\n'
-        'requires-python = ">=3.12"\n'
+        'requires-python = ">=3.13"\n'
         'dependencies = ["chano", "pkg-a"]\n\n'
         "[tool.uv.sources]\n"
         f"chano = {{ path = {json.dumps(repo_root.as_posix())}, editable = true }}\n"
@@ -2943,7 +2955,7 @@ def test_build_import_check_uses_uv_python_find(
         {
             "pyproject.toml": (
                 '[project]\nname = "api"\nversion = "0.1.0"\n'
-                'requires-python = ">=3.12"\n'
+                'requires-python = ">=3.13"\n'
                 'dependencies = ["chano"]\n\n'
                 "[tool.uv.sources]\n"
                 f"chano = {{ path = {json.dumps(repo_root.as_posix())}, "
@@ -3058,7 +3070,7 @@ def test_build_explain(tmp_path, isolated_imports, monkeypatch, capsys):
 
     base_pyproject = (
         '[project]\nname = "api"\nversion = "0.1.0"\n'
-        'requires-python = ">=3.12"\n'
+        'requires-python = ">=3.13"\n'
         "dependencies = [\n"
         '    "chano",\n'
         '    "pkg-a",\n'
@@ -3618,7 +3630,7 @@ def test_cookie_parameters():
         return f"user:{session}"
 
     def handler(
-        user: Annotated[str, Depends(current_user)],
+        user: str = Depends(current_user),
         count: Annotated[int, Cookie()] = 0,
         theme: Annotated[str | None, Cookie(alias="ui-theme")] = None,
     ):
@@ -3995,7 +4007,7 @@ def test_include_in_schema_false(tmp_path, isolated_imports):
     schema = client("GET", "/openapi.json").json()
     assert list(schema["paths"]) == ["/items"]
     assert list(schema["paths"]["/items"]) == ["post"]
-    assert set(schema["components"]["schemas"]) == {"Shared"}
+    assert set(schema["components"]["schemas"]) == {"Shared", "ValidationErrorDetail"}
     assert "internal" not in json.dumps(schema)
 
     # Hidden is only about documentation: hidden methods still serve requests.
@@ -4275,11 +4287,11 @@ def test_lazy_as_dependency(tmp_path, isolated_imports):
                 "    return {'kind': 'async'}\n\n"
                 "get_client = lazy(make_client)\n"
                 "get_pool = lazy(make_pool)\n\n"
-                "def GET(client: Annotated[dict, Depends(get_client)],\n"
-                "        pool: Annotated[dict, Depends(get_pool)] = None):\n"
+                "def GET(client: dict = Depends(get_client),\n"
+                "        pool: dict = Depends(get_pool)):\n"
                 "    return {'client': client, 'pool': pool, 'made': made}\n\n"
-                "async def POST(pool: Annotated[dict, Depends(get_pool)],\n"
-                "               client: Annotated[dict, Depends(get_client)]):\n"
+                "async def POST(pool: dict = Depends(get_pool),\n"
+                "               client: dict = Depends(get_client)):\n"
                 "    return {'pool': pool, 'client': client, 'made': made}\n"
             ),
         },
@@ -4354,7 +4366,7 @@ def test_lazy_async_callable_instance(tmp_path, isolated_imports):
                 "        Pool.calls += 1\n"
                 "        return {'pool': Pool.calls}\n\n"
                 "get_pool = lazy(Pool())\n\n"
-                "def GET(pool: Annotated[dict, Depends(get_pool)]):\n"
+                "def GET(pool: dict = Depends(get_pool)):\n"
                 "    return {'pool': pool, 'calls': Pool.calls}\n"
             ),
         },
@@ -4453,17 +4465,23 @@ def test_lazy_abandoned_waiter_after_failure(caplog):
 
 
 SECURE_ITEMS = """\
-from typing import Annotated
-
-from chano import Depends, HTTPBearer, HTTPException, raises
+from chano import Depends, HTTPBearer
+from chano.status import Forbidden, Unauthorized
 
 bearer = HTTPBearer()
 
 
-@raises(401, "Invalid token")
-def current_user(token: Annotated[str, Depends(bearer)]) -> str:
+class InvalidToken(Unauthorized):
+    \"\"\"Invalid token\"\"\"
+
+
+class NotAllowed(Forbidden):
+    \"\"\"Not allowed\"\"\"
+
+
+def current_user(token: str = Depends(bearer)) -> str | InvalidToken:
     if token != "secret":
-        raise HTTPException(401, "Invalid token")
+        return InvalidToken("Invalid token")
     return "scott"
 
 
@@ -4471,8 +4489,7 @@ def GET() -> list[str]:
     return ["public"]
 
 
-@raises(403, "Not allowed")
-def POST(name: str, user: Annotated[str, Depends(current_user)]) -> str:
+def POST(name: str, user: str = Depends(current_user)) -> str | NotAllowed:
     return f"{user}:{name}"
 """
 
@@ -4486,21 +4503,16 @@ def test_explicit_security_and_responses(tmp_path, isolated_imports):
             "pyproject.toml": '[project]\nname = "secure"\nversion = "0"\n',
             "app/items/route.py": SECURE_ITEMS,
             "app/broken/route.py": (
-                "from typing import Annotated\n"
                 "from chano import Depends, HTTPBearer\n\n"
-                "def explode(token: Annotated[str, Depends(HTTPBearer())]) -> str:\n"
+                "def explode(token: str = Depends(HTTPBearer())) -> str:\n"
                 "    raise RuntimeError('called during schema generation')\n\n"
-                "def GET(value: Annotated[str, Depends(explode)]) -> str:\n"
+                "def GET(value: str = Depends(explode)) -> str:\n"
                 "    return value\n"
             ),
             "app/internal/route.py": (
-                "from typing import Annotated\n"
-                "from chano import Depends, HTTPBearer, openapi, raises\n\n"
+                "from chano import Depends, HTTPBearer, openapi\n\n"
                 "@openapi(include_in_schema=False)\n"
-                "@raises(401, 'Internal only')\n"
-                "def GET(\n"
-                "    token: Annotated[str, Depends(HTTPBearer('internal'))],\n"
-                ") -> str:\n"
+                "def GET(token: str = Depends(HTTPBearer('internal'))) -> str:\n"
                 "    return token\n"
             ),
         },
@@ -4508,8 +4520,8 @@ def test_explicit_security_and_responses(tmp_path, isolated_imports):
     client = make_client(create_app(project / "app"))
     schema = client("GET", "/openapi.json").json()
 
-    assert schema["components"] == {
-        "securitySchemes": {"HTTPBearer": {"type": "http", "scheme": "bearer"}}
+    assert schema["components"]["securitySchemes"] == {
+        "HTTPBearer": {"type": "http", "scheme": "bearer"}
     }
     items = schema["paths"]["/items"]
     assert "security" not in items["get"]
@@ -4526,10 +4538,10 @@ def test_explicit_security_and_responses(tmp_path, isolated_imports):
     }
 
     # Declarations are read, not executed: the raising dependency is
-    # documented, and its scheme's runtime 401 is not, since it is undeclared.
+    # documented, and HTTPBearer's own 401 is documented without a decorator.
     broken = schema["paths"]["/broken"]["get"]
     assert broken["security"] == [{"HTTPBearer": []}]
-    assert list(broken["responses"]) == ["200"]
+    assert list(broken["responses"]) == ["200", "401"]
     assert "internal" not in json.dumps(schema)
 
     static = {f.path: f.content for f in plan_build(project).static_files}
@@ -4565,7 +4577,7 @@ def test_http_bearer_credentials(authorization, token):
     app = Chano(docs=False)
     bearer = HTTPBearer()
 
-    def handler(value: Annotated[str, Depends(bearer)]) -> str:
+    def handler(value: str = Depends(bearer)) -> str:
         return value
 
     app.add_route("/", handler, methods=["GET"])
@@ -4579,13 +4591,6 @@ def test_http_bearer_credentials(authorization, token):
         assert response.json() == token
 
 
-# @lat: [[tests#Declared responses must be errors]]
-@pytest.mark.parametrize("status", [200, 204, 399, 600])
-def test_raises_rejects_non_error_statuses(status):
-    with pytest.raises(ValueError, match="status"):
-        raises(status, "nope")
-
-
 def declared_descriptions(handler) -> dict[str, str]:
     app = Chano()
     app.add_route("/", handler, methods=["GET"])
@@ -4595,36 +4600,36 @@ def declared_descriptions(handler) -> dict[str, str]:
 
 # @lat: [[tests#Declared response precedence]]
 def test_declared_response_precedence():
-    @raises(401, "outer")
-    @raises(401, "inner")
-    @raises(403, "only")
-    def stacked() -> None:
+    class Nested401(Unauthorized):
+        """nested"""
+
+    class Nested403(Forbidden):
+        """nested"""
+
+    class Nested404(NotFound):
+        """nested"""
+
+    class Direct401(Unauthorized):
+        """direct"""
+
+    class Direct403(Forbidden):
+        """direct"""
+
+    class Handler403(Forbidden):
+        """handler"""
+
+    def nested() -> None | Nested401 | Nested403 | Nested404:
         return None
 
-    assert declared_descriptions(stacked) == {
-        "200": "Successful Response",
-        "401": "outer",
-        "403": "only",
-    }
-
-    @raises(401, "nested")
-    @raises(403, "nested")
-    @raises(404, "nested")
-    def nested() -> None:
-        return None
-
-    def first(value: Annotated[None, Depends(nested)]) -> None:
+    def first(value: None = Depends(nested)) -> None:
         return value
 
-    @raises(401, "direct")
-    @raises(403, "direct")
-    def second() -> None:
+    def second() -> None | Direct401 | Direct403:
         return None
 
-    @raises(403, "handler")
     def handler(
-        a: Annotated[None, Depends(first)], b: Annotated[None, Depends(second)]
-    ) -> None:
+        a: None = Depends(first), b: None = Depends(second)
+    ) -> None | Handler403:
         return None
 
     # The handler beats its dependencies, and a direct dependency beats a
@@ -4635,13 +4640,6 @@ def test_declared_response_precedence():
         "403": "handler",
         "404": "nested",
     }
-
-
-# @lat: [[tests#Declared response statuses must be integers]]
-@pytest.mark.parametrize("status", [401.5, "401", True, None])
-def test_raises_rejects_non_integer_statuses(status):
-    with pytest.raises(TypeError, match="status"):
-        raises(status, "nope")
 
 
 # @lat: [[tests#HTTP bearer scheme names]]
@@ -4664,7 +4662,7 @@ def test_http_bearer_scheme_names(name, valid):
         return
     bearer = HTTPBearer(name)
 
-    def handler(token: Annotated[str, Depends(bearer)]) -> str:
+    def handler(token: str = Depends(bearer)) -> str:
         return token
 
     app = Chano()
@@ -4673,19 +4671,27 @@ def test_http_bearer_scheme_names(name, valid):
 
 
 INHERITED_CHECKS = """\
-from typing import Annotated
-
 import deplog
-from chano import Depends, HTTPBearer, HTTPException, raises
+from chano import Depends, HTTPBearer
+from chano.status import Forbidden, Unauthorized
 
 bearer = HTTPBearer()
 
 
-@raises(401, "Invalid token")
-def require_user(token: Annotated[str, Depends(bearer)], tenant: str = "main") -> str:
+class InvalidToken(Unauthorized):
+    \"\"\"Invalid token\"\"\"
+
+
+class AdminsOnly(Forbidden):
+    \"\"\"Admins only\"\"\"
+
+
+def require_user(
+    token: str = Depends(bearer), tenant: str = "main"
+) -> str | InvalidToken:
     deplog.EVENTS.append("user")
     if token not in ("admin", "member"):
-        raise HTTPException(401, "Invalid token", {"www-authenticate": "Bearer"})
+        return InvalidToken("Invalid token", headers={"www-authenticate": "Bearer"})
     return f"{token}@{tenant}"
 
 
@@ -4697,23 +4703,27 @@ def admin_area() -> None:
     deplog.EVENTS.append("admin-area")
 
 
-@raises(403, "Admins only")
 def require_admin(
-    user: Annotated[str, Depends(require_user)], tenant: str = "main"
-) -> str:
+    user: str = Depends(require_user), tenant: str = "main"
+) -> str | AdminsOnly:
     deplog.EVENTS.append("admin")
     if not user.startswith("admin@"):
-        raise HTTPException(403, "Admins only")
+        return AdminsOnly("Admins only")
     return user
 """
 
 INHERITED_GROUP_ERROR = """\
-from chano import HTTPException, JSONResponse
+from chano import ErrorDetail, Failure, JSONResponse
 
 
 def handle_error(request, exc):
-    if isinstance(exc, HTTPException):
-        body = {"detail": exc.detail, "via": "group"}
+    if isinstance(exc, Failure):
+        detail = (
+            exc.content.detail
+            if isinstance(exc.content, ErrorDetail)
+            else exc.content
+        )
+        body = {"detail": detail, "via": "group"}
         return JSONResponse(body, exc.status_code, exc.headers)
     raise exc
 """
@@ -4740,11 +4750,10 @@ def inherited_project(root: Path) -> None:
             ),
             "app/(group)/admin/route.py": (
                 "import deplog\n"
-                "from typing import Annotated\n"
                 "from chano import Depends\n"
                 "from checks import require_admin\n\n"
                 "def GET(\n"
-                "    admin: Annotated[str, Depends(require_admin)],\n"
+                "    admin: str = Depends(require_admin),\n"
                 "    tenant: str = 'main',\n"
                 "):\n"
                 "    deplog.EVENTS.append('handler')\n"
@@ -4909,31 +4918,55 @@ def test_inherited_dependencies_schema(tmp_path, isolated_imports):
 
 # @lat: [[tests#Inherited typed dependencies#Declared response precedence]]
 def test_inherited_dependency_response_precedence():
-    @raises(401, "root")
-    @raises(403, "root")
-    @raises(404, "root")
-    @raises(409, "root")
-    @raises(410, "root")
-    def root() -> None:
+    class Root401(Unauthorized):
+        """root"""
+
+    class Root403(Forbidden):
+        """root"""
+
+    class Root404(NotFound):
+        """root"""
+
+    class Root409(Conflict):
+        """root"""
+
+    class Root410(Gone):
+        """root"""
+
+    class LeafFirst401(Unauthorized):
+        """leaf first"""
+
+    class LeafFirst403(Forbidden):
+        """leaf first"""
+
+    class LeafSecond403(Forbidden):
+        """leaf second"""
+
+    class LeafSecond409(Conflict):
+        """leaf second"""
+
+    class Direct404(NotFound):
+        """direct"""
+
+    class Direct410(Gone):
+        """direct"""
+
+    class Handler410(Gone):
+        """handler"""
+
+    def root() -> None | Root401 | Root403 | Root404 | Root409 | Root410:
         return None
 
-    @raises(401, "leaf first")
-    @raises(403, "leaf first")
-    def leaf_first() -> None:
+    def leaf_first() -> None | LeafFirst401 | LeafFirst403:
         return None
 
-    @raises(403, "leaf second")
-    @raises(409, "leaf second")
-    def leaf_second() -> None:
+    def leaf_second() -> None | LeafSecond403 | LeafSecond409:
         return None
 
-    @raises(404, "direct")
-    @raises(410, "direct")
-    def direct() -> None:
+    def direct() -> None | Direct404 | Direct410:
         return None
 
-    @raises(410, "handler")
-    def handler(value: Annotated[None, Depends(direct)]) -> None:
+    def handler(value: None = Depends(direct)) -> None | Handler410:
         return value
 
     app = Chano()
@@ -4959,18 +4992,18 @@ def test_shared_dependency_inputs_documented_once():
         return q
 
     def first(
-        value: Annotated[int, Depends(shared)], x_key: Annotated[str, Header()] = ""
+        value: int = Depends(shared), x_key: Annotated[str, Header()] = ""
     ) -> int:
         return value
 
     def second(
-        value: Annotated[int, Depends(shared)], x_key: Annotated[str, Header()] = ""
+        value: int = Depends(shared), x_key: Annotated[str, Header()] = ""
     ) -> int:
         return value
 
     def handler(
-        a: Annotated[int, Depends(first)],
-        b: Annotated[int, Depends(second)],
+        a: int = Depends(first),
+        b: int = Depends(second),
         q: int = 0,
     ):
         return a + b + q
@@ -5032,9 +5065,10 @@ def test_inherited_dependencies_trace_roots(tmp_path, isolated_imports, monkeypa
         {
             "pyproject.toml": '[project]\nname = "checks"\nversion = "0"\n',
             "app/(group)/dependencies.py": (
-                "from typing import Annotated\nfrom chano import Header, raises\n\n"
-                "@raises(403, 'Forbidden')\n"
-                "def check(x_key: Annotated[str, Header()]) -> str:\n"
+                "from typing import Annotated\n"
+                "from chano import Header\n"
+                "from chano.status import Forbidden\n\n"
+                "def check(x_key: Annotated[str, Header()]) -> str | Forbidden:\n"
                 "    import check_pkg\n"
                 "    return x_key\n\n"
                 "dependencies = [check]\n"
@@ -5075,7 +5109,7 @@ def test_async_callable_checks_block_the_handler():
     class Deny:
         async def __call__(self) -> None:
             calls.append("deny")
-            raise HTTPException(403, "denied")
+            raise Forbidden("denied")
 
     class Value:
         async def __call__(self) -> int:
@@ -5083,9 +5117,9 @@ def test_async_callable_checks_block_the_handler():
 
     async def deny_later() -> None:
         calls.append("later")
-        raise HTTPException(403, "later")
+        raise Forbidden("later")
 
-    def handler(value: Annotated[int, Depends(Value())]) -> int:
+    def handler(value: int = Depends(Value())) -> int:
         calls.append("handler")
         return value
 
@@ -5110,17 +5144,18 @@ def test_unhashable_callable_checks(tmp_path, isolated_imports):
             "roles.py": (
                 "from dataclasses import dataclass\n"
                 "from typing import Annotated\n"
-                "from chano import Header, HTTPException\n\n"
+                "from chano import Header\n"
+                "from chano.status import Forbidden\n\n"
                 "CALLS = []\n\n"
                 "@dataclass\n"
                 "class Role:\n"
                 "    name: str\n\n"
                 "    def __call__(\n"
                 "        self, x_role: Annotated[str, Header()] = ''\n"
-                "    ) -> str:\n"
+                "    ) -> str | Forbidden:\n"
                 "        CALLS.append(self.name)\n"
                 "        if x_role != self.name:\n"
-                "            raise HTTPException(403, 'wrong role')\n"
+                "            return Forbidden('wrong role')\n"
                 "        return x_role\n\n"
                 "admin = Role('admin')  # eq=True without frozen: unhashable\n"
             ),
@@ -5132,7 +5167,7 @@ def test_unhashable_callable_checks(tmp_path, isolated_imports):
                 "from chano import Depends, Header\n"
                 "from roles import admin\n\n"
                 "def GET(\n"
-                "    role: Annotated[str, Depends(admin)],\n"
+                "    role: str = Depends(admin),\n"
                 "    x_role: Annotated[str, Header()] = '',\n"
                 "):\n"
                 "    return {'role': role}\n"
@@ -5191,7 +5226,7 @@ def test_body_consumers_across_checks():
     def embedded_check(x: Annotated[int, Body()], y: Annotated[int, Body()]) -> int:
         return x + y
 
-    def handler(b: WholeB, x: Annotated[int, Depends(whole_check)]) -> list[int]:
+    def handler(b: WholeB, x: int = Depends(whole_check)) -> list[int]:
         return [x, b.y]
 
     app = Chano()
@@ -5239,7 +5274,7 @@ def test_distinct_equal_callables_each_run():
         def __call__(self) -> None:
             calls.append(f"{self.name}:{self.block}")
             if self.block:
-                raise HTTPException(403, "blocked")
+                raise Forbidden("blocked")
 
     first, second = Gate("gate"), Gate("gate", block=True)
     assert first == second and hash(first) == hash(second)
@@ -5268,7 +5303,7 @@ def test_bound_method_check_runs_once():
     guard = Guard()
 
     # guard.check makes a new bound-method object on each access.
-    def handler(value: Annotated[int, Depends(guard.check)]) -> int:
+    def handler(value: int = Depends(guard.check)) -> int:
         return value
 
     app = Chano(docs=False)
@@ -5472,7 +5507,7 @@ def test_checks_returning_generators_fail_closed():
     def awrapped():
         return agen()
 
-    def needs_wrapped(value: Annotated[Any, Depends(wrapped)]) -> None:
+    def needs_wrapped(value: Any = Depends(wrapped)) -> None:
         return None  # a Depends may take a generator as an ordinary value
 
     def handler() -> str:
@@ -6935,10 +6970,7 @@ def test_markers_require_annotated():
     def bad_body(b: Any = Body()):  # noqa: B008
         return b
 
-    def bad_depends(d: Any = Depends(dep)):  # noqa: B008
-        return d
-
-    for fn in (bad_query, bad_header, bad_cookie, bad_body, bad_depends):
+    for fn in (bad_query, bad_header, bad_cookie, bad_body):
         app = Chano()
         with pytest.raises(TypeError, match="must be placed inside Annotated"):
             app.add_route("/", fn, methods=["GET"])

@@ -3,20 +3,40 @@
 from __future__ import annotations
 
 import copy
+import functools
 import html
 import inspect
 import json
+import operator
 import re
-from collections.abc import Callable, Mapping, Sequence
+import types
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from http import HTTPStatus
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Literal,
+    TypeAliasType,
+    Union,
+    get_args,
+    get_origin,
+)
 
 import msgspec
 
 from chano._pydantic import json_schema as pydantic_json_schema
 from chano._pydantic import pydantic_adapter
+from chano.exceptions import RequestValidationError
 from chano.params import Endpoint, RequestInput
-from chano.responses import Response
+from chano.responses import (
+    Outcome,
+    Response,
+    _substitute_typevars,
+    _type_param_mapping,
+    resolve_outcome_content,
+)
 
 if TYPE_CHECKING:
     from chano.app import Chano
@@ -164,19 +184,114 @@ def openapi_info(func: Callable[..., Any]) -> OpenAPIInfo | None:
     return info if isinstance(info, OpenAPIInfo) else None
 
 
-_VALIDATION_ERROR = {
-    "description": "Validation Error",
-    "content": {
-        "application/json": {
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "detail": {"type": "array", "items": {"type": "object"}}
-                },
-            }
-        }
-    },
-}
+def _split_annotated(annotation: Any) -> tuple[Any, tuple[Any, ...]]:
+    meta: list[Any] = []
+    while get_origin(annotation) is Annotated:
+        annotation, *rest = get_args(annotation)
+        meta.extend(rest)
+    return annotation, tuple(meta)
+
+
+def _wrap_annotated(annotation: Any, meta: tuple[Any, ...]) -> Any:
+    return Annotated[(annotation, *meta)] if meta else annotation
+
+
+def _iter_union_members(annotation: Any) -> Iterator[Any]:
+    inner, meta = _split_annotated(annotation)
+    if isinstance(inner, TypeAliasType):
+        expanded = _substitute_typevars(inner.__value__, _type_param_mapping(inner, ()))
+        yield from _iter_union_members(_wrap_annotated(expanded, meta))
+        return
+    origin = get_origin(inner)
+    if isinstance(origin, TypeAliasType):
+        expanded = _substitute_typevars(
+            origin.__value__, _type_param_mapping(origin, get_args(inner))
+        )
+        yield from _iter_union_members(_wrap_annotated(expanded, meta))
+        return
+    if origin in (types.UnionType, Union):
+        members = [m for arg in get_args(inner) for m in _iter_union_members(arg)]
+        if meta:
+            plain = [
+                m
+                for m in members
+                if _outcome_class(m) is None and not _is_response_type(m)
+            ]
+            other = [
+                m
+                for m in members
+                if _outcome_class(m) is not None or _is_response_type(m)
+            ]
+            if plain:
+                yield _wrap_annotated(functools.reduce(operator.or_, plain), meta)
+            yield from other
+            return
+        yield from members
+        return
+    if _outcome_class(inner) is not None or _is_response_type(inner):
+        yield inner
+        return
+    yield _wrap_annotated(inner, meta)
+
+
+def _outcome_class(annotation: Any) -> type[Outcome[Any]] | None:
+    inner, _ = _split_annotated(annotation)
+    cls = get_origin(inner) or inner
+    return cls if isinstance(cls, type) and issubclass(cls, Outcome) else None
+
+
+def _is_response_type(annotation: Any) -> bool:
+    inner, _ = _split_annotated(annotation)
+    cls = get_origin(inner) or inner
+    return isinstance(cls, type) and issubclass(cls, Response)
+
+
+def _outcome_description(cls: type[Outcome[Any]]) -> str:
+    own_doc = cls.__dict__.get("__doc__")
+    if isinstance(own_doc, str) and own_doc.strip():
+        return inspect.cleandoc(own_doc)
+    try:
+        return HTTPStatus(cls.status).phrase
+    except ValueError:
+        return f"HTTP {cls.status}"
+
+
+def _add_schema(entry: dict[str, Any], media_type: str, schema: dict[str, Any]) -> None:
+    content = entry.setdefault("content", {})
+    if media_type not in content:
+        content[media_type] = {"schema": schema}
+        return
+    existing = content[media_type]["schema"]
+    if existing == schema:
+        return
+    variants = list(existing["anyOf"]) if list(existing) == ["anyOf"] else [existing]
+    if schema not in variants:
+        variants.append(schema)
+    content[media_type]["schema"] = {"anyOf": variants}
+
+
+def _add_outcome(
+    responses: dict[int, dict[str, Any]],
+    annotation: Any,
+    components: dict[str, Any],
+) -> None:
+    cls = _outcome_class(annotation)
+    status = getattr(cls, "status", None) if cls is not None else None
+    if cls is None or not isinstance(status, int) or isinstance(status, bool):
+        return
+    entry = responses.setdefault(status, {"description": _outcome_description(cls)})
+    content_type = resolve_outcome_content(annotation)
+    if (
+        100 <= status < 200
+        or status in (204, 304)
+        or content_type in (None, type(None))
+    ):
+        return
+    _add_schema(
+        entry,
+        cls.media_type or "application/json",
+        _schema(content_type, components, mode="serialization"),
+    )
 
 
 def _rewrite_refs(node: Any, renames: dict[str, str]) -> Any:
@@ -334,26 +449,54 @@ def _operation(
             "content": {"application/json": {"schema": body_schema}},
         }
 
-    success: dict[str, Any] = {
-        "description": (
-            info.response_description
-            if info is not None and info.response_description is not None
-            else "Successful Response"
-        )
-    }
+    responses: dict[int, dict[str, Any]] = {}
+    default_200_desc = (
+        info.response_description
+        if info is not None and info.response_description is not None
+        else "Successful Response"
+    )
     returns = inspect.signature(endpoint.func, eval_str=True).return_annotation
-    is_response = isinstance(returns, type) and issubclass(returns, Response)
-    if returns not in (inspect.Signature.empty, None) and not is_response:
-        success["content"] = {
-            "application/json": {
-                "schema": _schema(returns, components, mode="serialization")
-            }
-        }
-    responses: dict[int, Any] = {200: success}
+    if returns in (inspect.Signature.empty, None):
+        responses[200] = {"description": default_200_desc}
+    else:
+        plain: list[Any] = []
+        has_other_response = False
+        for member in _iter_union_members(returns):
+            if _outcome_class(member) is not None:
+                _add_outcome(responses, member, components)
+            elif _is_response_type(member):
+                has_other_response = True
+            else:
+                plain.append(member)
+        if plain:
+            entry = responses.setdefault(200, {"description": default_200_desc})
+            if not (len(plain) == 1 and plain[0] is type(None)):
+                for member in plain:
+                    _add_schema(
+                        entry,
+                        "application/json",
+                        _schema(member, components, mode="serialization"),
+                    )
+        elif has_other_response and 200 not in responses:
+            responses[200] = {"description": default_200_desc}
+
+    if not responses:
+        responses[200] = {"description": default_200_desc}
+
+    for dep in endpoint.response_endpoints():
+        if dep is endpoint:
+            continue
+        dep_returns = inspect.signature(dep.func, eval_str=True).return_annotation
+        if dep_returns in (inspect.Signature.empty, None):
+            continue
+        for member in _iter_union_members(dep_returns):
+            if _outcome_class(member) is not None:
+                _add_outcome(responses, member, components)
+
+    if info is not None and info.response_description is not None and 200 in responses:
+        responses[200]["description"] = info.response_description
     if fields:
-        responses[422] = _VALIDATION_ERROR
-    for status, description in endpoint.declared_responses().items():
-        responses.setdefault(status, {"description": description})
+        _add_outcome(responses, RequestValidationError, components)
     operation["responses"] = {str(k): v for k, v in sorted(responses.items())}
 
     # All dependencies run, so every scheme is required together: one

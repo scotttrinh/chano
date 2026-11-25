@@ -79,7 +79,7 @@ ENTRYPOINT = "index.py"
 
 # Vercel's Python functions run on Amazon Linux 2023 (glibc 2.34).
 DEFAULT_PLATFORM = "x86_64-manylinux_2_28"
-DEFAULT_PYTHON = "3.12"
+DEFAULT_PYTHON = "3.13"
 
 # Vercel's maximum uncompressed Python function size is 500 MB.
 SIZE_WARN_BYTES = 250 * 1024 * 1024

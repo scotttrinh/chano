@@ -38,7 +38,8 @@ SITE_NAME = "Chano"
 HERO_CODE_SAMPLE = """\
 from typing import Annotated
 from msgspec import Meta, Struct
-from chano import Depends, HTTPBearer, HTTPException, raises
+from chano import Depends, HTTPBearer
+from chano.status import Unauthorized
 
 class ItemInput(Struct):
     name: str
@@ -49,10 +50,9 @@ class Item(ItemInput):
 
 bearer = HTTPBearer()
 
-@raises(401, "Not authenticated")
-def current_user(token: Annotated[str, Depends(bearer)]) -> str:
+def current_user(token: str = Depends(bearer)) -> str | Unauthorized:
     if token != "secret":
-        raise HTTPException(401, "Not authenticated")
+        return Unauthorized("Not authenticated")
     return "alice"
 
 def GET(item_id: int, verbose: bool = False):
@@ -61,21 +61,21 @@ def GET(item_id: int, verbose: bool = False):
 async def PUT(
     item_id: int,
     item: ItemInput,
-    user: Annotated[str, Depends(current_user)],
+    user: str = Depends(current_user),
 ) -> Item:
     return Item(id=item_id, name=item.name, price=item.price)
 """
 
 DEPS_CODE_SAMPLE = """\
-from typing import Annotated
-from chano import Depends, HTTPBearer, HTTPException, raises
+from chano import Depends, HTTPBearer
+from chano.status import Forbidden
 
 bearer = HTTPBearer()
 
-@raises(403, "Admin access required")
-def require_admin(token: Annotated[str, Depends(bearer)]) -> None:
+def require_admin(token: str = Depends(bearer)) -> None | Forbidden:
     if token != "admin-secret":
-        raise HTTPException(403, "Admin access required")
+        return Forbidden("Admin access required")
+    return None
 
 dependencies = [require_admin]
 """

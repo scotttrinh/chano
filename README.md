@@ -24,7 +24,8 @@ public/                           ->  static files
 # app/api/items/[item_id]/route.py
 from typing import Annotated
 
-from chano import Depends, HTTPBearer, HTTPException, raises
+from chano import Depends, HTTPBearer
+from chano.status import Unauthorized
 from msgspec import Meta, Struct
 
 
@@ -36,10 +37,9 @@ class Item(Struct):
 bearer = HTTPBearer()
 
 
-@raises(401, "Not authenticated")
-def current_user(token: Annotated[str, Depends(bearer)]) -> str:
+def current_user(token: str = Depends(bearer)) -> str | Unauthorized:
     if token != "secret":
-        raise HTTPException(401, "Not authenticated")
+        return Unauthorized("Not authenticated")
     return "scott"
 
 
@@ -48,7 +48,7 @@ def GET(item_id: int, verbose: bool = False):
 
 
 async def PUT(
-    item_id: int, item: Item, user: Annotated[str, Depends(current_user)]
+    item_id: int, item: Item, user: str = Depends(current_user)
 ) -> Item:
     return item
 ```
@@ -59,16 +59,16 @@ A handler's signature declares its inputs, which are validated with
 - a parameter named after a `[segment]` comes from the path
 - a model (a msgspec `Struct`, dataclass or attrs class) comes from the JSON
   body, decoded and validated in a single pass
-- `Annotated[T, Depends(fn)]` is the result of calling `fn`, whose own signature is resolved
-  the same way
+- `user: User = Depends(fn)` is the result of calling `fn`, whose own signature is resolved
+  the same way and whose `Response` branches short-circuit the request
 - a `Request` annotation receives the raw request
 - anything else is a query parameter; `Annotated[T, Query()]`, `Annotated[T, Header()]`,
   `Annotated[T, Cookie()]`, and `Annotated[T, Body()]` override the default
 
-`Annotated[str, Depends(HTTPBearer())]` returns the token from `Authorization: Bearer <token>`
-(or responds `401`) and documents an HTTP bearer security scheme in
-`openapi.json`. `@raises(401, "Not authenticated")` on a handler or dependency
-documents an error response for every operation using it.
+`token: str = Depends(HTTPBearer())` returns the token from `Authorization: Bearer <token>`
+(or returns `Unauthorized`) and documents an HTTP bearer security scheme and `401` response in
+`openapi.json`. Return types using `Outcome`, `Failure`, and `chano.status` declare status codes
+and error responses directly for both static type checkers and OpenAPI.
 
 Handlers can be sync or async, and return JSON-serializable data or a
 `Response`.

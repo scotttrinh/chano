@@ -357,6 +357,8 @@ A module-level `include_in_schema = False` in `route.py` leaves the route's oper
 
 ### 6.7 Explicit OpenAPI security and responses
 
+> **Superseded:** `@raises` and the `Annotated` form of `Depends` have been replaced by typed `Outcome`/`Failure` return annotations and default-value `Depends` (see `docs/outcomes-and-boundary.md` §1–§2 and `lat.md/responses.md`). `HTTPBearer.__call__` now returns `str | Unauthorized`, so its `401` is documented automatically from its return type.
+
 The generator walks the declared request fields of a handler and its dependencies. On its own, that walk documents a credential read with `Header()` as an ordinary `authorization` header and documents only `200` and `422`, even when a dependency can raise `401`. The hello project's `PUT` uses the declarations below instead.
 
 Security documentation needs an explicit declaration of the credential scheme. For a declared HTTP bearer scheme, emit one entry in `components.securitySchemes` and reference it in each affected operation's `security` list. Represent its credential there only. OpenAPI reserves the `Authorization` header for this purpose. Document `401` and `403` when explicitly declared. A bearer scheme describes how to present credentials. Application code still decides whether the caller may perform the operation.
