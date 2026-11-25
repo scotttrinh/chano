@@ -36,6 +36,14 @@ A worker thread cannot be interrupted, so [[src/chano/responses.py#_ThreadedIter
 
 Cleanup is [[src/chano/responses.py#_stop]]: cancel the stream and listener tasks, wait for both to stop, then close the iterator, because an async generator cannot be closed while a task is still running it (for example, a producer whose `finally` awaits). [[src/chano/responses.py#_run_to_completion]] runs that cleanup as a shielded task. If the caller cancels the request meanwhile, the response still waits for cleanup to finish, then re-raises `CancelledError`.
 
+### Request Body Streaming
+
+[[src/chano/requests.py#Request#stream]] yields non-empty `bytes` chunks from ASGI `receive` incrementally, raising [[src/chano/exceptions.py#ClientDisconnect]] on `http.disconnect` and `RuntimeError` if consumed twice or on an unexpected message type.
+
+[[src/chano/requests.py#Request#body]] consumes `stream()` once and caches the bytes so later `stream()` calls yield the cached body without re-reading `receive`. Direct `stream()` iteration does not buffer or cache, so a second `stream()` or subsequent `body()` raises `RuntimeError("Stream consumed")`.
+
+To support full-duplex `StreamingResponse(request.stream())` and `SSEResponse(request.stream())`, [[src/chano/app.py#Chano#__call__]] and [[src/chano/app.py#EndpointASGIApp#__call__]] pass [[src/chano/requests.py#Request#_response_receive]] to the response instead of the raw ASGI `receive`. `Request.stream()` marks `_stream_consumed` synchronously on call, and both [[src/chano/requests.py#Request#_stream_body]] and `_response_receive` serialize `receive()` calls behind a single `asyncio.Lock` (released before yielding chunks) coordinated by a single `_pending_message` slot and a `_body_done` event. While `stream()` is active or a single unread `http.request` frame sits in `_pending_message` with `more_body=True`, `_response_receive` awaits `_body_done` instead of calling `receive()`, preserving ASGI backpressure and ensuring producers that lazily call `request.stream()` after an `await` never lose frames. Once `more_body=False` is seen (set before yielding the terminal chunk) or `_stream_body` exits, `_body_done` wakes `_response_receive` to watch for `http.disconnect` (or immediately replay it if `_disconnected` is already set). [[src/chano/responses.py#StreamingResponse#__call__]] treats [[src/chano/exceptions.py#ClientDisconnect]] from a producer task as a normal disconnect rather than propagating it after `http.response.start`.
+
 ## Server-Sent Events
 
 [[src/chano/responses.py#SSEResponse]] is a streaming response with `content-type: text/event-stream` and `cache-control: no-cache`, which always win over caller `headers`.

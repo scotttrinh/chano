@@ -28,7 +28,9 @@ from typing import (
 import msgspec
 
 from chano._pydantic import enc_hook as _pydantic_enc_hook
-from chano.requests import Message, Receive, Send
+
+if TYPE_CHECKING:
+    from chano.requests import Message, Receive, Send
 
 
 def _header_dict(
@@ -476,6 +478,10 @@ class StreamingResponse(Response):
             await _run_to_completion(_stop(iterator, stream, listen))
         for task in (stream, listen):
             if not task.cancelled() and (error := task.exception()):
+                from chano.exceptions import ClientDisconnect
+
+                if isinstance(error, ClientDisconnect):
+                    continue
                 raise error
 
     @staticmethod

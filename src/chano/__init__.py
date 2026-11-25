@@ -1,6 +1,6 @@
 from chano.app import Boundary, CallNext, Chano, Guard, Recover, Wrap, after
 from chano.config import ChanoConfig, WorkflowConfig, load_config
-from chano.exceptions import RequestValidationError
+from chano.exceptions import ClientDisconnect, RequestValidationError
 from chano.openapi import openapi
 from chano.params import Body, Cookie, Depends, Header, Query, lazy
 from chano.queues import create_queue_app, invoke_queue
@@ -29,6 +29,7 @@ __all__ = [
     "CallNext",
     "Chano",
     "ChanoConfig",
+    "ClientDisconnect",
     "Cookie",
     "Depends",
     "ErrorDetail",

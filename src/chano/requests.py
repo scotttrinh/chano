@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import uuid
-from collections.abc import Awaitable, Callable, MutableMapping
+from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
 from typing import Any
 from urllib.parse import parse_qs, unquote
 
 import msgspec
+
+from chano.exceptions import ClientDisconnect
 
 Scope = MutableMapping[str, Any]
 Message = MutableMapping[str, Any]
@@ -50,6 +53,11 @@ class Request:
         self.scope = scope
         self._receive = receive
         self._body: bytes | None = None
+        self._stream_consumed = False
+        self._receive_lock = asyncio.Lock()
+        self._pending_message: Message | None = None
+        self._body_done = asyncio.Event()
+        self._disconnected = False
         self.path_params: dict[str, str] = {}
         # Generated eagerly so concurrent first reads of ``id`` agree.
         self._generated_id = uuid.uuid4().hex
@@ -153,16 +161,88 @@ class Request:
         query = self.scope.get("query_string", b"").decode("latin-1")
         return parse_qs(query, keep_blank_values=True)
 
+    def stream(self) -> AsyncIterator[bytes]:
+        if self._body is not None:
+            return self._cached_stream()
+        if self._stream_consumed:
+            raise RuntimeError("Stream consumed")
+        self._stream_consumed = True
+        return self._stream_body()
+
+    async def _cached_stream(self) -> AsyncIterator[bytes]:
+        if self._body:
+            yield self._body
+
+    async def _stream_body(self) -> AsyncIterator[bytes]:
+        try:
+            while True:
+                if self._pending_message is not None:
+                    message = self._pending_message
+                    self._pending_message = None
+                else:
+                    async with self._receive_lock:
+                        if self._pending_message is not None:
+                            message = self._pending_message
+                            self._pending_message = None
+                        elif self._disconnected:
+                            raise ClientDisconnect()
+                        else:
+                            message = await self._receive()
+                            if message.get("type") == "http.disconnect":
+                                self._disconnected = True
+                msg_type = message.get("type")
+                if msg_type == "http.request":
+                    body = message.get("body", b"")
+                    more_body = bool(message.get("more_body", False))
+                    if not more_body:
+                        self._body_done.set()
+                    if body:
+                        yield body
+                    if not more_body:
+                        return
+                elif msg_type == "http.disconnect":
+                    self._disconnected = True
+                    raise ClientDisconnect()
+                else:
+                    raise RuntimeError(f"Unexpected ASGI message: {msg_type!r}")
+        finally:
+            self._body_done.set()
+
     async def body(self) -> bytes:
         if self._body is None:
-            chunks = []
-            while True:
-                message = await self._receive()
-                chunks.append(message.get("body", b""))
-                if not message.get("more_body"):
-                    break
-            self._body = b"".join(chunks)
+            self._body = b"".join([chunk async for chunk in self.stream()])
         return self._body
+
+    async def _response_receive(self) -> Message:
+        while True:
+            if self._disconnected:
+                return {"type": "http.disconnect"}
+            if (
+                self._stream_consumed or self._pending_message is not None
+            ) and not self._body_done.is_set():
+                await self._body_done.wait()
+                continue
+            async with self._receive_lock:
+                if self._disconnected:
+                    return {"type": "http.disconnect"}
+                if (
+                    self._stream_consumed or self._pending_message is not None
+                ) and not self._body_done.is_set():
+                    continue
+                message = await self._receive()
+                msg_type = message.get("type")
+                if msg_type == "http.disconnect":
+                    self._disconnected = True
+                    return message
+                if (
+                    msg_type == "http.request"
+                    and self._body is None
+                    and not self._body_done.is_set()
+                ):
+                    self._pending_message = message
+                    if not message.get("more_body", False):
+                        self._body_done.set()
+                return message
 
     async def json(self) -> Any:
         return json.loads(await self.body())

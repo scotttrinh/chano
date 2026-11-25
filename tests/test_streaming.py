@@ -1,4 +1,5 @@
 import asyncio
+import json
 import re
 import time
 
@@ -6,6 +7,9 @@ import msgspec
 import pytest
 
 from chano import (
+    Chano,
+    ClientDisconnect,
+    Request,
     ServerSentEvent,
     SSEResponse,
     StreamingResponse,
@@ -362,3 +366,496 @@ def test_sse_response_enforces_headers():
 def test_sse_response_rejects_invalid_ping(ping):
     with pytest.raises(ValueError, match="ping"):
         SSEResponse(["a"], ping=ping)
+
+
+def _post_app(handler) -> Chano:
+    app = Chano(docs=False)
+    app.add_route("/s", handler, ["POST"])
+    return app
+
+
+def _json_body(sent: list[dict]):
+    raw = b"".join(m["body"] for m in body_messages(sent))
+    return json.loads(raw)
+
+
+def _messages_receive(messages: list[dict]):
+    it = iter(messages)
+
+    async def receive():
+        return next(it)
+
+    return receive
+
+
+# @lat: [[tests#Request body streaming#Streams chunks incrementally]]
+def test_request_stream_incremental(tmp_path):
+    """Each chunk reaches the handler before the next chunk is sent."""
+    target = tmp_path / "upload.bin"
+    release_next: list[asyncio.Event] = []
+    seen_order: list[str] = []
+
+    async def handler(request: Request):
+        chunks: list[str] = []
+        with target.open("wb") as fh:
+            async for chunk in request.stream():
+                fh.write(chunk)
+                seen_order.append(f"read:{chunk.decode()}")
+                chunks.append(chunk.decode())
+                release_next[-1].set()
+        return {"chunks": chunks}
+
+    incoming: list[tuple[bytes, bool]] = [
+        (b"part1-", True),
+        (b"", True),
+        (b"part2-", True),
+        (b"part3", False),
+    ]
+    index = 0
+
+    async def receive():
+        nonlocal index
+        body, more_body = incoming[index]
+        index += 1
+        if body:
+            if release_next:
+                await release_next[-1].wait()
+            release_next.append(asyncio.Event())
+            seen_order.append(f"send:{body.decode()}")
+        return {"type": "http.request", "body": body, "more_body": more_body}
+
+    sent = call_asgi(_post_app(handler), receive, method="POST")
+    assert sent[0]["status"] == 200
+    assert _json_body(sent) == {"chunks": ["part1-", "part2-", "part3"]}
+    assert target.read_bytes() == b"part1-part2-part3"
+    assert seen_order == [
+        "send:part1-",
+        "read:part1-",
+        "send:part2-",
+        "read:part2-",
+        "send:part3",
+        "read:part3",
+    ]
+
+
+# @lat: [[tests#Request body streaming#Empty body yields zero chunks]]
+def test_request_stream_empty_body():
+    async def handler(request: Request):
+        chunks = [chunk.decode() async for chunk in request.stream()]
+        return {"chunks": chunks}
+
+    receive = _messages_receive(
+        [{"type": "http.request", "body": b"", "more_body": False}]
+    )
+    sent = call_asgi(_post_app(handler), receive, method="POST")
+    assert sent[0]["status"] == 200
+    assert _json_body(sent) == {"chunks": []}
+
+
+# @lat: [[tests#Request body streaming#Stream after body yields cached bytes]]
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        pytest.param(b"hello world", ["hello world"], id="non-empty"),
+        pytest.param(b"", [], id="empty"),
+    ],
+)
+def test_request_stream_after_body_uses_cache(payload, expected):
+    async def handler(request: Request):
+        raw = await request.body()
+        first = [chunk.decode() async for chunk in request.stream()]
+        second = [chunk.decode() async for chunk in request.stream()]
+        return {"body": raw.decode(), "first": first, "second": second}
+
+    receive = _messages_receive(
+        [{"type": "http.request", "body": payload, "more_body": False}]
+    )
+    sent = call_asgi(_post_app(handler), receive, method="POST")
+    assert sent[0]["status"] == 200
+    assert _json_body(sent) == {
+        "body": payload.decode(),
+        "first": expected,
+        "second": expected,
+    }
+
+
+async def _consume_stream_twice(request: Request) -> None:
+    _ = [chunk async for chunk in request.stream()]
+    _ = [chunk async for chunk in request.stream()]
+
+
+async def _body_after_stream(request: Request) -> None:
+    _ = [chunk async for chunk in request.stream()]
+    await request.body()
+
+
+# @lat: [[tests#Request body streaming#Consumed stream raises RuntimeError]]
+@pytest.mark.parametrize(
+    "reader",
+    [
+        pytest.param(_consume_stream_twice, id="stream-then-stream"),
+        pytest.param(_body_after_stream, id="stream-then-body"),
+    ],
+)
+def test_request_stream_consumed_raises(reader):
+    async def handler(request: Request):
+        try:
+            await reader(request)
+        except RuntimeError as exc:
+            return {"error": str(exc)}
+        return {"error": None}
+
+    receive = _messages_receive(
+        [{"type": "http.request", "body": b"abc", "more_body": False}]
+    )
+    sent = call_asgi(_post_app(handler), receive, method="POST")
+    assert sent[0]["status"] == 200
+    assert _json_body(sent) == {"error": "Stream consumed"}
+
+
+async def _read_via_stream(request: Request) -> None:
+    async for _ in request.stream():
+        pass
+
+
+async def _read_via_body(request: Request) -> None:
+    await request.body()
+
+
+# @lat: [[tests#Request body streaming#Disconnect raises ClientDisconnect]]
+@pytest.mark.parametrize(
+    "reader",
+    [
+        pytest.param(_read_via_stream, id="stream"),
+        pytest.param(_read_via_body, id="body"),
+    ],
+)
+def test_request_disconnect_raises_client_disconnect(reader):
+    async def handler(request: Request):
+        try:
+            await reader(request)
+        except ClientDisconnect:
+            return {"disconnected": True}
+        return {"disconnected": False}
+
+    receive = _messages_receive(
+        [
+            {"type": "http.request", "body": b"partial", "more_body": True},
+            {"type": "http.disconnect"},
+        ]
+    )
+    sent = call_asgi(_post_app(handler), receive, method="POST")
+    assert sent[0]["status"] == 200
+    assert _json_body(sent) == {"disconnected": True}
+
+
+# @lat: [[tests#Request body streaming#Unexpected ASGI message raises RuntimeError]]
+def test_request_stream_unexpected_message_raises():
+    async def handler(request: Request):
+        try:
+            async for _ in request.stream():
+                pass
+        except RuntimeError as exc:
+            return {"error": str(exc)}
+        return {"error": None}
+
+    receive = _messages_receive([{"type": "websocket.receive"}])
+    sent = call_asgi(_post_app(handler), receive, method="POST")
+    assert sent[0]["status"] == 200
+    assert _json_body(sent) == {"error": "Unexpected ASGI message: 'websocket.receive'"}
+
+
+# @lat: [[tests#Request body streaming#Full-duplex echo with StreamingResponse]]
+def test_streaming_response_from_request_stream_full_duplex():
+    """StreamingResponse(request.stream()) echoes all chunks without stealing."""
+    chunks = [b"alpha", b"beta", b"gamma"]
+    sent_index = 0
+    chunk_acked: list[asyncio.Event] = []
+
+    def handler(request: Request):
+        return StreamingResponse(request.stream())
+
+    async def receive():
+        nonlocal sent_index
+        if sent_index < len(chunks):
+            if chunk_acked:
+                await chunk_acked[-1].wait()
+            body = chunks[sent_index]
+            sent_index += 1
+            chunk_acked.append(asyncio.Event())
+            return {
+                "type": "http.request",
+                "body": body,
+                "more_body": sent_index < len(chunks),
+            }
+        await asyncio.Event().wait()
+
+    def on_send(sent):
+        if sent[-1]["type"] == "http.response.body" and sent[-1].get("body"):
+            chunk_acked[-1].set()
+
+    sent = call_asgi(_post_app(handler), receive, method="POST", on_send=on_send)
+    assert sent[0]["status"] == 200
+    bodies = body_messages(sent)
+    assert [m["body"] for m in bodies] == [b"alpha", b"beta", b"gamma", b""]
+    assert [m["more_body"] for m in bodies] == [True, True, True, False]
+
+
+# @lat: [[tests#Request body streaming#Disconnect after stream cancels response]]
+def test_streaming_response_observes_disconnect_after_request_stream_finishes():
+    """After request.stream() finishes, http.disconnect still cancels the stream."""
+    closed: list[bool] = []
+    disconnect = asyncio.Event()
+
+    def handler(request: Request):
+        async def produce():
+            try:
+                async for chunk in request.stream():
+                    yield chunk
+                while True:
+                    await asyncio.sleep(0.001)
+                    yield b"tick"
+            finally:
+                closed.append(True)
+
+        return StreamingResponse(produce())
+
+    incoming = iter(
+        [
+            {"type": "http.request", "body": b"in-1", "more_body": True},
+            {"type": "http.request", "body": b"in-2", "more_body": False},
+        ]
+    )
+
+    async def receive():
+        msg = next(incoming, None)
+        if msg is not None:
+            return msg
+        await disconnect.wait()
+        return {"type": "http.disconnect"}
+
+    def on_send(sent):
+        ticks = [m for m in body_messages(sent) if m["body"] == b"tick"]
+        if len(ticks) == 2:
+            disconnect.set()
+
+    sent = call_asgi(_post_app(handler), receive, method="POST", on_send=on_send)
+    bodies = [m["body"] for m in body_messages(sent)]
+    assert bodies[:2] == [b"in-1", b"in-2"]
+    assert bodies[2:].count(b"tick") >= 2
+    assert closed == [True]
+
+
+# @lat: [[tests#Request body streaming#Disconnect during stream stops response]]
+def test_streaming_response_disconnect_during_request_stream():
+    """A disconnect seen by request.stream() is replayed to the response listener."""
+    saw_disconnect: list[bool] = []
+    closed: list[bool] = []
+    receive_calls = 0
+
+    def handler(request: Request):
+        async def produce():
+            try:
+                try:
+                    async for chunk in request.stream():
+                        yield chunk
+                except ClientDisconnect:
+                    saw_disconnect.append(True)
+                    await asyncio.Event().wait()
+            finally:
+                closed.append(True)
+
+        return StreamingResponse(produce())
+
+    incoming = iter(
+        [
+            {"type": "http.request", "body": b"first", "more_body": True},
+            {"type": "http.disconnect"},
+        ]
+    )
+
+    async def receive():
+        nonlocal receive_calls
+        receive_calls += 1
+        msg = next(incoming, None)
+        if msg is None:
+            raise AssertionError("receive called again after http.disconnect")
+        return msg
+
+    sent = call_asgi(_post_app(handler), receive, method="POST")
+    assert [m["body"] for m in body_messages(sent)] == [b"first"]
+    assert saw_disconnect == [True]
+    assert closed == [True]
+    assert receive_calls == 2
+
+
+# @lat: [[tests#Request body streaming#SSEResponse receives all request stream chunks]]
+def test_sse_response_from_request_stream_no_stolen_chunks():
+    """SSEResponse(request.stream()) delivers every chunk without listener theft."""
+    incoming = iter(
+        [
+            {"type": "http.request", "body": b"one", "more_body": True},
+            {"type": "http.request", "body": b"two", "more_body": True},
+            {"type": "http.request", "body": b"three", "more_body": False},
+        ]
+    )
+
+    def handler(request: Request):
+        return SSEResponse(request.stream())
+
+    async def receive():
+        msg = next(incoming, None)
+        if msg is not None:
+            return msg
+        await asyncio.Event().wait()
+
+    sent = call_asgi(_post_app(handler), receive, method="POST")
+    assert sent[0]["status"] == 200
+    bodies = [m["body"] for m in body_messages(sent)]
+    expected = [
+        ServerSentEvent(data=chunk).encode() for chunk in (b"one", b"two", b"three")
+    ]
+    assert bodies == [*expected, b""]
+
+
+# @lat: [[tests#Request body streaming#Disconnect while paused on terminal chunk]]
+def test_streaming_response_disconnect_while_paused_on_terminal_chunk():
+    """A producer pausing inside the terminal-chunk iteration still sees disconnect."""
+    closed: list[bool] = []
+    disconnect = asyncio.Event()
+
+    def handler(request: Request):
+        async def produce():
+            try:
+                async for chunk in request.stream():
+                    yield chunk
+                    await asyncio.Event().wait()
+            finally:
+                closed.append(True)
+
+        return StreamingResponse(produce())
+
+    incoming = iter([{"type": "http.request", "body": b"only", "more_body": False}])
+
+    async def receive():
+        msg = next(incoming, None)
+        if msg is not None:
+            return msg
+        await disconnect.wait()
+        return {"type": "http.disconnect"}
+
+    def on_send(sent):
+        if any(m["body"] == b"only" for m in body_messages(sent)):
+            disconnect.set()
+
+    sent = call_asgi(_post_app(handler), receive, method="POST", on_send=on_send)
+    assert sent[0]["status"] == 200
+    assert [m["body"] for m in body_messages(sent)] == [b"only"]
+    assert closed == [True]
+
+
+# @lat: [[tests#Request body streaming#StreamingResponse ignores ClientDisconnect]]
+def test_streaming_response_request_stream_disconnect_exits_cleanly():
+    """Direct StreamingResponse(request.stream()) treats ClientDisconnect as normal."""
+    first_sent = asyncio.Event()
+    sent_first = False
+
+    def handler(request: Request):
+        return StreamingResponse(request.stream())
+
+    async def receive():
+        nonlocal sent_first
+        if not sent_first:
+            sent_first = True
+            return {"type": "http.request", "body": b"first", "more_body": True}
+        await first_sent.wait()
+        return {"type": "http.disconnect"}
+
+    def on_send(sent):
+        if any(m["body"] == b"first" for m in body_messages(sent)):
+            first_sent.set()
+
+    sent = call_asgi(_post_app(handler), receive, method="POST", on_send=on_send)
+    assert sent[0]["status"] == 200
+    assert [m["body"] for m in body_messages(sent)] == [b"first"]
+
+
+# @lat: [[tests#Request body streaming#Lazy stream after await loses no chunks]]
+def test_streaming_response_lazy_request_stream_after_await():
+    """Calling request.stream() after an await in a producer receives every chunk."""
+    incoming = iter(
+        [
+            {"type": "http.request", "body": b"one", "more_body": True},
+            {"type": "http.request", "body": b"two", "more_body": True},
+            {"type": "http.request", "body": b"three", "more_body": False},
+        ]
+    )
+
+    def handler(request: Request):
+        async def produce():
+            await asyncio.sleep(0)
+            async for chunk in request.stream():
+                yield chunk
+
+        return StreamingResponse(produce())
+
+    async def receive():
+        msg = next(incoming, None)
+        if msg is not None:
+            return msg
+        await asyncio.Event().wait()
+
+    sent = call_asgi(_post_app(handler), receive, method="POST")
+    assert sent[0]["status"] == 200
+    bodies = body_messages(sent)
+    assert [m["body"] for m in bodies] == [b"one", b"two", b"three", b""]
+    assert [m["more_body"] for m in bodies] == [True, True, True, False]
+
+
+# @lat: [[tests#Request body streaming#Backpressure prevents draining receive ahead]]
+def test_streaming_response_request_stream_backpressure():
+    """While send() is blocked on chunk 1, receive() is not drained ahead."""
+
+    async def run():
+        chunks = [f"chunk-{i}".encode() for i in range(10)]
+        receive_calls = 0
+        first_send_entered = asyncio.Event()
+        release_send = asyncio.Event()
+        sent: list[dict] = []
+
+        def handler(request: Request):
+            return StreamingResponse(request.stream())
+
+        async def receive():
+            nonlocal receive_calls
+            if receive_calls < len(chunks):
+                body = chunks[receive_calls]
+                receive_calls += 1
+                return {
+                    "type": "http.request",
+                    "body": body,
+                    "more_body": receive_calls < len(chunks),
+                }
+            await asyncio.Event().wait()
+
+        async def send(message):
+            if (
+                message["type"] == "http.response.body"
+                and message["body"] == b"chunk-0"
+            ):
+                first_send_entered.set()
+                await release_send.wait()
+            sent.append(message)
+
+        app = _post_app(handler)
+        task = asyncio.ensure_future(app(stream_scope("POST"), receive, send))
+        await first_send_entered.wait()
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert receive_calls == 1, f"drained {receive_calls} chunks while send blocked"
+        release_send.set()
+        await asyncio.wait_for(task, timeout=5)
+        bodies = body_messages(sent)
+        assert [m["body"] for m in bodies] == [*chunks, b""]
+
+    asyncio.run(asyncio.wait_for(run(), timeout=5))

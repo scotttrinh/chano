@@ -431,7 +431,9 @@ class Chano:
                 response = await self._handle(request)
             except Exception as exc:  # unmatched paths and middleware errors
                 response = error_response(exc)
-            await response(receive, send, include_body=request.method != "HEAD")
+            await response(
+                request._response_receive, send, include_body=request.method != "HEAD"
+            )
 
     async def _handle(self, request: Request) -> Response:
         """Match in Build Output order: literal routes, then docs and
@@ -583,4 +585,6 @@ class EndpointASGIApp:
                     response = JSONResponse(result)
             except Exception as exc:
                 response = error_response(exc)
-            await response(receive, send, include_body=request.method != "HEAD")
+            await response(
+                request._response_receive, send, include_body=request.method != "HEAD"
+            )

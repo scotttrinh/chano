@@ -7,6 +7,10 @@ import msgspec
 from chano.status import UnprocessableContent
 
 
+class ClientDisconnect(Exception):
+    """Raised when the client disconnects while reading the request body."""
+
+
 class ValidationErrorDetail(msgspec.Struct):
     detail: list[dict[str, Any]]
 

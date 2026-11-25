@@ -20,10 +20,34 @@ Annotate any handler or dependency parameter with `request: Request` to receive 
 | `request.headers` | `dict[str, str]` | Request headers keyed by lower-case name |
 | `request.cookies` | `dict[str, str]` | Parsed cookies; unquoted, first occurrence wins |
 | `await request.body()` | `bytes` | Cached raw request body bytes |
+| `request.stream()` | `AsyncIterator[bytes]` | Async iterator yielding non-empty request body chunks |
 | `await request.json()` | `Any` | Parsed JSON request body |
 | `request.id` | `str` | `x-vercel-id` header, or a generated UUID4 hex string locally |
 | `request.ip` | `str \| None` | `x-real-ip`, else first `x-forwarded-for`, else ASGI client host |
 | `request.geo` | `Geo` | Frozen struct populated from Vercel `x-vercel-ip-*` headers |
+
+### Streaming request bodies
+
+Use `request.stream()` to read large uploads incrementally without buffering the whole payload in memory, or pass it directly to `StreamingResponse` for full-duplex streaming:
+
+```python
+from chano import ClientDisconnect, Request, StreamingResponse
+
+async def POST(request: Request) -> dict[str, int]:
+    size = 0
+    try:
+        async for chunk in request.stream():
+            size += len(chunk)
+    except ClientDisconnect:
+        return {"received": size}
+    return {"received": size}
+```
+
+- Each yielded chunk is a non-empty `bytes` payload; an empty request body yields zero chunks.
+- Calling `await request.body()` caches the body so a later `request.stream()` yields the cached bytes (or zero chunks if empty).
+- Consuming `request.stream()` directly does not cache the body; calling `request.stream()` a second time or calling `await request.body()` afterward raises `RuntimeError("Stream consumed")`.
+- If the client disconnects while reading via `request.stream()` or `await request.body()`, Chano raises `ClientDisconnect` (exported from `chano`).
+- Returning `StreamingResponse(request.stream())` or `SSEResponse(request.stream())` coordinates ASGI `receive` behind a single reader so the response disconnect listener never drops `http.request` chunks and `ClientDisconnect` exits the stream cleanly.
 
 ### `Geo` fields
 
