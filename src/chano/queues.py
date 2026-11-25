@@ -4,8 +4,8 @@ Each ``queue.py`` module exports a ``CONSUME`` handler (sync or async) and
 module-level ``topic`` (required), plus optional queue tuning:
 
 - ``consumer`` (str, default ``"default"``)
-- ``retry_after`` (int >= 0 -> ``retryAfterSeconds``)
-- ``initial_delay`` (int >= 0 -> ``initialDelaySeconds``)
+- ``retry_after`` (int in ``1..86400`` -> ``retryAfterSeconds``)
+- ``initial_delay`` (int in ``0..86400`` -> ``initialDelaySeconds``)
 - ``max_concurrency`` (int >= 1 -> ``maxConcurrency``)
 
 Plus the standard Vercel function options (``max_duration``, ``memory``,
@@ -322,7 +322,7 @@ def resolve_queues(
     to each ``queue.py``'s ``consumer`` declaration).
     """
     normalized_consumer = (
-        sanitize_queue_name(consumer) if consumer is not None else None
+        sanitize_queue_name(consumer.strip()) if consumer is not None else None
     )
     matches = [
         q

@@ -242,8 +242,7 @@ def _substitute_typevars(annotation: Any, mapping: dict[Any, Any]) -> Any:
 
 def resolve_outcome_content(annotation: Any) -> Any:
     """Resolve ``T`` in ``Outcome[T]`` for an ``Outcome`` subclass or alias."""
-    while get_origin(annotation) is Annotated:
-        annotation = get_args(annotation)[0]
+    annotation = _unwrap_type(annotation)
     origin = get_origin(annotation)
     cls = origin or annotation
     args = get_args(annotation) if origin is not None else ()

@@ -248,7 +248,7 @@ Covers recursive project helpers with relative imports and cycles, transitive `R
 
 ## Import tracer and closure
 
-Verify [[src/chano/build.py#_trace_function_chains]], [[src/chano/build.py#_resolve_closure_with_reasons]], [[src/chano/build.py#ALWAYS_INCLUDED]], and [[src/chano/build.py#_read_route_include]] handle tracer, closure, size-report, and validation edge cases against a synthetic store.
+Verify [[src/chano/build.py#_trace_function_chains]], [[src/chano/build.py#_resolve_closure_with_reasons]], [[src/chano/build.py#ALWAYS_INCLUDED]], and [[src/chano/build.py#_read_module_include]] handle tracer, closure, size-report, and validation edge cases against a synthetic store.
 
 Covers `vercel` inclusion with its closure, cyclic `Requires-Dist`, namespace packages in the store and project helpers, package `__init__.py` tracing, `if TYPE_CHECKING:` `else` branches and `if not TYPE_CHECKING:`, aliased/relative `importlib.import_module`, unknown/stdlib ignores, per-function size warnings, and `ValueError` on invalid route `include`.
 
@@ -668,6 +668,10 @@ Verify [[src/chano/build.py#emit_build]] emits `_queues/*.func` with `queue/v2be
 
 Verify `chano queue list` and `chano queue send` (including `--consumer` and stdin `-` payload) list and invoke local queue consumers.
 
+### Consumer lookup strips whitespace
+
+Verify [[src/chano/queues.py#resolve_queues]] strips whitespace from `consumer` before sanitizing so `" default "` matches `"default"` as in [[src/chano/queues.py#read_queue_trigger]].
+
 ## Vercel Schedules
 
 Tests for `app/**/schedule.py` private jobs, cron/timezone/name validation, build output, and `chano schedule` CLI commands.
@@ -736,6 +740,10 @@ Verify [[src/chano/workflows.py#introspect_workflow_triggers]] attributes only s
 
 Verify multi-namespace `Workflows` registries mount `/.well-known/workflow/v1/flow` and `manifest.json` in `create_app`, route by `x-vqs-queue-name`, manage lifespan hooks, and emit valid build artifacts.
 
+### Multi-namespace step topic routing
+
+Verify [[src/chano/workflows.py#create_workflow_app]] routes step-prefixed `x-vqs-queue-name` headers to the matching namespace registry and raises `ValueError` on unexpected ASGI body messages.
+
 ## Combined Vercel primitives
 
 Verify a single project combining HTTP `route.py`, `queue.py`, `schedule.py`, and `[[tool.vercel.workflows]]` builds cleanly with all functions, `config.json` sections, and isolated OpenAPI output.
@@ -763,6 +771,26 @@ Verify a queue consumer returning or raising a `Failure` triggers a retry even w
 ### Static typing fixtures
 
 Verify `ty check` passes on [[tests/typing/ok.py]] and reports errors on the exact marked lines of [[tests/typing/bad.py]].
+
+### Outcome type aliases
+
+Verify routes returning PEP 695 `Outcome` aliases produce the expected HTTP response and OpenAPI schema, and [[src/chano/responses.py#resolve_outcome_content]] unwraps plain and generic aliases.
+
+## List query parameters with unions and aliases
+
+Verify [[src/chano/params.py#Field#is_list]] binds list-only unions and PEP 695 aliases as repeated query lists while keeping mixed scalar/list unions scalar.
+
+Covers `list[str] | None`, `Optional[list[str]]`, PEP 695 aliases, and a mixed `str | list[str]` query parameter paired with a scalar `Depends` (both request handling and `/openapi.json`).
+
+## Embedded body fields on malformed or non-object JSON
+
+Verify [[src/chano/params.py#Endpoint#_resolve]] reports only the top-level body error for malformed or non-object JSON on routes with multiple embedded `Body()` fields, while empty bodies still report missing fields.
+
+## Root-only build ignores preserve nested public and tests
+
+Verify [[src/chano/build.py#_project_ignore]] ignores `public` and `tests` only at the project root while ignoring dotfiles, `__pycache__`, `*.pyc`, `node_modules`, and `uv.lock` at every depth.
+
+Invokes built functions in a fresh interpreter after deleting the source tree to cover `app/public/` importing a nested `tests/` package alongside nested `node_modules`, a dangling symlink inside nested `subpkg/tests/fixtures/`, `public -> app/images`, and `public -> shared` with an imported `shared` package.
 
 ## Checked Depends
 

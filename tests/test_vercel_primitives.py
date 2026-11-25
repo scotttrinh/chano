@@ -8,6 +8,8 @@ import functools
 import importlib
 import io
 import json
+import shutil
+import subprocess
 import sys
 import tomllib
 import types
@@ -26,8 +28,7 @@ from chano import (
     create_app,
     create_queue_app,
     create_schedule_app,
-    create_workflow_flow_app,
-    create_workflow_step_app,
+    create_workflow_app,
     invoke_queue,
     invoke_schedule,
     load_config,
@@ -1609,8 +1610,6 @@ def test_workflow_build_output_and_sequential_replays(
             }
         ],
     }
-    assert "create_workflow_flow_app" in flow_spec.entrypoint
-
     out = emit_build(plan)
     config_json = json.loads((out / "config.json").read_text())
     assert config_json == {
@@ -1776,9 +1775,7 @@ def test_workflow_local_dev_without_sdk_is_graceful(
     write_files(project, {"wf_test_plain.py": "wf = object()\n"})
     sys.path.insert(0, str(project))
     with pytest.raises(RuntimeError, match="vercel-workflow is required"):
-        create_workflow_flow_app(["wf_test_plain:wf"])
-    with pytest.raises(RuntimeError, match="vercel-workflow is required"):
-        create_workflow_step_app(["wf_test_plain:wf"])
+        create_workflow_app(["wf_test_plain:wf"])
 
 
 # @lat: [[tests#Vercel Workflows#Real vercel-workflow SDK end-to-end run and build]]
@@ -2041,7 +2038,7 @@ def test_workflow_real_sdk_shape_local_dev_and_build(
     monkeypatch.setitem(sys.modules, "vercel.queue", fake_queue)
 
     project = write_files(
-        tmp_path,
+        tmp_path / "proj",
         {
             "pyproject.toml": (
                 '[project]\nname = "wfsdk"\nversion = "0.1.0"\n'
@@ -2136,7 +2133,9 @@ def test_workflow_real_sdk_shape_local_dev_and_build(
             consumer_group="default",
         )
     )
-    plan_with_step = plan_build(project, python="3.12", platform=None)
+    plan_with_step = plan_build(
+        project, python="3.12", platform=None, output=tmp_path / "emitted_out"
+    )
     by_name_step = {f.name: f for f in plan_with_step.functions}
     assert by_name_step[".well-known/workflow/v1/step"].vc_config[
         "experimentalTriggers"
@@ -2170,14 +2169,116 @@ def test_workflow_real_sdk_shape_local_dev_and_build(
     monkeypatch.setitem(sys.modules, "vercel_runtime", fake_vr)
     monkeypatch.setitem(sys.modules, "vercel_runtime.workers", fake_workers)
 
-    flow_app = create_workflow_flow_app(["wf_test_real:default_wf"])
-    step_app = create_workflow_step_app(["wf_test_real:default_wf"])
-    assert make_client(flow_app)("POST", "/.well-known/workflow/v1/flow").json() == {
+    wf_app = create_workflow_app(["wf_test_real:default_wf"])
+    assert make_client(wf_app)("POST", "/.well-known/workflow/v1/flow").json() == {
         "served_by": "create_queue_service_app"
     }
-    assert make_client(step_app)("POST", "/.well-known/workflow/v1/step").json() == {
+    assert make_client(wf_app)("POST", "/.well-known/workflow/v1/step").json() == {
         "served_by": "create_queue_service_app"
     }
+
+    # Emit build and invoke each generated entrypoint in a fresh subprocess
+    # after deleting the source tree so imports come only from the artifact.
+    def fake_install(_root: Path, vendor_dir: Path, *_args: Any) -> None:
+        write_files(
+            vendor_dir,
+            _fake_store_files(
+                {
+                    "chano": {"chano/__init__.py": ""},
+                    "vercel-runtime": {"vercel_runtime/__init__.py": ""},
+                    "vercel-workflow": {"vercel/workflow/__init__.py": ""},
+                    "vercel-queue": {"vercel/queue/__init__.py": ""},
+                }
+            ),
+        )
+
+    monkeypatch.setattr(build_module, "_install_dependencies", fake_install)
+    monkeypatch.setattr(build_module, "_check_function_imports", lambda *args: None)
+    emitted_out = emit_build(plan_with_step)
+    shutil.rmtree(project)
+
+    runner = (
+        "import asyncio, json, sys, types, httpx\n"
+        "from dataclasses import dataclass\n"
+        "@dataclass\n"
+        "class FakeHTTPResponse:\n"
+        "    status: int\n"
+        "    body: bytes\n"
+        "    headers: dict[str, str]\n"
+        "class FakeWorkflows:\n"
+        "    def __init__(self, *, namespace=None):\n"
+        "        self.namespace = namespace\n"
+        "    @property\n"
+        "    def http_handler(self):\n"
+        "        ns = self.namespace\n"
+        "        async def handle(request):\n"
+        '            body = b"".join([c async for c in request.aiter_bytes()])\n'
+        "            return FakeHTTPResponse(\n"
+        "                200,\n"
+        "                json.dumps({\n"
+        '                    "namespace": ns,\n'
+        '                    "method": request.method,\n'
+        '                    "url": request.url,\n'
+        '                    "queue": request.headers.get("x-vqs-queue-name"),\n'
+        '                    "body": json.loads(body) if body else None,\n'
+        "                }).encode(),\n"
+        '                {"content-type": "application/json"},\n'
+        "            )\n"
+        "        return handle\n"
+        'fake_vercel = types.ModuleType("vercel")\n'
+        'fake_wf = types.ModuleType("vercel.workflow")\n'
+        "fake_wf.Workflows = FakeWorkflows\n"
+        "fake_vercel.workflow = fake_wf\n"
+        'sys.modules["vercel"] = fake_vercel\n'
+        'sys.modules["vercel.workflow"] = fake_wf\n'
+        'sys.modules["vercel_runtime"] = None\n'
+        'sys.modules["vercel_runtime.workers"] = None\n'
+        "import index\n"
+        "func_kind, queue_name = sys.argv[1], sys.argv[2]\n"
+        "async def run():\n"
+        "    async with httpx.AsyncClient(\n"
+        "        transport=httpx.ASGITransport(app=index.app),\n"
+        '        base_url="http://test",\n'
+        "    ) as client:\n"
+        "        r = await client.post(\n"
+        '            f"/.well-known/workflow/v1/{func_kind}",\n'
+        '            json={"run": func_kind},\n'
+        '            headers={"x-vqs-queue-name": queue_name},\n'
+        "        )\n"
+        '        print(json.dumps({"status": r.status_code, "body": r.json()}))\n'
+        "asyncio.run(run())\n"
+    )
+    for func_kind, queue_name in (
+        ("flow", "__payments_wkf_workflow_emitted"),
+        ("step", "__payments_wkf_step_emitted"),
+    ):
+        func_dir = (
+            emitted_out
+            / "functions"
+            / ".well-known"
+            / "workflow"
+            / "v1"
+            / f"{func_kind}.func"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", runner, func_kind, queue_name],
+            cwd=func_dir,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert proc.returncode == 0, proc.stderr
+        payload = json.loads(proc.stdout.strip().splitlines()[-1])
+        assert payload == {
+            "status": 200,
+            "body": {
+                "namespace": "payments",
+                "method": "POST",
+                "url": f"/.well-known/workflow/v1/{func_kind}",
+                "queue": queue_name,
+                "body": {"run": func_kind},
+            },
+        }
 
 
 # @lat: [[tests#Combined Vercel primitives]]
@@ -2550,3 +2651,107 @@ def test_boundary_is_http_only_for_routes_queues_and_schedules(
         create_schedule_app(private_app_dir, "_schedules/nightly")
     )
     assert deployed_s_client("POST", "/_schedules/nightly").json() == {"nightly": True}
+
+
+# @lat: [[tests#Vercel Workflows#Multi-namespace step topic routing]]
+def test_workflow_multi_namespace_step_prefix_routing(
+    tmp_path: Path, monkeypatch: Any, isolated_sys_path: Any
+):
+    write_files(
+        tmp_path,
+        {
+            "wf_test_step_routing.py": (
+                "import json\n"
+                "from types import SimpleNamespace\n"
+                "\n"
+                "class FakeRegistry:\n"
+                "    def __init__(self, namespace=None):\n"
+                "        self.namespace = namespace\n"
+                "\n"
+                "    async def http_handler(self, req):\n"
+                "        chunks = [c async for c in req.aiter_bytes()]\n"
+                "        return SimpleNamespace(\n"
+                "            status=200,\n"
+                '            headers={"content-type": "application/json"},\n'
+                "            body=json.dumps({\n"
+                '                "namespace": self.namespace,\n'
+                '                "queue": req.headers.get("x-vqs-queue-name"),\n'
+                '                "body": json.loads(b"".join(chunks) or b"{}"),\n'
+                "            }).encode(),\n"
+                "        )\n"
+                "\n"
+                "default_wf = FakeRegistry()\n"
+                'payments_wf = FakeRegistry(namespace="payments")\n'
+            ),
+        },
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setitem(sys.modules, "vercel_runtime", None)
+    monkeypatch.setitem(sys.modules, "vercel_runtime.workers", None)
+
+    app = create_workflow_app(
+        ["wf_test_step_routing:default_wf", "wf_test_step_routing:payments_wf"]
+    )
+    client = make_client(app)
+
+    flow_resp = client(
+        "POST",
+        "/.well-known/workflow/v1/flow",
+        json={"kind": "flow"},
+        headers={"x-vqs-queue-name": "__payments_wkf_workflow_1"},
+    )
+    assert flow_resp.status_code == 200
+    assert flow_resp.json()["namespace"] == "payments"
+
+    step_resp = client(
+        "POST",
+        "/.well-known/workflow/v1/step",
+        json={"kind": "step"},
+        headers={"x-vqs-queue-name": "__payments_wkf_step_1"},
+    )
+    assert step_resp.status_code == 200
+    assert step_resp.json()["namespace"] == "payments"
+
+    # Unexpected ASGI message while reading request body raises ValueError.
+    messages = iter([{"type": "websocket.receive"}, {"type": "http.disconnect"}])
+
+    async def receive() -> Message:
+        return next(messages)
+
+    async def send(_message: Message) -> None:
+        pass
+
+    scope: dict[str, Any] = {
+        "type": "http",
+        "method": "POST",
+        "path": "/.well-known/workflow/v1/flow",
+        "query_string": b"",
+        "headers": [],
+    }
+
+    async def invoke_raw() -> None:
+        await app(scope, receive, send)
+
+    with pytest.raises(ValueError, match="unexpected ASGI message"):
+        asyncio.run(invoke_raw())
+
+
+# @lat: [[tests#Vercel Queues#Consumer lookup strips whitespace]]
+def test_queue_consumer_lookup_strips_whitespace(tmp_path: Path):
+    project = write_files(
+        tmp_path,
+        {
+            "app/orders/queue.py": (
+                'topic = "orders"\n'
+                'consumer = " default "\n'
+                'def CONSUME(item_id: int):\n    return {"item_id": item_id}\n'
+            ),
+        },
+    )
+    result = asyncio.run(
+        invoke_queue(project / "app", "orders", 7, consumer=" default ")
+    )
+    assert result == {"item_id": 7}
+    assert asyncio.run(
+        invoke_queue(project / "app", "orders", 8, consumer="default")
+    ) == {"item_id": 8}

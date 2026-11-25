@@ -1013,3 +1013,33 @@ def test_typing_fixtures():
         )
     }
     assert reported_lines == expected_lines, bad_result.stdout + bad_result.stderr
+
+
+type _MyOK = OK[int]
+type _GenericOK[T] = OK[T]
+
+
+# @lat: [[tests#Outcomes#Outcome type aliases]]
+def test_outcome_type_alias_route_and_resolve_content():
+    from chano.responses import resolve_outcome_content
+
+    app = Chano()
+
+    def get_number() -> _MyOK:
+        return OK(42)
+
+    app.add_route("/num", get_number, methods=["GET"])
+    client = make_client(app)
+
+    resp = client("GET", "/num")
+    assert resp.status_code == 200
+    assert resp.json() == 42
+
+    schema = app.openapi()
+    ok_schema = schema["paths"]["/num"]["get"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]
+    assert ok_schema == {"type": "integer"}
+
+    assert resolve_outcome_content(_MyOK) is int
+    assert resolve_outcome_content(_GenericOK[str]) is str

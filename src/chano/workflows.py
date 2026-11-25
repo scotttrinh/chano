@@ -43,11 +43,8 @@ if TYPE_CHECKING:
 WORKFLOW_FLOW_FUNCTION = ".well-known/workflow/v1/flow"
 WORKFLOW_STEP_FUNCTION = ".well-known/workflow/v1/step"
 WORKFLOW_FLOW_PATH = f"/{WORKFLOW_FLOW_FUNCTION}"
-WORKFLOW_STEP_PATH = f"/{WORKFLOW_STEP_FUNCTION}"
 WORKFLOW_MANIFEST_PATH = "/.well-known/workflow/v1/manifest.json"
 
-WORKFLOW_FLOW_TOPIC = "__wkf_workflow_*"
-WORKFLOW_STEP_TOPIC = "__wkf_step_*"
 WORKFLOW_CONSUMER = "default"
 WORKFLOW_FLOW_MAX_DURATION = 60
 WORKFLOW_STEP_MAX_DURATION = "max"
@@ -431,16 +428,17 @@ class _ASGIHTTPRequest:
             msg_type = message.get("type")
             if msg_type == "http.disconnect":
                 return
-            if msg_type == "http.request":
-                body = cast("bytes", message.get("body", b""))
-                if body:
-                    if chunk_size is not None and chunk_size > 0:
-                        for idx in range(0, len(body), chunk_size):
-                            yield body[idx : idx + chunk_size]
-                    else:
-                        yield body
-                if not message.get("more_body", False):
-                    return
+            if msg_type != "http.request":
+                raise ValueError(f"unexpected ASGI message: {msg_type!r}")
+            body = cast("bytes", message.get("body", b""))
+            if body:
+                if chunk_size is not None and chunk_size > 0:
+                    for idx in range(0, len(body), chunk_size):
+                        yield body[idx : idx + chunk_size]
+                else:
+                    yield body
+            if not message.get("more_body", False):
+                return
 
 
 def _http_handler_to_asgi(handler: Callable[[Any], Awaitable[Any]]) -> ASGIApp:
@@ -498,12 +496,13 @@ def _registry_manifest_handler(
 def _registries_flow_asgi(registries: Sequence[Any]) -> ASGIApp | None:
     """Build an ASGI app serving ``Workflows.http_handler`` for one or more
     registries, routing multi-namespace requests by ``x-vqs-queue-name``."""
-    entries: list[tuple[str, Callable[[Any], Awaitable[Any]]]] = []
+    entries: list[tuple[tuple[str, str], Callable[[Any], Awaitable[Any]]]] = []
     for registry in registries:
         handler = _registry_http_handler(registry)
         if handler is not None:
             ns = getattr(registry, "namespace", None)
-            entries.append((get_workflow_topic_prefix(ns), handler))
+            prefixes = (get_workflow_topic_prefix(ns), get_step_topic_prefix(ns))
+            entries.append((prefixes, handler))
     if not entries:
         return None
     if len(entries) == 1:
@@ -512,8 +511,8 @@ def _registries_flow_asgi(registries: Sequence[Any]) -> ASGIApp | None:
     async def dispatch(request: _ASGIHTTPRequest) -> Any:
         queue_name = request.headers.get("x-vqs-queue-name", "")
         if queue_name:
-            for prefix, handler in entries:
-                if queue_name.startswith(prefix):
+            for prefixes, handler in entries:
+                if queue_name.startswith(prefixes):
                     return await handler(request)
         return await entries[0][1](request)
 
@@ -539,17 +538,13 @@ def _try_create_queue_service_app() -> ASGIApp | None:
 
 def create_workflow_app(
     entrypoints: Sequence[str | WorkflowConfig],
-    *,
-    kind: WorkflowKind,
 ) -> ASGIApp:
-    """Load configured workflow ``entrypoints`` and return the ASGI app for
-    ``kind`` (``"flow"`` or ``"step"``).
+    """Load configured workflow ``entrypoints`` and return their ASGI app.
 
     On Vercel, prefers ``vercel_runtime.workers.create_queue_service_app()``
     backed by the ``vercel.queue`` subscriptions registered when ``Workflows``
     is imported, and falls back to adapting ``Workflows.http_handler``.
     """
-    _ = kind
     registries = [load_workflow_entrypoint(ep) for ep in entrypoints]
     if queue_app := _try_create_queue_service_app():
         return queue_app
@@ -559,20 +554,6 @@ def create_workflow_app(
         "vercel-workflow is required to serve workflow handlers; "
         "install `vercel-workflow` in your project"
     )
-
-
-def create_workflow_flow_app(
-    entrypoints: Sequence[str | WorkflowConfig],
-) -> ASGIApp:
-    """Build the ASGI app for ``.well-known/workflow/v1/flow.func``."""
-    return create_workflow_app(entrypoints, kind="flow")
-
-
-def create_workflow_step_app(
-    entrypoints: Sequence[str | WorkflowConfig],
-) -> ASGIApp:
-    """Build the ASGI app for ``.well-known/workflow/v1/step.func``."""
-    return create_workflow_app(entrypoints, kind="step")
 
 
 async def _start_workflow_world() -> None:

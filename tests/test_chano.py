@@ -6996,3 +6996,261 @@ def test_annotated_query_meta_with_default():
     assert client("GET", "/items").json() == {"limit": 10}
     assert client("GET", "/items?limit=42").json() == {"limit": 42}
     assert client("GET", "/items?limit=100").status_code == 422
+
+
+type _QueryTags = list[str]
+
+
+# @lat: [[tests#List query parameters with unions and aliases]]
+def test_list_query_unions_and_type_aliases():
+    from typing import Optional
+
+    app = Chano()
+
+    def union_pipe(tags: Annotated[list[str] | None, Query()] = None):
+        return {"tags": tags}
+
+    def union_optional(tags: Optional[list[str]] = None):  # noqa: UP045
+        return {"tags": tags}
+
+    def alias_direct(tags: _QueryTags):
+        return {"tags": tags}
+
+    def alias_optional(tags: Annotated[_QueryTags | None, Query()] = None):
+        return {"tags": tags}
+
+    app.add_route("/pipe", union_pipe, methods=["GET"])
+    app.add_route("/optional", union_optional, methods=["GET"])
+    app.add_route("/alias", alias_direct, methods=["GET"])
+    app.add_route("/alias-opt", alias_optional, methods=["GET"])
+    client = make_client(app)
+
+    for path in ("/pipe", "/optional", "/alias", "/alias-opt"):
+        resp = client("GET", f"{path}?tags=a&tags=b")
+        assert resp.status_code == 200, (path, resp.text)
+        assert resp.json() == {"tags": ["a", "b"]}
+
+        single = client("GET", f"{path}?tags=only")
+        assert single.status_code == 200, (path, single.text)
+        assert single.json() == {"tags": ["only"]}
+
+    for path in ("/pipe", "/optional", "/alias-opt"):
+        absent = client("GET", path)
+        assert absent.status_code == 200
+        assert absent.json() == {"tags": None}
+
+    def dep_q(q: str) -> str:
+        return q
+
+    def mixed(
+        q: Annotated[str | list[str], Query()],
+        from_dep: str = Depends(dep_q),
+    ):
+        return [q, from_dep]
+
+    app.add_route("/mixed", mixed, methods=["GET"])
+    mixed_resp = client("GET", "/mixed?q=a")
+    assert mixed_resp.status_code == 200
+    assert mixed_resp.json() == ["a", "a"]
+
+    openapi_resp = client("GET", "/openapi.json")
+    assert openapi_resp.status_code == 200
+    assert "/mixed" in openapi_resp.json()["paths"]
+
+
+# @lat: [[tests#Embedded body fields on malformed or non-object JSON]]
+def test_embedded_body_malformed_or_non_object_json():
+    app = Chano()
+
+    def create(
+        name: Annotated[str, Body()],
+        count: Annotated[int, Body()],
+    ):
+        return {"name": name, "count": count}
+
+    app.add_route("/items", create, methods=["POST"])
+    client = make_client(app)
+
+    for raw_body in (b"{bad", b"[1, 2]", b"null"):
+        resp = client(
+            "POST",
+            "/items",
+            content=raw_body,
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert len(detail) == 1, detail
+        assert detail[0]["loc"] == ["body"]
+
+    empty = client("POST", "/items", content=b"")
+    assert empty.status_code == 422
+    assert empty.json()["detail"] == [
+        {"loc": ["body", "name"], "msg": "Field required"},
+        {"loc": ["body", "count"], "msg": "Field required"},
+    ]
+
+
+# @lat: [[tests#Root-only build ignores preserve nested public and tests]]
+@pytest.mark.parametrize(
+    (
+        "files",
+        "symlinks",
+        "function_name",
+        "request_path",
+        "expected_body",
+        "expected_missing",
+        "expected_static",
+    ),
+    [
+        pytest.param(
+            {
+                "pyproject.toml": '[project]\nname = "nested"\nversion = "0.1.0"\n',
+                "app/public/route.py": (
+                    "from mylib.tests import helper\n"
+                    'def GET():\n    return {"from": helper.VALUE}\n'
+                ),
+                "app/public/.secret": "nope",
+                "mylib/__init__.py": "",
+                "mylib/tests/__init__.py": "",
+                "mylib/tests/helper.py": 'VALUE = "nested-ok"\n',
+                "public/hello.txt": "static-file",
+                "tests/test_root.py": "assert True\n",
+                "node_modules/pkg/index.js": "module.exports = 1;\n",
+                "frontend/node_modules/pkg/index.js": "module.exports = 2;\n",
+                "uv.lock": "version = 1\n",
+                "subpkg/uv.lock": "version = 1\n",
+            },
+            [],
+            "public",
+            "/public",
+            {"from": "nested-ok"},
+            (
+                "app/public/.secret",
+                "public",
+                "tests",
+                "node_modules",
+                "frontend/node_modules",
+                "uv.lock",
+                "subpkg/uv.lock",
+            ),
+            ("hello.txt", "static-file"),
+            id="nested-public-tests-and-node-modules",
+        ),
+        pytest.param(
+            {
+                "pyproject.toml": '[project]\nname = "dangling"\nversion = "0.1.0"\n',
+                "app/route.py": 'def GET():\n    return {"ok": True}\n',
+                "public/ok.txt": "ok",
+            },
+            [("subpkg/tests/fixtures/dangling-link", "missing-target")],
+            "index",
+            "/",
+            {"ok": True},
+            ("subpkg/tests/fixtures/dangling-link",),
+            ("ok.txt", "ok"),
+            id="dangling-symlink-in-nested-tests",
+        ),
+        pytest.param(
+            {
+                "pyproject.toml": '[project]\nname = "overlap"\nversion = "0.1.0"\n',
+                "app/images/route.py": 'def GET():\n    return {"route": "images"}\n',
+                "app/images/logo.txt": "logo",
+            },
+            [("public", "app/images")],
+            "images",
+            "/images",
+            {"route": "images"},
+            ("public",),
+            ("logo.txt", "logo"),
+            id="public-symlink-into-app",
+        ),
+        pytest.param(
+            {
+                "pyproject.toml": '[project]\nname = "sharedpkg"\nversion = "0.1.0"\n',
+                "app/images/route.py": (
+                    "from shared.required import VALUE\n"
+                    'def GET():\n    return {"shared": VALUE}\n'
+                ),
+                "shared/__init__.py": "",
+                "shared/required.py": 'VALUE = "from-shared"\n',
+                "shared/logo.txt": "shared-logo",
+            },
+            [("public", "shared")],
+            "images",
+            "/images",
+            {"shared": "from-shared"},
+            ("public",),
+            ("logo.txt", "shared-logo"),
+            id="public-symlink-to-imported-package",
+        ),
+    ],
+)
+def test_build_ignores_root_only_preserves_nested_public_and_tests(
+    tmp_path: Path,
+    monkeypatch: Any,
+    isolated_imports: Any,
+    files: dict[str, str],
+    symlinks: list[tuple[str, str]],
+    function_name: str,
+    request_path: str,
+    expected_body: dict[str, Any],
+    expected_missing: tuple[str, ...],
+    expected_static: tuple[str, str],
+):
+    import shutil
+
+    project = tmp_path / "proj"
+    write_project(project, files)
+    for link_rel, target_rel in symlinks:
+        link_path = project / link_rel
+        link_path.parent.mkdir(parents=True, exist_ok=True)
+        link_path.symlink_to(project / target_rel)
+
+    def fake_install(_workspace, vendor_dir, _python, _platform, _package=None):
+        write_project(
+            vendor_dir,
+            {
+                **make_dist("chano", "chano"),
+                **make_dist("vercel-runtime", "vercel_runtime"),
+                **make_dist("vercel", "vercel"),
+            },
+        )
+
+    monkeypatch.setattr(build_module, "_install_dependencies", fake_install)
+    monkeypatch.setattr(build_module, "_check_function_imports", lambda *args: None)
+    monkeypatch.syspath_prepend(str(project))
+    out = build(project, platform=None, output=tmp_path / "out")
+
+    func_dir = out / "functions" / f"{function_name}.func"
+    for rel in expected_missing:
+        assert not (func_dir / rel).exists(), rel
+    static_rel, static_text = expected_static
+    assert (out / "static" / static_rel).read_text() == static_text
+
+    # Delete the source tree and invoke the emitted entrypoint in a fresh
+    # interpreter so imports can only come from the build artifact.
+    shutil.rmtree(project)
+    runner = (
+        "import asyncio, json, sys, httpx, index\n"
+        "async def run():\n"
+        "    async with httpx.AsyncClient(\n"
+        "        transport=httpx.ASGITransport(app=index.app),\n"
+        '        base_url="http://test",\n'
+        "    ) as client:\n"
+        "        r = await client.get(sys.argv[1])\n"
+        '        print(json.dumps({"status": r.status_code, "body": r.json()}))\n'
+        "asyncio.run(run())\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", runner, request_path],
+        cwd=func_dir,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout.strip().splitlines()[-1]) == {
+        "status": 200,
+        "body": expected_body,
+    }

@@ -90,9 +90,8 @@ ALWAYS_INCLUDED: tuple[str, ...] = (
     "vercel",
 )
 
-IGNORE = shutil.ignore_patterns(
-    ".*", "__pycache__", "*.pyc", "public", "node_modules", "tests", "uv.lock"
-)
+IGNORE = shutil.ignore_patterns(".*", "__pycache__", "*.pyc", "node_modules", "uv.lock")
+ROOT_IGNORE = frozenset({"public", "tests"})
 
 ENTRYPOINT_SOURCE = """\
 import os
@@ -133,9 +132,9 @@ app = create_schedule_app(
 
 WORKFLOW_ENTRYPOINT_SOURCE = """\
 {imports}
-from chano.workflows import {factory}
+from chano.workflows import create_workflow_app
 
-app = {factory}({entrypoints!r})
+app = create_workflow_app({entrypoints!r})
 """
 
 # Module-level settings a route.py may define, and their .vc-config.json keys.
@@ -544,11 +543,6 @@ def _read_module_include(module: ModuleType, file: Path) -> tuple[str, ...]:
     return tuple(dict.fromkeys(names))
 
 
-def _read_route_include(module: ModuleType, route: Route) -> tuple[str, ...]:
-    """Read and normalize module-level ``include`` from a loaded route module."""
-    return _read_module_include(module, route.file)
-
-
 def _base_vc_config(python: str, module: ModuleType | None = None) -> dict[str, object]:
     config: dict[str, object] = {
         "runtime": f"python{python}",
@@ -642,7 +636,6 @@ def _plan_workflow_functions(
                 route=None,
                 entrypoint=WORKFLOW_ENTRYPOINT_SOURCE.format(
                     imports=imports,
-                    factory="create_workflow_flow_app",
                     entrypoints=entrypoints,
                 ),
                 vc_config=flow_config,
@@ -663,7 +656,6 @@ def _plan_workflow_functions(
                 route=None,
                 entrypoint=WORKFLOW_ENTRYPOINT_SOURCE.format(
                     imports=imports,
-                    factory="create_workflow_step_app",
                     entrypoints=entrypoints,
                 ),
                 vc_config=step_config,
@@ -728,13 +720,27 @@ def _validate_output_dir(
             )
 
 
-def _ignore_path(
-    target: Path, base: Callable[[str, list[str]], set[str]] | None = None
-) -> Callable[[str, list[str]], set[str]]:
+def _ignore_path(target: Path) -> Callable[[str, list[str]], set[str]]:
     def ignore(src: str, names: list[str]) -> set[str]:
-        ignored = set(base(src, names)) if base else set()
         if Path(src).resolve() == target.parent and target.name in names:
-            ignored.add(target.name)
+            return {target.name}
+        return set()
+
+    return ignore
+
+
+def _project_ignore(
+    project_dir: Path, output: Path
+) -> Callable[[str, list[str]], set[str]]:
+    root = project_dir.resolve()
+
+    def ignore(src: str, names: list[str]) -> set[str]:
+        src_resolved = Path(src).resolve()
+        ignored = set(IGNORE(src, names))
+        if src_resolved == root:
+            ignored.update(ROOT_IGNORE.intersection(names))
+        if src_resolved == output.parent and output.name in names:
+            ignored.add(output.name)
         return ignored
 
     return ignore
@@ -1647,7 +1653,12 @@ def emit_build(plan: BuildPlan, *, explain: str | None = None) -> Path:
     explanation: FunctionExplanation | None = None
     with tempfile.TemporaryDirectory(dir=output, prefix=".chano-") as tmp:
         shared = Path(tmp) / "shared"
-        shutil.copytree(plan.project_dir, shared, ignore=_ignore_path(output, IGNORE))
+        shutil.copytree(
+            plan.project_dir,
+            shared,
+            ignore=_project_ignore(plan.project_dir, output),
+            ignore_dangling_symlinks=True,
+        )
         (shared / f"{HANDLER_MODULE}.py").write_text(TRAMPOLINE_SOURCE)
         store_dir = Path(tmp) / "store"
         _install_dependencies(

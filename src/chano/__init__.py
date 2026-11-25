@@ -21,7 +21,7 @@ from chano.responses import (
 from chano.routing import create_app, create_route_app
 from chano.schedules import create_schedule_app, invoke_schedule
 from chano.security import HTTPBearer
-from chano.workflows import create_workflow_flow_app, create_workflow_step_app
+from chano.workflows import create_workflow_app
 
 __all__ = [
     "Body",
@@ -57,8 +57,7 @@ __all__ = [
     "create_queue_app",
     "create_route_app",
     "create_schedule_app",
-    "create_workflow_flow_app",
-    "create_workflow_step_app",
+    "create_workflow_app",
     "invoke_queue",
     "invoke_schedule",
     "lazy",
