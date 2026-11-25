@@ -39,60 +39,7 @@ from chano.cli import main as cli_main
 from chano.queues import QueueNotFoundError, discover_queues
 from chano.requests import Message
 from chano.schedules import ScheduleNotFoundError, discover_schedules
-
-
-def make_client(app: Any) -> Any:
-    def request(method: str, url: str, **kwargs: Any) -> httpx.Response:
-        async def send() -> httpx.Response:
-            transport = httpx.ASGITransport(app=app)
-            async with httpx.AsyncClient(
-                transport=transport, base_url="http://test"
-            ) as http:
-                return await http.request(method, url, **kwargs)
-
-        return asyncio.run(send())
-
-    return request
-
-
-def write_files(root: Path, files: dict[str, str]) -> Path:
-    for rel, content in files.items():
-        path = root / rel
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
-    return root
-
-
-def _fake_store_files(packages: dict[str, dict[str, str]]) -> dict[str, str]:
-    """Build synthetic dist-info + module files for a fake dependency store."""
-    files: dict[str, str] = {}
-    for dist_name, mod_files in packages.items():
-        dist_dir = f"{dist_name.replace('-', '_')}-1.0.dist-info"
-        files[f"{dist_dir}/METADATA"] = (
-            f"Metadata-Version: 2.1\nName: {dist_name}\nVersion: 1.0\n"
-        )
-        record_lines = [f"{rel},," for rel in sorted(mod_files)]
-        record_lines.append(f"{dist_dir}/METADATA,,")
-        record_lines.append(f"{dist_dir}/RECORD,,")
-        files[f"{dist_dir}/RECORD"] = "\n".join(record_lines) + "\n"
-        files.update(mod_files)
-    return files
-
-
-@pytest.fixture
-def isolated_sys_path():
-    before_path = list(sys.path)
-    before_modules = set(sys.modules)
-    try:
-        yield
-    finally:
-        sys.path[:] = before_path
-        for name in list(sys.modules):
-            if name not in before_modules and (
-                name.startswith("chano_routes.") or name.startswith("wf_test_")
-            ):
-                sys.modules.pop(name, None)
-
+from tests.helpers import make_client, make_dist, write_project
 
 # ---------------------------------------------------------------------------
 # Vercel Queues
@@ -100,8 +47,8 @@ def isolated_sys_path():
 
 
 # @lat: [[tests#Vercel Queues#Discovery and OpenAPI isolation]]
-def test_queue_discovery_and_openapi_isolation(tmp_path: Path, isolated_sys_path: Any):
-    project = write_files(
+def test_queue_discovery_and_openapi_isolation(tmp_path: Path, isolated_imports: Any):
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "qdemo"\nversion = "0.1.0"\n',
@@ -139,9 +86,9 @@ def test_queue_discovery_and_openapi_isolation(tmp_path: Path, isolated_sys_path
 
 # @lat: [[tests#Vercel Queues#Sync, async, validation, and Depends]]
 def test_queue_consume_sync_async_validation_and_depends(
-    tmp_path: Path, isolated_sys_path: Any
+    tmp_path: Path, isolated_imports: Any
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "qval"\nversion = "0.1.0"\n',
@@ -218,9 +165,9 @@ def test_queue_consume_sync_async_validation_and_depends(
 
 # @lat: [[tests#Vercel Queues#Multi-consumer dev trigger and ASGI fallback]]
 def test_queue_multi_consumer_dev_trigger_and_asgi_app(
-    tmp_path: Path, monkeypatch: Any, isolated_sys_path: Any
+    tmp_path: Path, monkeypatch: Any, isolated_imports: Any
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "qmulti"\nversion = "0.1.0"\n',
@@ -305,7 +252,7 @@ def test_queue_multi_consumer_dev_trigger_and_asgi_app(
 
 # @lat: [[tests#Vercel Queues#Delivery lifecycle, ack, and retry]]
 def test_queue_delivery_lifecycle_accept_renew_ack_and_retry(
-    tmp_path: Path, monkeypatch: Any, isolated_sys_path: Any
+    tmp_path: Path, monkeypatch: Any, isolated_imports: Any
 ):
     """Platform CloudEvent push delivery runs through vercel.queue +
     vercel_runtime.workers.create_queue_service_app: subscribe, accept, lease
@@ -449,7 +396,7 @@ def test_queue_delivery_lifecycle_accept_renew_ack_and_retry(
     monkeypatch.setitem(sys.modules, "vercel_runtime", fake_vr)
     monkeypatch.setitem(sys.modules, "vercel_runtime.workers", fake_workers)
 
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "qlife"\nversion = "0.1.0"\n',
@@ -541,7 +488,7 @@ def test_queue_delivery_lifecycle_accept_renew_ack_and_retry(
 
 # @lat: [[tests#Vercel Queues#Real vercel-queue SDK registration and delivery]]
 def test_queue_real_sdk_registration_sanitization_and_delivery(
-    tmp_path: Path, isolated_sys_path: Any
+    tmp_path: Path, isolated_imports: Any
 ):
     """End-to-end test with the real vercel-queue SDK: Message[bytes] metadata,
     SanitizedName consumer normalization matching .vc-config.json, and real
@@ -549,7 +496,7 @@ def test_queue_real_sdk_registration_sanitization_and_delivery(
     import vercel.queue as vq
     from vercel.queue._internal.embedded import embedded_queue_service
 
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "realq"\nversion = "0.1.0"\n',
@@ -618,9 +565,9 @@ def test_queue_real_sdk_registration_sanitization_and_delivery(
 
 # @lat: [[tests#Vercel Queues#Build requires vercel-queue in store]]
 def test_queue_build_fails_when_vercel_queue_missing_from_store(
-    tmp_path: Path, monkeypatch: Any, isolated_sys_path: Any
+    tmp_path: Path, isolated_imports: Any, stub_build_install: Any
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "qmissing"\nversion = "0.1.0"\n',
@@ -631,21 +578,12 @@ def test_queue_build_fails_when_vercel_queue_missing_from_store(
         },
     )
 
-    def fake_install_without_queue(_root: Path, vendor_dir: Path, *_args: Any) -> None:
-        write_files(
-            vendor_dir,
-            _fake_store_files(
-                {
-                    "chano": {"chano/__init__.py": ""},
-                    "vercel-runtime": {"vercel_runtime/__init__.py": ""},
-                }
-            ),
-        )
-
-    monkeypatch.setattr(
-        build_module, "_install_dependencies", fake_install_without_queue
+    stub_build_install(
+        {
+            **make_dist("chano", "chano"),
+            **make_dist("vercel-runtime", "vercel_runtime"),
+        }
     )
-    monkeypatch.setattr(build_module, "_check_function_imports", lambda *args: None)
 
     plan = plan_build(project, python="3.12", platform=None)
     with pytest.raises(RuntimeError, match="requires 'vercel-queue'"):
@@ -738,13 +676,13 @@ def test_queue_build_fails_when_vercel_queue_missing_from_store(
 )
 def test_queue_validation_errors(
     tmp_path: Path,
-    isolated_sys_path: Any,
+    isolated_imports: Any,
     rel_path: str,
     source: str,
     exc_type: type[Exception],
     match: str,
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "qerr"\nversion = "0.1.0"\n',
@@ -756,10 +694,8 @@ def test_queue_validation_errors(
 
 
 # @lat: [[tests#Vercel Queues#Duplicate topic and consumer rejected]]
-def test_queue_duplicate_topic_consumer_rejected(
-    tmp_path: Path, isolated_sys_path: Any
-):
-    project = write_files(
+def test_queue_duplicate_topic_consumer_rejected(tmp_path: Path, isolated_imports: Any):
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "qdup"\nversion = "0.1.0"\n',
@@ -773,9 +709,9 @@ def test_queue_duplicate_topic_consumer_rejected(
 
 # @lat: [[tests#Vercel Queues#Wildcard dispatch and consumer sanitization]]
 def test_queue_wildcard_dispatch_and_deterministic_consumer_matching(
-    tmp_path: Path, isolated_sys_path: Any
+    tmp_path: Path, isolated_imports: Any
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "qwild"\nversion = "0.1.0"\n',
@@ -846,10 +782,10 @@ def test_queue_wildcard_dispatch_and_deterministic_consumer_matching(
 
 # @lat: [[tests#Vercel Queues#Overlapping wildcard topics rejected]]
 def test_queue_overlapping_wildcard_topics_rejected(
-    tmp_path: Path, isolated_sys_path: Any
+    tmp_path: Path, isolated_imports: Any
 ):
     # Wildcard + exact topic on same consumer group -> rejected.
-    exact_overlap = write_files(
+    exact_overlap = write_project(
         tmp_path / "exact",
         {
             "pyproject.toml": '[project]\nname = "qov1"\nversion = "0.1.0"\n',
@@ -861,7 +797,7 @@ def test_queue_overlapping_wildcard_topics_rejected(
         plan_build(exact_overlap)
 
     # Overlapping wildcard prefixes on same consumer group -> rejected.
-    wild_overlap = write_files(
+    wild_overlap = write_project(
         tmp_path / "wild",
         {
             "pyproject.toml": '[project]\nname = "qov2"\nversion = "0.1.0"\n',
@@ -873,7 +809,7 @@ def test_queue_overlapping_wildcard_topics_rejected(
         plan_build(wild_overlap)
 
     # Same overlapping topics on DIFFERENT consumer groups -> allowed.
-    distinct_groups = write_files(
+    distinct_groups = write_project(
         tmp_path / "distinct",
         {
             "pyproject.toml": '[project]\nname = "qov3"\nversion = "0.1.0"\n',
@@ -894,9 +830,9 @@ def test_queue_overlapping_wildcard_topics_rejected(
 
 # @lat: [[tests#Vercel Queues#Queue build output and tree-shaking]]
 def test_queue_build_output_and_tree_shaking(
-    tmp_path: Path, monkeypatch: Any, isolated_sys_path: Any
+    tmp_path: Path, monkeypatch: Any, isolated_imports: Any, stub_build_install: Any
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "qbuild"\nversion = "0.1.0"\n',
@@ -918,25 +854,22 @@ def test_queue_build_output_and_tree_shaking(
         },
     )
 
-    def fake_install(_root: Path, vendor_dir: Path, *_args: Any) -> None:
-        write_files(
-            vendor_dir,
-            _fake_store_files(
-                {
-                    "chano": {"chano/__init__.py": ""},
-                    "vercel-runtime": {"vercel_runtime/__init__.py": ""},
-                    "vercel-queue": {"vercel/queue/__init__.py": ""},
-                    "queue-only-pkg": {"queue_only_pkg/__init__.py": "VALUE = 1\n"},
-                    "extra-queue-pkg": {"extra_queue_pkg/__init__.py": ""},
-                }
-            ),
-        )
-
     monkeypatch.setitem(
         sys.modules, "queue_only_pkg", types.ModuleType("queue_only_pkg")
     )
-    monkeypatch.setattr(build_module, "_install_dependencies", fake_install)
-    monkeypatch.setattr(build_module, "_check_function_imports", lambda *args: None)
+    stub_build_install(
+        {
+            **make_dist("chano", "chano"),
+            **make_dist("vercel-runtime", "vercel_runtime"),
+            **make_dist("vercel-queue", "vercel/queue"),
+            **make_dist(
+                "queue-only-pkg",
+                "queue_only_pkg",
+                extra_files={"queue_only_pkg/__init__.py": "VALUE = 1\n"},
+            ),
+            **make_dist("extra-queue-pkg", "extra_queue_pkg"),
+        }
+    )
 
     plan = plan_build(project, python="3.12", platform=None)
     by_name = {f.name: f for f in plan.functions}
@@ -997,9 +930,9 @@ def test_queue_build_output_and_tree_shaking(
 
 # @lat: [[tests#Vercel Queues#Queue CLI list and send]]
 def test_queue_cli_list_and_send(
-    tmp_path: Path, monkeypatch: Any, capsys: Any, isolated_sys_path: Any
+    tmp_path: Path, monkeypatch: Any, capsys: Any, isolated_imports: Any
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "qcli"\nversion = "0.1.0"\n',
@@ -1036,9 +969,9 @@ def test_queue_cli_list_and_send(
 
 # @lat: [[tests#Vercel Schedules#Discovery and OpenAPI isolation]]
 def test_schedule_discovery_and_openapi_isolation(
-    tmp_path: Path, isolated_sys_path: Any
+    tmp_path: Path, isolated_imports: Any
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "sdemo"\nversion = "0.1.0"\n',
@@ -1071,9 +1004,9 @@ def test_schedule_discovery_and_openapi_isolation(
 
 # @lat: [[tests#Vercel Schedules#Sync, async, Depends, and ASGI app]]
 def test_schedule_run_sync_async_depends_and_asgi(
-    tmp_path: Path, isolated_sys_path: Any
+    tmp_path: Path, isolated_imports: Any
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "srun"\nversion = "0.1.0"\n',
@@ -1131,9 +1064,9 @@ def test_schedule_run_sync_async_depends_and_asgi(
 
 # @lat: [[tests#Vercel Schedules#Schedule build output and tree-shaking]]
 def test_schedule_build_output_and_tree_shaking(
-    tmp_path: Path, monkeypatch: Any, isolated_sys_path: Any
+    tmp_path: Path, monkeypatch: Any, isolated_imports: Any, stub_build_install: Any
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": (
@@ -1164,24 +1097,21 @@ def test_schedule_build_output_and_tree_shaking(
         },
     )
 
-    def fake_install(_root: Path, vendor_dir: Path, *_args: Any) -> None:
-        write_files(
-            vendor_dir,
-            _fake_store_files(
-                {
-                    "chano": {"chano/__init__.py": ""},
-                    "vercel-runtime": {"vercel_runtime/__init__.py": ""},
-                    "sched-only-pkg": {"sched_only_pkg/__init__.py": "OK = True\n"},
-                    "extra-sched-pkg": {"extra_sched_pkg/__init__.py": ""},
-                }
-            ),
-        )
-
     monkeypatch.setitem(
         sys.modules, "sched_only_pkg", types.ModuleType("sched_only_pkg")
     )
-    monkeypatch.setattr(build_module, "_install_dependencies", fake_install)
-    monkeypatch.setattr(build_module, "_check_function_imports", lambda *args: None)
+    stub_build_install(
+        {
+            **make_dist("chano", "chano"),
+            **make_dist("vercel-runtime", "vercel_runtime"),
+            **make_dist(
+                "sched-only-pkg",
+                "sched_only_pkg",
+                extra_files={"sched_only_pkg/__init__.py": "OK = True\n"},
+            ),
+            **make_dist("extra-sched-pkg", "extra_sched_pkg"),
+        }
+    )
 
     plan = plan_build(project, python="3.12", platform=None)
     by_name = {f.name: f for f in plan.functions}
@@ -1344,13 +1274,13 @@ def test_schedule_build_output_and_tree_shaking(
 )
 def test_schedule_validation_errors(
     tmp_path: Path,
-    isolated_sys_path: Any,
+    isolated_imports: Any,
     rel_path: str,
     source: str,
     exc_type: type[Exception],
     match: str,
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "serr"\nversion = "0.1.0"\n',
@@ -1362,8 +1292,8 @@ def test_schedule_validation_errors(
 
 
 # @lat: [[tests#Vercel Schedules#Schedule name collision rejected]]
-def test_schedule_name_collision_rejected(tmp_path: Path, isolated_sys_path: Any):
-    project = write_files(
+def test_schedule_name_collision_rejected(tmp_path: Path, isolated_imports: Any):
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "scollide"\nversion = "0.1.0"\n',
@@ -1377,9 +1307,9 @@ def test_schedule_name_collision_rejected(tmp_path: Path, isolated_sys_path: Any
 
 # @lat: [[tests#Vercel Schedules#Schedule handler KeyError returns 500]]
 def test_schedule_handler_keyerror_returns_500_and_runs_once(
-    tmp_path: Path, isolated_sys_path: Any
+    tmp_path: Path, isolated_imports: Any
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "skeyerr"\nversion = "0.1.0"\n',
@@ -1413,9 +1343,9 @@ def test_schedule_handler_keyerror_returns_500_and_runs_once(
 
 # @lat: [[tests#Vercel Schedules#Schedule dev trigger and CLI]]
 def test_schedule_dev_trigger_and_cli(
-    tmp_path: Path, capsys: Any, isolated_sys_path: Any
+    tmp_path: Path, capsys: Any, isolated_imports: Any
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "scli"\nversion = "0.1.0"\n',
@@ -1474,7 +1404,7 @@ def test_workflow_config_parsing_and_optional_dependency(tmp_path: Path):
 
     # Parse [[tool.vercel.workflows]] alongside [tool.chano].
     pyproject = (
-        write_files(
+        write_project(
             tmp_path,
             {
                 "pyproject.toml": (
@@ -1544,13 +1474,13 @@ def test_workflow_config_validation_errors(tmp_path: Path, toml_text: str, match
 
 # @lat: [[tests#Vercel Workflows#Build output and sequential replays]]
 def test_workflow_build_output_and_sequential_replays(
-    tmp_path: Path, monkeypatch: Any, isolated_sys_path: Any
+    tmp_path: Path, monkeypatch: Any, isolated_imports: Any, stub_build_install: Any
 ):
     """Build introspects real vercel-workflow subscriptions, emits flow.func
     matching actual SDK subscriptions (no unbacked step.func), traces step
     imports, and reflects WORKFLOW_SEQUENTIAL_REPLAYS=1."""
     monkeypatch.setenv("WORKFLOW_LOCAL_DATA_DIR", str(tmp_path / ".wf-data"))
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": (
@@ -1569,23 +1499,20 @@ def test_workflow_build_output_and_sequential_replays(
         },
     )
 
-    def fake_install(_root: Path, vendor_dir: Path, *_args: Any) -> None:
-        write_files(
-            vendor_dir,
-            _fake_store_files(
-                {
-                    "chano": {"chano/__init__.py": ""},
-                    "vercel-runtime": {"vercel_runtime/__init__.py": ""},
-                    "vercel-workflow": {"vercel/workflow/__init__.py": ""},
-                    "vercel-queue": {"vercel/queue/__init__.py": ""},
-                    "wf-step-dep": {"wf_step_dep/__init__.py": "X = 1\n"},
-                }
-            ),
-        )
-
     monkeypatch.setitem(sys.modules, "wf_step_dep", types.ModuleType("wf_step_dep"))
-    monkeypatch.setattr(build_module, "_install_dependencies", fake_install)
-    monkeypatch.setattr(build_module, "_check_function_imports", lambda *args: None)
+    stub_build_install(
+        {
+            **make_dist("chano", "chano"),
+            **make_dist("vercel-runtime", "vercel_runtime"),
+            **make_dist("vercel-workflow", "vercel/workflow"),
+            **make_dist("vercel-queue", "vercel/queue"),
+            **make_dist(
+                "wf-step-dep",
+                "wf_step_dep",
+                extra_files={"wf_step_dep/__init__.py": "X = 1\n"},
+            ),
+        }
+    )
 
     monkeypatch.delenv("WORKFLOW_SEQUENTIAL_REPLAYS", raising=False)
     plan = plan_build(project, python="3.12", platform=None)
@@ -1662,9 +1589,9 @@ def test_workflow_build_output_and_sequential_replays(
 
 # @lat: [[tests#Vercel Workflows#Build fails without SDK or subscriptions]]
 def test_workflow_build_fails_without_sdk_or_subscriptions(
-    tmp_path: Path, monkeypatch: Any, isolated_sys_path: Any
+    tmp_path: Path, monkeypatch: Any, isolated_imports: Any
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": (
@@ -1698,7 +1625,7 @@ def test_workflow_build_fails_without_sdk_or_subscriptions(
         'non_serving = workflow.Workflows(namespace="shared", as_vercel_job=False)\n'
         'unconfigured = workflow.Workflows(namespace="other")\n'
     )
-    unbacked = write_files(
+    unbacked = write_project(
         tmp_path / "unbacked",
         {
             "pyproject.toml": (
@@ -1715,7 +1642,7 @@ def test_workflow_build_fails_without_sdk_or_subscriptions(
 
     # Configuring only `serving` emits ONLY `__shared_wkf_workflow_*` and does
     # NOT emit `unconfigured`'s `__other_wkf_workflow_*` subscription.
-    configured = write_files(
+    configured = write_project(
         tmp_path / "configured",
         {
             "pyproject.toml": (
@@ -1745,9 +1672,9 @@ def test_workflow_build_fails_without_sdk_or_subscriptions(
 
 # @lat: [[tests#Vercel Workflows#Local dev without SDK is graceful]]
 def test_workflow_local_dev_without_sdk_is_graceful(
-    tmp_path: Path, monkeypatch: Any, isolated_sys_path: Any
+    tmp_path: Path, monkeypatch: Any, isolated_imports: Any
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": (
@@ -1772,7 +1699,7 @@ def test_workflow_local_dev_without_sdk_is_graceful(
     client = make_client(app)
     assert client("GET", "/").json() == {"ok": True}
 
-    write_files(project, {"wf_test_plain.py": "wf = object()\n"})
+    write_project(project, {"wf_test_plain.py": "wf = object()\n"})
     sys.path.insert(0, str(project))
     with pytest.raises(RuntimeError, match="vercel-workflow is required"):
         create_workflow_app(["wf_test_plain:wf"])
@@ -1780,7 +1707,7 @@ def test_workflow_local_dev_without_sdk_is_graceful(
 
 # @lat: [[tests#Vercel Workflows#Real vercel-workflow SDK end-to-end run and build]]
 def test_workflow_real_sdk_end_to_end_run_and_build(
-    tmp_path: Path, monkeypatch: Any, isolated_sys_path: Any
+    tmp_path: Path, monkeypatch: Any, isolated_imports: Any
 ):
     """End-to-end test using the REAL vercel-workflow + vercel-queue SDKs:
     runs a real workflow with a @wf.step to completion under create_app(),
@@ -1793,7 +1720,7 @@ def test_workflow_real_sdk_end_to_end_run_and_build(
     monkeypatch.setenv("WORKFLOW_PUBLIC_MANIFEST", "1")
     monkeypatch.delenv("WORKFLOW_SEQUENTIAL_REPLAYS", raising=False)
 
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": (
@@ -1874,7 +1801,7 @@ def test_workflow_real_sdk_end_to_end_run_and_build(
 
 # @lat: [[tests#Vercel Workflows#Ignores unrelated queue subscribers]]
 def test_workflow_ignores_unrelated_queue_subscriber_on_step_topic(
-    tmp_path: Path, monkeypatch: Any, isolated_sys_path: Any
+    tmp_path: Path, monkeypatch: Any, isolated_imports: Any
 ):
     """Real-SDK regression test: an unrelated @vercel.queue.subscribe on
     `__review_wkf_step_*` must NOT be attributed to Workflows(namespace="review")."""
@@ -1883,7 +1810,7 @@ def test_workflow_ignores_unrelated_queue_subscriber_on_step_topic(
     monkeypatch.setenv("WORKFLOW_LOCAL_DATA_DIR", str(tmp_path / ".wf-review"))
     monkeypatch.delenv("WORKFLOW_SEQUENTIAL_REPLAYS", raising=False)
 
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": (
@@ -1927,7 +1854,7 @@ def test_workflow_ignores_unrelated_queue_subscriber_on_step_topic(
 
 # @lat: [[tests#Vercel Workflows#Real SDK shape local dev and build]]
 def test_workflow_real_sdk_shape_local_dev_and_build(
-    tmp_path: Path, monkeypatch: Any, isolated_sys_path: Any
+    tmp_path: Path, monkeypatch: Any, isolated_imports: Any, stub_build_install: Any
 ):
     """Tests the real vercel-workflow SDK API shape: Workflows(namespace=...),
     http_handler(HTTPRequest) -> HTTPResponse, manifest_handler, ENDPOINT_PATH,
@@ -2037,7 +1964,7 @@ def test_workflow_real_sdk_shape_local_dev_and_build(
     monkeypatch.setitem(sys.modules, "vercel.workflow._internal.world", fake_wf_world)
     monkeypatch.setitem(sys.modules, "vercel.queue", fake_queue)
 
-    project = write_files(
+    project = write_project(
         tmp_path / "proj",
         {
             "pyproject.toml": (
@@ -2179,21 +2106,14 @@ def test_workflow_real_sdk_shape_local_dev_and_build(
 
     # Emit build and invoke each generated entrypoint in a fresh subprocess
     # after deleting the source tree so imports come only from the artifact.
-    def fake_install(_root: Path, vendor_dir: Path, *_args: Any) -> None:
-        write_files(
-            vendor_dir,
-            _fake_store_files(
-                {
-                    "chano": {"chano/__init__.py": ""},
-                    "vercel-runtime": {"vercel_runtime/__init__.py": ""},
-                    "vercel-workflow": {"vercel/workflow/__init__.py": ""},
-                    "vercel-queue": {"vercel/queue/__init__.py": ""},
-                }
-            ),
-        )
-
-    monkeypatch.setattr(build_module, "_install_dependencies", fake_install)
-    monkeypatch.setattr(build_module, "_check_function_imports", lambda *args: None)
+    stub_build_install(
+        {
+            **make_dist("chano", "chano"),
+            **make_dist("vercel-runtime", "vercel_runtime"),
+            **make_dist("vercel-workflow", "vercel/workflow"),
+            **make_dist("vercel-queue", "vercel/queue"),
+        }
+    )
     emitted_out = emit_build(plan_with_step)
     shutil.rmtree(project)
 
@@ -2283,10 +2203,10 @@ def test_workflow_real_sdk_shape_local_dev_and_build(
 
 # @lat: [[tests#Combined Vercel primitives]]
 def test_combined_build_with_all_primitives(
-    tmp_path: Path, monkeypatch: Any, isolated_sys_path: Any
+    tmp_path: Path, monkeypatch: Any, isolated_imports: Any, stub_build_install: Any
 ):
     monkeypatch.setenv("WORKFLOW_LOCAL_DATA_DIR", str(tmp_path / ".wf-data"))
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": (
@@ -2309,22 +2229,15 @@ def test_combined_build_with_all_primitives(
         },
     )
 
-    def fake_install(_root: Path, vendor_dir: Path, *_args: Any) -> None:
-        write_files(
-            vendor_dir,
-            _fake_store_files(
-                {
-                    "chano": {"chano/__init__.py": ""},
-                    "vercel-runtime": {"vercel_runtime/__init__.py": ""},
-                    "vercel-queue": {"vercel/queue/__init__.py": ""},
-                    "vercel-workflow": {"vercel/workflow/__init__.py": ""},
-                }
-            ),
-        )
-
     monkeypatch.delenv("WORKFLOW_SEQUENTIAL_REPLAYS", raising=False)
-    monkeypatch.setattr(build_module, "_install_dependencies", fake_install)
-    monkeypatch.setattr(build_module, "_check_function_imports", lambda *args: None)
+    stub_build_install(
+        {
+            **make_dist("chano", "chano"),
+            **make_dist("vercel-runtime", "vercel_runtime"),
+            **make_dist("vercel-queue", "vercel/queue"),
+            **make_dist("vercel-workflow", "vercel/workflow"),
+        }
+    )
 
     out = build(project, platform=None, output=tmp_path / "out")
     flow_cfg = json.loads(
@@ -2370,9 +2283,9 @@ def test_combined_build_with_all_primitives(
 
 # @lat: [[tests#Boundary#HTTP-only boundary scoping for queues and schedules]]
 def test_boundary_is_http_only_for_routes_queues_and_schedules(
-    tmp_path: Path, monkeypatch: Any, isolated_sys_path: Any
+    tmp_path: Path, monkeypatch: Any, isolated_imports: Any, stub_build_install: Any
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "httpbound"\nversion = "0.1.0"\n',
@@ -2527,24 +2440,19 @@ def test_boundary_is_http_only_for_routes_queues_and_schedules(
 
     # 4. Build tracing: route traces boundary.py and bundles boundary-only-pkg;
     # queue and schedule do not trace boundary.py or bundle boundary-only-pkg.
-    def fake_install(_workspace, vendor_dir, _python, _platform, _package=None):
-        write_files(
-            vendor_dir,
-            _fake_store_files(
-                {
-                    "chano": {"chano/__init__.py": "X = 1\n"},
-                    "vercel-runtime": {"vercel_runtime/__init__.py": ""},
-                    "vercel": {"vercel/__init__.py": ""},
-                    "vercel-queue": {"vercel_queue/__init__.py": ""},
-                    "boundary-only-pkg": {
-                        "boundary_only_pkg/__init__.py": 'TAG = "yes"\n'
-                    },
-                }
+    stub_build_install(
+        {
+            **make_dist("chano", "chano", extra_files={"chano/__init__.py": "X = 1\n"}),
+            **make_dist("vercel-runtime", "vercel_runtime"),
+            **make_dist("vercel", "vercel"),
+            **make_dist("vercel-queue", "vercel_queue"),
+            **make_dist(
+                "boundary-only-pkg",
+                "boundary_only_pkg",
+                extra_files={"boundary_only_pkg/__init__.py": 'TAG = "yes"\n'},
             ),
-        )
-
-    monkeypatch.setattr(build_module, "_install_dependencies", fake_install)
-    monkeypatch.setattr(build_module, "_check_function_imports", lambda *args: None)
+        }
+    )
 
     plan = plan_build(project, python="3.12", platform=None)
     by_name = {f.name: f for f in plan.functions}
@@ -2579,7 +2487,7 @@ def test_boundary_is_http_only_for_routes_queues_and_schedules(
 
     # 5. Private entrypoints never even import ancestor boundary.py (create_app is
     # never called on this project, and app/boundary.py raises at import time).
-    private_project = write_files(
+    private_project = write_project(
         tmp_path / "private_only",
         {
             "pyproject.toml": '[project]\nname = "privonly"\nversion = "0.1.0"\n',
@@ -2655,9 +2563,9 @@ def test_boundary_is_http_only_for_routes_queues_and_schedules(
 
 # @lat: [[tests#Vercel Workflows#Multi-namespace step topic routing]]
 def test_workflow_multi_namespace_step_prefix_routing(
-    tmp_path: Path, monkeypatch: Any, isolated_sys_path: Any
+    tmp_path: Path, monkeypatch: Any, isolated_imports: Any
 ):
-    write_files(
+    write_project(
         tmp_path,
         {
             "wf_test_step_routing.py": (
@@ -2738,7 +2646,7 @@ def test_workflow_multi_namespace_step_prefix_routing(
 
 # @lat: [[tests#Vercel Queues#Consumer lookup strips whitespace]]
 def test_queue_consumer_lookup_strips_whitespace(tmp_path: Path):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "app/orders/queue.py": (

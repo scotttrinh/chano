@@ -11,7 +11,6 @@ import sys
 from pathlib import Path
 from typing import Annotated, Any
 
-import httpx
 import msgspec
 import pytest
 
@@ -45,20 +44,7 @@ from chano.status import (
     Unauthorized,
     UnprocessableContent,
 )
-
-
-def make_client(app: Any):
-    def request(method: str, path: str, **kwargs: Any) -> httpx.Response:
-        async def run() -> httpx.Response:
-            transport = httpx.ASGITransport(app=app)
-            async with httpx.AsyncClient(
-                transport=transport, base_url="http://test"
-            ) as client:
-                return await client.request(method, path, **kwargs)
-
-        return asyncio.run(run())
-
-    return request
+from tests.helpers import make_client
 
 
 class Item(msgspec.Struct):
@@ -667,7 +653,7 @@ def test_openapi_from_return_annotations():
 
 
 # @lat: [[tests#Outcomes#Queue retry on returned and raised Failure]]
-def test_queue_retry_on_returned_and_raised_failure(tmp_path):
+def test_queue_retry_on_returned_and_raised_failure(tmp_path, isolated_imports):
     app_dir = tmp_path / "app"
     q_dir = app_dir / "jobs"
     q_dir.mkdir(parents=True)
@@ -920,7 +906,7 @@ def test_boundary_openapi_recover_replaces_422():
 
 
 # @lat: [[tests#Boundary#Local schedule runner ignores boundary]]
-def test_local_schedule_runner_ignores_boundary(tmp_path):
+def test_local_schedule_runner_ignores_boundary(tmp_path, isolated_imports):
     app_dir = tmp_path / "app"
     (app_dir / "ret").mkdir(parents=True)
     (app_dir / "exc").mkdir(parents=True)

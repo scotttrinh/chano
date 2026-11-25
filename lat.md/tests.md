@@ -4,7 +4,7 @@ lat:
 ---
 # Tests
 
-Test specifications for Chano, anchored to [[tests/test_chano.py]] and [[tests/test_vercel_primitives.py]].
+Test specifications for Chano, anchored to [[tests]].
 
 ## Routes and parameters
 
@@ -170,7 +170,7 @@ Verify a project whose `app` symlinks to `src/app` reads `base_path` from the ro
 
 Verify [[src/chano/build.py#plan_build]] on a temporary project without writing output: paths, functions, entrypoints, `.vc-config.json` overrides, generated docs, and `config.json` routes.
 
-The `isolated_imports` fixture restores `sys.path` and `sys.modules` after loading route modules and disables bytecode writes.
+The `isolated_imports` fixture restores `sys.path`, disables bytecode writes, and evicts non-installed modules added to `sys.modules` while keeping installed environment modules (stdlib, site-packages, built-in, and frozen).
 
 ## Build emit
 
