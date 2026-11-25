@@ -18,10 +18,18 @@ from tests.helpers import (
     write_project,
 )
 
+# Never write .pyc files during test runs (e.g. when importing examples/hello).
+sys.dont_write_bytecode = True
+
 _INSTALLED_ROOTS = tuple(
-    Path(p).resolve()
-    for key in ("stdlib", "platstdlib", "purelib", "platlib")
-    if (p := sysconfig.get_paths().get(key))
+    {
+        *(Path(sysconfig.get_path(k)).resolve() for k in ("stdlib", "platstdlib")),
+        *(
+            Path(p).resolve()
+            for p in sys.path
+            if p and Path(p).name in ("site-packages", "dist-packages")
+        ),
+    }
 )
 
 
@@ -46,11 +54,9 @@ def _is_installed_module(mod: object) -> bool:
 
 @contextmanager
 def _isolated_import_scope():
-    """Restore sys.path, bytecode setting, and non-installed sys.modules entries."""
+    """Restore sys.path and evict non-installed sys.modules entries."""
     before_path = list(sys.path)
-    before_bytecode = sys.dont_write_bytecode
     before_modules = set(sys.modules)
-    sys.dont_write_bytecode = True
     try:
         yield
     finally:
@@ -62,7 +68,6 @@ def _isolated_import_scope():
             if not _is_installed_module(sys.modules.get(name))
         ]
         sys.path[:] = before_path
-        sys.dont_write_bytecode = before_bytecode
         for name in to_evict:
             sys.modules.pop(name, None)
 
@@ -112,9 +117,14 @@ def client(example_app):
 
 
 @pytest.fixture(scope="module")
-def output():
+def output(tmp_path_factory: pytest.TempPathFactory):
     # Vendor for this machine so the function can be invoked locally.
-    return build(EXAMPLE, python=HOST_PYTHON, platform=None)
+    return build(
+        EXAMPLE,
+        python=HOST_PYTHON,
+        platform=None,
+        output=tmp_path_factory.mktemp("example-output"),
+    )
 
 
 @pytest.fixture(scope="module")

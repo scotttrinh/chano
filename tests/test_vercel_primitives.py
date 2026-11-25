@@ -22,6 +22,7 @@ import httpx
 import pytest
 
 from chano import (
+    Chano,
     ChanoConfig,
     RequestValidationError,
     WorkflowConfig,
@@ -39,6 +40,16 @@ from chano.cli import main as cli_main
 from chano.queues import QueueNotFoundError, discover_queues
 from chano.requests import Message
 from chano.schedules import ScheduleNotFoundError, discover_schedules
+from chano.workflows import (
+    get_step_topic_prefix,
+    get_workflow_topic_prefix,
+    introspect_workflow_triggers,
+    load_workflow_entrypoint,
+    mount_workflows,
+    resolve_workflow_trace_roots,
+    validate_workflow_namespace,
+    workflow_flow_trigger,
+)
 from tests.helpers import make_client, make_dist, write_project
 
 # ---------------------------------------------------------------------------
@@ -221,7 +232,7 @@ def test_queue_multi_consumer_dev_trigger_and_asgi_app(
         ).status_code
         == 500
     )
-    with pytest.raises(KeyError):
+    with pytest.raises(KeyError, match="'id'"):
         asyncio.run(app.dispatch_queue("orders", {}, consumer="billing"))
 
     # Deployed single-consumer ASGI app (simulating vercel-queue absent):
@@ -1336,7 +1347,7 @@ def test_schedule_handler_keyerror_returns_500_and_runs_once(
     assert resp.status_code == 500
     assert job.module.calls == 1
 
-    with pytest.raises(KeyError):
+    with pytest.raises(KeyError, match="'missing'"):
         asyncio.run(app.run_schedule("buggy"))
     assert job.module.calls == 2
 
@@ -1706,6 +1717,7 @@ def test_workflow_local_dev_without_sdk_is_graceful(
 
 
 # @lat: [[tests#Vercel Workflows#Real vercel-workflow SDK end-to-end run and build]]
+@pytest.mark.slow
 def test_workflow_real_sdk_end_to_end_run_and_build(
     tmp_path: Path, monkeypatch: Any, isolated_imports: Any
 ):
@@ -2663,3 +2675,262 @@ def test_queue_consumer_lookup_strips_whitespace(tmp_path: Path):
     assert asyncio.run(
         invoke_queue(project / "app", "orders", 8, consumer="default")
     ) == {"item_id": 8}
+
+
+# @lat: [[tests#Vercel Workflows#Namespace validation and prefix fallback]]
+@pytest.mark.parametrize(
+    "bad_ns",
+    ["", "1abc", "Upper", "a-b", "a_b"],
+    ids=["empty", "leading-digit", "uppercase", "hyphen", "underscore"],
+)
+def test_workflow_rejects_invalid_namespace(bad_ns: str):
+    with pytest.raises(ValueError, match="Invalid queue namespace"):
+        validate_workflow_namespace(bad_ns)
+    with pytest.raises(ValueError, match="Invalid queue namespace"):
+        get_workflow_topic_prefix(bad_ns)
+    with pytest.raises(ValueError, match="Invalid queue namespace"):
+        get_step_topic_prefix(bad_ns)
+
+
+# @lat: [[tests#Vercel Workflows#Topic prefix fallback and concurrency]]
+def test_workflow_prefix_fallback_and_flow_trigger_concurrency(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setitem(sys.modules, "vercel.workflow._internal.world", None)
+    assert get_workflow_topic_prefix() == "__wkf_workflow_"
+    assert get_workflow_topic_prefix("billing") == "__billing_wkf_workflow_"
+
+    trigger = workflow_flow_trigger(max_concurrency=4, sequential_replays=False)
+    assert trigger["maxConcurrency"] == 4
+
+
+# @lat: [[tests#Vercel Workflows#Src trace roots and missing attribute]]
+def test_workflow_trace_roots_src_layout_and_missing_attr(
+    tmp_path: Path, isolated_imports: Any
+):
+    project = write_project(
+        tmp_path / "src_wf",
+        {
+            "src/my_wf/__init__.py": "wf = object()\n",
+        },
+    )
+    roots = resolve_workflow_trace_roots([WorkflowConfig("my_wf:wf")], project)
+    assert roots == ((project / "src" / "my_wf" / "__init__.py").resolve(),)
+
+    with pytest.raises(AttributeError, match="attribute 'does_not_exist' not found"):
+        load_workflow_entrypoint("chano.workflows:does_not_exist")
+
+
+# @lat: [[tests#Vercel Workflows#Trigger introspection error paths]]
+def test_workflow_introspection_error_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_imports: Any
+):
+    project = write_project(
+        tmp_path / "wf_errs",
+        {
+            "wf_missing_sdk.py": "import vercel.workflow\nwf = object()\n",
+            "wf_missing_user_dep.py": "import no_such_user_dep_xyz\nwf = object()\n",
+            "wf_bad_ns.py": (
+                "class _Reg:\n"
+                "    namespace = 123\n"
+                "    async def http_handler(self, req):\n"
+                "        return None\n"
+                "wf = _Reg()\n"
+            ),
+            "wf_no_subs.py": (
+                "class _Reg:\n"
+                '    namespace = "orphan"\n'
+                "    async def http_handler(self, req):\n"
+                "        return None\n"
+                "wf = _Reg()\n"
+            ),
+        },
+    )
+
+    # vercel.queue without get_subscriptions() fails clearly.
+    monkeypatch.setitem(sys.modules, "vercel.queue", types.ModuleType("vercel.queue"))
+    with pytest.raises(RuntimeError, match="does not expose get_subscriptions"):
+        introspect_workflow_triggers([WorkflowConfig("wf_no_subs:wf")], project)
+
+    # vercel.queue present, but vercel.workflow missing when loading entrypoint.
+    fake_queue: Any = types.ModuleType("vercel.queue")
+    fake_queue.get_subscriptions = lambda: []
+    monkeypatch.setitem(sys.modules, "vercel.queue", fake_queue)
+    monkeypatch.setitem(sys.modules, "vercel.workflow", None)
+    with pytest.raises(RuntimeError, match="'vercel-workflow' is not installed"):
+        introspect_workflow_triggers([WorkflowConfig("wf_missing_sdk:wf")], project)
+
+    # Non-vercel missing module propagates unchanged instead of being masked.
+    with pytest.raises(ModuleNotFoundError, match="no_such_user_dep_xyz"):
+        introspect_workflow_triggers(
+            [WorkflowConfig("wf_missing_user_dep:wf")], project
+        )
+
+    # Non-string namespace on registry raises ValueError.
+    with pytest.raises(ValueError, match="invalid namespace"):
+        introspect_workflow_triggers([WorkflowConfig("wf_bad_ns:wf")], project)
+
+    # Registry with http_handler but zero registered vercel.queue subscriptions fails.
+    with pytest.raises(
+        RuntimeError, match=r"did not register any vercel\.queue subscription"
+    ):
+        introspect_workflow_triggers([WorkflowConfig("wf_no_subs:wf")], project)
+
+
+# @lat: [[tests#Vercel Workflows#ASGI adapter lifespan and chunking]]
+def test_workflow_asgi_adapter_lifespan_chunking_disconnect_and_str_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_imports: Any
+):
+    project = write_project(
+        tmp_path / "wf_asgi",
+        {
+            "wf_asgi_mod.py": (
+                "from dataclasses import dataclass, field\n"
+                "@dataclass\n"
+                "class _Resp:\n"
+                "    status: int\n"
+                "    body: str\n"
+                "    headers: dict[str, str] = field(default_factory=dict)\n"
+                "class _Reg:\n"
+                "    namespace = None\n"
+                "    async def http_handler(self, req):\n"
+                "        chunks = [c async for c in req.aiter_bytes(chunk_size=3)]\n"
+                '        joined = "café:" + "|".join(c.decode() for c in chunks)\n'
+                '        return _Resp(200, joined, {"x-ok": "1"})\n'
+                "wf = _Reg()\n"
+            ),
+        },
+    )
+    sys.path.insert(0, str(project))
+    monkeypatch.setitem(sys.modules, "vercel_runtime.workers", None)
+    app = create_workflow_app(["wf_asgi_mod:wf"])
+
+    async def run_asgi(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        await app(scope, receive, send)
+
+    # Lifespan startup/shutdown handshake completes cleanly.
+    lifespan_msgs = iter([{"type": "lifespan.startup"}, {"type": "lifespan.shutdown"}])
+    lifespan_sent: list[Message] = []
+
+    async def lifespan_receive() -> Message:
+        return next(lifespan_msgs)
+
+    async def lifespan_send(msg: Message) -> None:
+        lifespan_sent.append(msg)
+
+    asyncio.run(run_asgi({"type": "lifespan"}, lifespan_receive, lifespan_send))
+    assert lifespan_sent == [
+        {"type": "lifespan.startup.complete"},
+        {"type": "lifespan.shutdown.complete"},
+    ]
+
+    # Non-HTTP scope is ignored cleanly.
+    ws_sent: list[Message] = []
+
+    async def ws_send(msg: Message) -> None:
+        ws_sent.append(msg)
+
+    asyncio.run(run_asgi({"type": "websocket"}, lifespan_receive, ws_send))
+    assert ws_sent == []
+
+    # Chunked body streaming + non-ASCII str response body encoded as UTF-8.
+    client = make_client(app)
+    resp = client("POST", "/.well-known/workflow/v1/flow", content=b"abcdefg")
+    assert resp.status_code == 200
+    assert resp.headers["x-ok"] == "1"
+    assert resp.content == "café:abc|def|g".encode()
+
+    # Client disconnect mid-body terminates aiter_bytes cleanly.
+    disc_msgs = iter(
+        [
+            {"type": "http.request", "body": b"hi", "more_body": True},
+            {"type": "http.disconnect"},
+        ]
+    )
+    disc_sent: list[Message] = []
+
+    async def disc_receive() -> Message:
+        return next(disc_msgs)
+
+    async def disc_send(msg: Message) -> None:
+        disc_sent.append(msg)
+
+    asyncio.run(
+        run_asgi(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/.well-known/workflow/v1/flow",
+                "query_string": b"",
+                "headers": [],
+            },
+            disc_receive,
+            disc_send,
+        )
+    )
+    assert disc_sent[0]["status"] == 200
+    assert disc_sent[1]["body"] == "café:hi".encode()
+
+
+# @lat: [[tests#Vercel Workflows#Dev mount edge cases]]
+def test_workflow_mount_workflows_edge_cases(tmp_path: Path, isolated_imports: Any):
+    project = write_project(
+        tmp_path / "wf_mount",
+        {
+            "wf_non_serving.py": (
+                "class _Reg:\n"
+                "    @property\n"
+                "    def http_handler(self):\n"
+                '        raise RuntimeError("not serving")\n'
+                "wf = _Reg()\n"
+            ),
+            "wf_bad_dep.py": "import no_such_mount_dep_xyz\nwf = object()\n",
+            "wf_no_manifest.py": (
+                "from dataclasses import dataclass, field\n"
+                "@dataclass\n"
+                "class _Resp:\n"
+                "    status: int\n"
+                "    body: bytes\n"
+                "    headers: dict[str, str] = field(default_factory=dict)\n"
+                "class _Reg:\n"
+                "    namespace = None\n"
+                "    async def http_handler(self, req):\n"
+                '        return _Resp(200, b"flow-ok")\n'
+                "    @property\n"
+                "    def manifest_handler(self):\n"
+                '        raise RuntimeError("no manifest")\n'
+                "wf = _Reg()\n"
+            ),
+        },
+    )
+
+    assert mount_workflows(Chano(docs=False), []) is False
+
+    app_ns = Chano(docs=False)
+    assert (
+        mount_workflows(
+            app_ns, [WorkflowConfig("wf_non_serving:wf")], project_root=project
+        )
+        is False
+    )
+    client_ns = make_client(app_ns)
+    assert client_ns("POST", "/.well-known/workflow/v1/flow").status_code == 404
+    assert client_ns("GET", "/.well-known/workflow/v1/manifest.json").status_code == 404
+
+    with pytest.raises(ModuleNotFoundError, match="no_such_mount_dep_xyz"):
+        mount_workflows(
+            Chano(docs=False),
+            [WorkflowConfig("wf_bad_dep:wf")],
+            project_root=project,
+        )
+
+    app_nm = Chano(docs=False)
+    assert (
+        mount_workflows(
+            app_nm, [WorkflowConfig("wf_no_manifest:wf")], project_root=project
+        )
+        is True
+    )
+    client = make_client(app_nm)
+    assert client("POST", "/.well-known/workflow/v1/flow").text == "flow-ok"
+    assert client("GET", "/.well-known/workflow/v1/manifest.json").status_code == 404

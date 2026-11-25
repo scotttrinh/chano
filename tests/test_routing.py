@@ -128,8 +128,8 @@ def test_dev_docs_and_static_files(client, example_app):
     }
 
 
-# @lat: [[tests#Project config]]
-def test_project_config(tmp_path):
+# @lat: [[tests#Project config#Defaults and keys]]
+def test_project_config_defaults_and_keys(tmp_path):
     pyproject = tmp_path / "pyproject.toml"
     pyproject.write_text('[project]\nname = "x"\n')
     assert load_config(pyproject) == ChanoConfig(
@@ -143,17 +143,34 @@ def test_project_config(tmp_path):
         base_path="/api", tree_shake=False, include=("anyio",)
     )
 
-    for raw, normalized in [
+    with pytest.raises(ValueError, match="invalid base_path"):
+        ChanoConfig(base_path="/a\x00b")
+    # functions/svc.func would be read as a function, not a directory.
+    with pytest.raises(ValueError, match="invalid base_path"):
+        normalize_base_path("/svc.func")
+    assert normalize_base_path("/svc.funcs/x.func.d") == "/svc.funcs/x.func.d"
+
+
+# @lat: [[tests#Project config#Base path normalization]]
+@pytest.mark.parametrize(
+    ("raw", "normalized"),
+    [
         ("", ""),
         ("/", ""),
         ("/api/", "/api"),
         ("/api", "/api"),
         ("/v1/api", "/v1/api"),
         ("/v1+/a-b_c.d~e!,;=@", "/v1+/a-b_c.d~e!,;=@"),
-    ]:
-        assert ChanoConfig(base_path=raw).base_path == normalized
+    ],
+)
+def test_project_config_base_path_normalization(raw, normalized):
+    assert ChanoConfig(base_path=raw).base_path == normalized
 
-    for table, error in [
+
+# @lat: [[tests#Project config#Invalid tool.chano table]]
+@pytest.mark.parametrize(
+    ("table", "error"),
+    [
         ("base_pth = '/api'", "unknown field `base_pth`"),
         ("base_path = 1", "Expected `str`, got `int`"),
         ("base_path = '/a//b'", "invalid base_path"),
@@ -178,25 +195,29 @@ def test_project_config(tmp_path):
         ("tree_shake = 1", "Expected `bool`, got `int`"),
         ("include = 'anyio'", "Expected `array`, got `str`"),
         ("include = [1]", "Expected `str`, got `int`"),
-    ]:
-        pyproject.write_text(f"[tool.chano]\n{table}\n")
-        with pytest.raises(ValueError, match=error):
-            load_config(pyproject)
+    ],
+)
+def test_project_config_invalid_chano_table(tmp_path, table, error):
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(f"[tool.chano]\n{table}\n")
+    with pytest.raises(ValueError, match=error):
+        load_config(pyproject)
 
-    for toml, error in [
+
+# @lat: [[tests#Project config#Invalid tool table]]
+@pytest.mark.parametrize(
+    ("toml", "error"),
+    [
         ("tool = true", "`tool` must be a table"),
         ("[tool]\nchano = true", "`tool.chano` must be a table"),
-    ]:
-        pyproject.write_text(f"{toml}\n")
-        with pytest.raises(ValueError, match=f"invalid \\[tool.chano\\] .*{error}"):
-            load_config(pyproject)
-
-    with pytest.raises(ValueError, match="invalid base_path"):
-        ChanoConfig(base_path="/a\x00b")
-    # functions/svc.func would be read as a function, not a directory.
-    with pytest.raises(ValueError, match="invalid base_path"):
-        normalize_base_path("/svc.func")
-    assert normalize_base_path("/svc.funcs/x.func.d") == "/svc.funcs/x.func.d"
+    ],
+    ids=["tool-not-table", "tool-chano-not-table"],
+)
+def test_project_config_invalid_tool_table(tmp_path, toml, error):
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(f"{toml}\n")
+    with pytest.raises(ValueError, match=rf"invalid \[tool\.chano\] .*{error}"):
+        load_config(pyproject)
 
 
 def test_swagger_html_escapes_title_and_url():
@@ -239,48 +260,57 @@ def test_prefixed_dev_routing(prefixed_project, isolated_imports):
     assert plain("GET", "/users").json() == {"route": "users"}
 
 
-# @lat: [[tests#Root path reconstruction]]
-def test_root_path_reconstruction(prefixed_project, isolated_imports):
+# @lat: [[tests#Root path reconstruction#Request path joining]]
+@pytest.mark.parametrize(
+    ("scope", "full"),
+    [
+        ({"path": "/", "root_path": ""}, "/"),
+        ({"path": "/api/users", "root_path": ""}, "/api/users"),
+        ({"path": "/", "root_path": "/api"}, "/api"),
+        ({"path": "/", "root_path": "/api/"}, "/api"),
+        ({"path": "/users", "root_path": "/api"}, "/api/users"),
+        ({"path": "/apiary", "root_path": "/api"}, "/api/apiary"),
+        ({"path": "/api/users", "root_path": "/api"}, "/api/api/users"),
+        ({"path": "/x"}, "/x"),
+    ],
+)
+def test_request_path_reconstruction(scope, full):
     async def receive():
         return {"type": "http.request"}
 
-    for root_path, path, full in [
-        ("", "/", "/"),
-        ("", "/api/users", "/api/users"),
-        ("/api", "/", "/api"),
-        ("/api/", "/", "/api"),
-        ("/api", "/users", "/api/users"),
-        ("/api", "/apiary", "/api/apiary"),
-        ("/api", "/api/users", "/api/api/users"),
-    ]:
-        scope = {"path": path, "root_path": root_path}
-        assert Request(scope, receive).path == full
-    assert Request({"path": "/x"}, receive).path == "/x"
+    assert Request(scope, receive).path == full
 
+
+# @lat: [[tests#Root path reconstruction#Routing with root_path]]
+def test_root_path_reconstruction(prefixed_project, isolated_imports):
     app = create_app(prefixed_project / "app")
 
     # What vercel-runtime's prefix strip produces for both /api and /api/.
     assert make_client(app, "/api")("GET", "/").json() == {"route": "root"}
     # Without a strip, /api/ is a literal miss.
-    assert make_client(app, "")("GET", "/api/").status_code == 404
+    miss = make_client(app, "")("GET", "/api/")
+    assert miss.status_code == 404
+    assert miss.json() == {"detail": "Not Found"}
     assert make_client(app, "/api")("GET", "/users").json() == {"route": "users"}
     assert make_client(app, "/api/")("GET", "/users/3").json() == {
         "id": 3,
         "path": "/api/users/3",
     }
     # No startswith check: a stripped path may itself begin with the prefix.
-    assert make_client(app, "/api")("GET", "/apiary").status_code == 404
+    miss = make_client(app, "/api")("GET", "/apiary")
+    assert miss.status_code == 404
+    assert miss.json() == {"detail": "Not Found"}
     response = make_client(app, "/api")("GET", "/api/users")
     assert response.status_code == 404
+    assert response.json() == {"detail": "Not Found"}
 
     route_app = create_route_app(prefixed_project / "app", "api/users/[id]")
     route_client = make_client(route_app, "/api")
     assert route_client("GET", "/users/3").json() == {"id": 3, "path": "/api/users/3"}
-    assert route_client("GET", "/").status_code == 404
-    response = route_client("GET", "/api/users/3")
-    assert response.status_code == 404
-    response = route_client("GET", "/apiary/x")
-    assert response.status_code == 404
+    for path in ("/", "/api/users/3", "/apiary/x"):
+        response = route_client("GET", path)
+        assert response.status_code == 404
+        assert response.json() == {"detail": "Not Found"}
 
 
 # @lat: [[tests#Dev routing priority]]
@@ -507,29 +537,23 @@ def test_segment_module_loading(tmp_path, isolated_imports):
         assert set(sys.modules) == before
 
 
-def test_markers_require_annotated():
-    def dep() -> int:
-        return 1
+@pytest.mark.parametrize(
+    "marker",
+    [Query, Header, Cookie, Body],
+    ids=["Query", "Header", "Cookie", "Body"],
+)
+def test_markers_require_annotated(marker):
+    def bad(value: Any = marker()):  # noqa: B008
+        return value
 
-    def bad_query(q: Any = Query()):  # noqa: B008
-        return q
+    app = Chano()
+    with pytest.raises(TypeError, match="must be placed inside Annotated"):
+        app.add_route("/", bad, methods=["GET"])
 
-    def bad_header(h: Any = Header()):  # noqa: B008
-        return h
 
-    def bad_cookie(c: Any = Cookie()):  # noqa: B008
-        return c
-
-    def bad_body(b: Any = Body()):  # noqa: B008
-        return b
-
-    for fn in (bad_query, bad_header, bad_cookie, bad_body):
-        app = Chano()
-        with pytest.raises(TypeError, match="must be placed inside Annotated"):
-            app.add_route("/", fn, methods=["GET"])
-
+def test_query_rejects_positional_argument():
     query_fn: Any = Query
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match="positional"):
         query_fn(10)
 
 
@@ -607,8 +631,13 @@ def test_list_query_unions_and_type_aliases():
     assert "/mixed" in openapi_resp.json()["paths"]
 
 
-# @lat: [[tests#Embedded body fields on malformed or non-object JSON]]
-def test_embedded_body_malformed_or_non_object_json():
+# @lat: [[tests#Embedded body fields#Malformed or non-object JSON]]
+@pytest.mark.parametrize(
+    "raw_body",
+    [b"{bad", b"[1, 2]", b"null"],
+    ids=["malformed-json", "json-array", "json-null"],
+)
+def test_embedded_body_malformed_or_non_object_json(raw_body):
     app = Chano()
 
     def create(
@@ -620,17 +649,30 @@ def test_embedded_body_malformed_or_non_object_json():
     app.add_route("/items", create, methods=["POST"])
     client = make_client(app)
 
-    for raw_body in (b"{bad", b"[1, 2]", b"null"):
-        resp = client(
-            "POST",
-            "/items",
-            content=raw_body,
-            headers={"content-type": "application/json"},
-        )
-        assert resp.status_code == 422
-        detail = resp.json()["detail"]
-        assert len(detail) == 1, detail
-        assert detail[0]["loc"] == ["body"]
+    resp = client(
+        "POST",
+        "/items",
+        content=raw_body,
+        headers={"content-type": "application/json"},
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert len(detail) == 1, detail
+    assert detail[0]["loc"] == ["body"]
+
+
+# @lat: [[tests#Embedded body fields#Empty body reports missing fields]]
+def test_embedded_body_empty_reports_missing_fields():
+    app = Chano()
+
+    def create(
+        name: Annotated[str, Body()],
+        count: Annotated[int, Body()],
+    ):
+        return {"name": name, "count": count}
+
+    app.add_route("/items", create, methods=["POST"])
+    client = make_client(app)
 
     empty = client("POST", "/items", content=b"")
     assert empty.status_code == 422

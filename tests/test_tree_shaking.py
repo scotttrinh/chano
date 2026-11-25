@@ -46,6 +46,7 @@ def _write_workspace_pkg(
 
 
 # @lat: [[tests#Per-function tree-shaking]]
+@pytest.mark.slow
 def test_tree_shaking_workspace_build(tmp_path, isolated_imports, monkeypatch, capsys):
     from chano.build import index_store
 
@@ -372,7 +373,7 @@ def test_trace_and_closure_edge_cases(
 
     monkeypatch.setattr(build_module, "SIZE_WARN_BYTES", 8_192)
     monkeypatch.setattr(build_module, "SIZE_LIMIT_BYTES", 1024 * 1024)
-    with pytest.warns(UserWarning) as record:
+    with pytest.warns(UserWarning, match="huge-pkg") as record:
         out = build(project, platform=None, output=tmp_path / "out")
     capsys.readouterr()
 
@@ -547,6 +548,7 @@ def test_segment_files_are_trace_roots(
 
 
 # @lat: [[tests#Build-time import check]]
+@pytest.mark.slow
 def test_build_import_check_catches_computed_import(
     tmp_path, isolated_imports, monkeypatch, capsys
 ):
@@ -654,6 +656,9 @@ def test_build_import_check_skips_non_matching_platform(
     def spy_run(cmd, *args, **kwargs):
         if isinstance(cmd, list) and cmd[:3] == ["uv", "python", "find"]:
             uv_calls.append(cmd)
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"{sys.executable}\n", stderr=""
+            )
         return real_run(cmd, *args, **kwargs)
 
     monkeypatch.setattr(build_module.subprocess, "run", spy_run)
@@ -694,6 +699,7 @@ def test_build_import_check_skips_non_matching_platform(
 
 
 # @lat: [[tests#Import check target interpreter]]
+@pytest.mark.slow
 def test_build_import_check_uses_uv_python_find(
     tmp_path, isolated_imports, monkeypatch, capsys
 ):
@@ -789,6 +795,7 @@ def test_build_import_check_uses_uv_python_find(
 
 
 # @lat: [[tests#Build explain]]
+@pytest.mark.slow
 def test_build_explain(tmp_path, isolated_imports, monkeypatch, capsys):
     repo_root = Path(__file__).parent.parent.resolve()
     workspace = tmp_path / "explain-ws"
@@ -992,7 +999,7 @@ def test_build_explain(tmp_path, isolated_imports, monkeypatch, capsys):
     # before touching an existing output directory.
     sentinel = out_alpha / "keep.txt"
     sentinel.write_text("untouched")
-    with pytest.raises(ValueError) as exc_info:
+    with pytest.raises(ValueError, match="missing") as exc_info:
         cli_main(["build", "--output", str(out_alpha), "--explain", "missing"])
     msg = str(exc_info.value)
     assert "missing" in msg

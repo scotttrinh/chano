@@ -29,7 +29,7 @@ def sync_chunks():
     yield from (b"one ", "two ", b"three")
 
 
-# @lat: [[tests#Streaming responses]]
+# @lat: [[tests#Streaming responses#Streams chunks in order]]
 @pytest.mark.parametrize(
     "make_content",
     [async_chunks, sync_chunks, lambda: [b"one ", "two ", b"three"]],
@@ -55,41 +55,82 @@ def test_streaming_response_streams_chunks_in_order(make_content):
     assert [m["body"] for m in bodies] == [b"one ", b"two ", b"three", b""]
     assert [m["more_body"] for m in bodies] == [True, True, True, False]
 
-    # HEAD sends headers and an empty final body without running the producer.
-    consumed = []
 
-    def tracked():
-        consumed.append(True)
-        yield b"never sent"
+def _tracked_generator(called: list[str]):
+    called.append("next")
+    raise AssertionError("generator stepped for HEAD")
+    yield b"never sent"
 
+
+class _TrackedNoIter:
+    def __init__(self, called: list[str]) -> None:
+        self._called = called
+
+    def __iter__(self):
+        self._called.append("iter")
+        raise AssertionError("__iter__ called for HEAD")
+
+
+class _TrackedNoAiter:
+    def __init__(self, called: list[str]) -> None:
+        self._called = called
+
+    def __aiter__(self):
+        self._called.append("aiter")
+        raise AssertionError("__aiter__ called for HEAD")
+
+
+_SSE_DEFAULT_HEADERS = {
+    b"content-type": b"text/event-stream",
+    b"cache-control": b"no-cache",
+}
+
+
+# @lat: [[tests#Streaming responses#HEAD skips producer]]
+@pytest.mark.parametrize(
+    ("make_response", "expected_headers"),
+    [
+        pytest.param(
+            lambda called: StreamingResponse(_tracked_generator(called)),
+            {},
+            id="streaming-generator",
+        ),
+        pytest.param(
+            lambda called: StreamingResponse(_TrackedNoIter(called)),
+            {},
+            id="streaming-sync-no-iter",
+        ),
+        pytest.param(
+            lambda called: StreamingResponse(_TrackedNoAiter(called)),
+            {},
+            id="streaming-async-no-aiter",
+        ),
+        pytest.param(
+            lambda called: SSEResponse(_TrackedNoIter(called)),
+            _SSE_DEFAULT_HEADERS,
+            id="sse-sync-no-iter",
+        ),
+        pytest.param(
+            lambda called: SSEResponse(_TrackedNoAiter(called)),
+            _SSE_DEFAULT_HEADERS,
+            id="sse-async-no-aiter",
+        ),
+    ],
+)
+def test_streaming_head_skips_producer(make_response, expected_headers):
+    called: list[str] = []
     head = call_asgi(
-        stream_app(lambda: StreamingResponse(tracked())), wait_for_disconnect, "HEAD"
+        stream_app(lambda: make_response(called)), wait_for_disconnect, "HEAD"
     )
-    assert consumed == []
+    assert called == []
+    assert head[0]["type"] == "http.response.start"
+    assert head[0]["status"] == 200
+    headers = dict(head[0]["headers"])
+    assert headers == expected_headers
+    assert b"content-length" not in headers
     assert body_messages(head) == [
         {"type": "http.response.body", "body": b"", "more_body": False}
     ]
-    assert b"content-length" not in dict(head[0]["headers"])
-
-    class NoIter:
-        def __iter__(self):
-            raise AssertionError("__iter__ called for HEAD")
-
-    class NoAiter:
-        def __aiter__(self):
-            raise AssertionError("__aiter__ called for HEAD")
-
-    for make in (
-        lambda: StreamingResponse(NoIter()),
-        lambda: StreamingResponse(NoAiter()),
-        lambda: SSEResponse(NoIter()),
-        lambda: SSEResponse(NoAiter()),
-    ):
-        head = call_asgi(stream_app(make), wait_for_disconnect, "HEAD")
-        assert head[0]["type"] == "http.response.start"
-        assert body_messages(head) == [
-            {"type": "http.response.body", "body": b"", "more_body": False}
-        ]
 
 
 def endless_sync(closed: list):
@@ -203,9 +244,9 @@ def test_sse_response_framing_and_pings():
     assert ServerSentEvent().encode() == b"\n\n"
 
     # Newlines in single-line fields would break framing.
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="SSE event must not contain a newline"):
         ServerSentEvent(data="x", event="a\nb")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="SSE id must not contain a newline"):
         ServerSentEvent(data="x", id="1\r2")
 
 
@@ -293,8 +334,8 @@ def test_streaming_response_cancel_during_disconnect_cleanup():
     asyncio.run(asyncio.wait_for(run(), timeout=5))
 
 
-# @lat: [[tests#SSE headers and ping validation]]
-def test_sse_response_enforces_headers_and_validates_ping():
+# @lat: [[tests#SSE headers and ping validation#Enforces SSE headers]]
+def test_sse_response_enforces_headers():
     response = SSEResponse(
         ["a"],
         headers={
@@ -308,9 +349,16 @@ def test_sse_response_enforces_headers_and_validates_ping():
     assert headers[b"content-type"] == b"text/event-stream"
     assert headers[b"cache-control"] == b"no-cache"
     assert headers[b"x-extra"] == b"1"
-
-    for ping in (0, -1, 0.0, float("nan"), float("inf"), float("-inf")):
-        with pytest.raises(ValueError, match="ping"):
-            SSEResponse(["a"], ping=ping)
     SSEResponse(["a"], ping=None)
     SSEResponse(["a"], ping=0.5)
+
+
+# @lat: [[tests#SSE headers and ping validation#Rejects invalid ping]]
+@pytest.mark.parametrize(
+    "ping",
+    [0, -1, 0.0, float("nan"), float("inf"), float("-inf")],
+    ids=["zero", "negative", "zero-float", "nan", "inf", "neg-inf"],
+)
+def test_sse_response_rejects_invalid_ping(ping):
+    with pytest.raises(ValueError, match="ping"):
+        SSEResponse(["a"], ping=ping)

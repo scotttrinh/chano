@@ -8,6 +8,8 @@ import json
 import re
 import subprocess
 import sys
+import types
+from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -27,9 +29,9 @@ from chano import (
     RequestValidationError,
     Response,
     create_app,
+    create_queue_app,
     openapi,
 )
-from chano.queues import _make_queue_subscriber, discover_queues, load_queue
 from chano.status import (
     OK,
     Accepted,
@@ -148,13 +150,8 @@ class UnhashableMetaCreated[T](Created[Annotated[T, {"note": "unhashable"}]]):
     pass
 
 
-# @lat: [[tests#Outcomes#Returned and raised outcomes]]
-def test_outcomes_status_body_headers_cookies_and_bodyless():
-    with pytest.raises(TypeError, match="status"):
-        Outcome("x")
-    with pytest.raises(TypeError, match="status"):
-        Failure("x")
-
+@pytest.fixture(scope="module")
+def outcomes_client():
     app = Chano(docs=False)
 
     def created() -> Created[Item]:
@@ -207,63 +204,89 @@ def test_outcomes_status_body_headers_cookies_and_bodyless():
     app.add_route("/fail-return", fail_return, ["GET"])
     app.add_route("/fail-raise", fail_raise, ["GET"])
     app.add_route("/fail-struct", fail_struct, ["GET"])
+    return make_client(app)
 
-    client = make_client(app)
 
-    r = client("POST", "/created")
+# @lat: [[tests#Outcomes#Returned and raised outcomes#Base types require status]]
+def test_outcome_and_failure_require_status():
+    with pytest.raises(TypeError, match="status"):
+        Outcome("x")
+    with pytest.raises(TypeError, match="status"):
+        Failure("x")
+
+
+# @lat: [[tests#Outcomes#Returned and raised outcomes#Success outcomes]]
+def test_outcome_created_and_accepted_responses(outcomes_client):
+    r = outcomes_client("POST", "/created")
     assert r.status_code == 201
     assert r.json() == {"id": 1, "name": "book"}
     assert r.headers["location"] == "/items/1"
     assert r.headers["content-type"] == "application/json"
     assert "session=abc" in r.headers["set-cookie"]
 
-    r = client("POST", "/accepted")
+    r = outcomes_client("POST", "/accepted")
     assert (r.status_code, r.json()) == (202, {"id": 2, "name": "job"})
-    r = client("POST", "/accepted?empty=true")
+    r = outcomes_client("POST", "/accepted?empty=true")
     assert (r.status_code, r.content) == (202, b"")
     assert "content-type" not in r.headers
 
-    r = client("DELETE", "/no-content")
+
+# @lat: [[tests#Outcomes#Returned and raised outcomes#Bodyless outcomes]]
+def test_outcome_bodyless_responses(outcomes_client):
+    r = outcomes_client("DELETE", "/no-content")
     assert (r.status_code, r.content) == (204, b"")
     assert r.headers["x-done"] == "1"
     assert "content-type" not in r.headers
     assert "content-length" not in r.headers
     assert "Max-Age=0" in r.headers["set-cookie"]
 
-    r = client("GET", "/not-modified")
+    r = outcomes_client("GET", "/not-modified")
     assert (r.status_code, r.content) == (304, b"")
     assert r.headers["etag"] == '"v1"'
     assert "content-type" not in r.headers
     assert "content-length" not in r.headers
 
-    r = client("GET", "/ok-none")
+    r = outcomes_client("GET", "/ok-none")
     assert (r.status_code, r.content) == (200, b"")
     assert r.headers["x-empty"] == "yes"
     assert "content-type" not in r.headers
+    assert r.headers["content-length"] == "0"
 
-    r = client("GET", "/early")
+    r = outcomes_client("GET", "/early")
     assert (r.status_code, r.content) == (103, b"")
     assert "content-type" not in r.headers
     assert "content-length" not in r.headers
 
-    r = client("GET", "/custom-204")
+    r = outcomes_client("GET", "/custom-204")
     assert (r.status_code, r.content) == (204, b"")
     assert "content-type" not in r.headers
+    assert "content-length" not in r.headers
 
-    # Returned and raised failures produce identical responses.
-    r_ret = client("GET", "/fail-return")
-    r_raise = client("GET", "/fail-raise")
-    for res in (r_ret, r_raise):
-        assert res.status_code == 404
-        assert res.json() == {"detail": "gone"}
-        assert res.headers["x-reason"] == "missing"
-        assert "err_cookie=1" in res.headers["set-cookie"]
 
-    r_prob = client("GET", "/fail-struct")
+# @lat: [[tests#Outcomes#Returned and raised outcomes#Returned vs raised failures]]
+@pytest.mark.parametrize(
+    "path",
+    ["/fail-return", "/fail-raise"],
+    ids=["returned", "raised"],
+)
+def test_outcome_returned_and_raised_failure_responses(outcomes_client, path):
+    res = outcomes_client("GET", path)
+    assert res.status_code == 404
+    assert res.json() == {"detail": "gone"}
+    assert res.headers["x-reason"] == "missing"
+    assert "err_cookie=1" in res.headers["set-cookie"]
+
+
+# @lat: [[tests#Outcomes#Returned and raised outcomes#Custom failure media type]]
+def test_outcome_problem_struct_failure_response(outcomes_client):
+    r_prob = outcomes_client("GET", "/fail-struct")
     assert r_prob.status_code == 404
     assert r_prob.headers["content-type"] == "application/problem+json"
     assert r_prob.json() == {"title": "No such item", "status": 404}
 
+
+# @lat: [[tests#Outcomes#Returned and raised outcomes#Failure payload wrapping]]
+def test_failure_string_wrapping_and_generic_subclasses():
     # Failure[str] and subclasses of Failure[str] preserve raw str payloads, while
     # default NotFound("gone") and NotFound[ErrorDetail]("gone") wrap in ErrorDetail.
     raw_generic = NotFound[str]("gone")
@@ -418,8 +441,8 @@ def test_depends_short_circuit_nested_and_cached():
     assert calls == ["check"]
 
 
-# @lat: [[tests#Outcomes#OpenAPI from return annotations]]
-def test_openapi_from_return_annotations():
+@pytest.fixture(scope="module")
+def return_annotation_openapi_schema():
     bearer = HTTPBearer()
 
     def dep_auth(token: str = Depends(bearer)) -> User | Forbidden:
@@ -515,14 +538,19 @@ def test_openapi_from_return_annotations():
     app.add_route("/multi-created", multi_created, ["POST"])
     app.add_route("/mixin-not-found", mixin_not_found, ["GET"])
     app.add_route("/dep-200", dep_200_override, ["POST"])
+    return app.openapi()
 
-    schema = app.openapi()
-    schemas = schema["components"]["schemas"]
 
+# @lat: [[tests#Outcomes#OpenAPI from return annotations#Handler, deps, and guards]]
+def test_openapi_return_annotations_combines_handler_deps_and_guards(
+    return_annotation_openapi_schema,
+):
     # GET /items/{item_id}: 200 (with @openapi response_description), 303 (guard),
     # 401 (nested HTTPBearer without decorator), 403 (dep_auth), 404 (anyOf
     # ItemNotFound's Problem + dep_alt_404's ErrorDetail), 422 (has request inputs).
-    get_res = schema["paths"]["/items/{item_id}"]["get"]["responses"]
+    get_res = return_annotation_openapi_schema["paths"]["/items/{item_id}"]["get"][
+        "responses"
+    ]
     assert list(get_res) == ["200", "303", "401", "403", "404", "422"]
     assert get_res["200"]["description"] == "Fetched item"
     assert get_res["200"]["content"]["application/json"]["schema"] == {
@@ -546,9 +574,15 @@ def test_openapi_from_return_annotations():
         "$ref": "#/components/schemas/ValidationErrorDetail"
     }
 
+
+# @lat: [[tests#Outcomes#OpenAPI from return annotations#Envelopes and media types]]
+def test_openapi_return_annotations_envelopes_and_problem_media_type(
+    return_annotation_openapi_schema,
+):
+    schemas = return_annotation_openapi_schema["components"]["schemas"]
     # POST /items: envelope subclass resolves ApiCreated[Item] -> Document[Item] at 201,
     # ApiNotFound -> application/problem+json at 404, no invented 200.
-    post_res = schema["paths"]["/items"]["post"]["responses"]
+    post_res = return_annotation_openapi_schema["paths"]["/items"]["post"]["responses"]
     assert list(post_res) == ["201", "404", "422"]
     assert post_res["201"]["description"] == "Created"
     doc_ref = post_res["201"]["content"]["application/json"]["schema"]["$ref"]
@@ -561,14 +595,21 @@ def test_openapi_from_return_annotations():
         "$ref": "#/components/schemas/Problem"
     }
 
+
+# @lat: [[tests#Outcomes#OpenAPI from return annotations#Bodyless, unions, bearer]]
+def test_openapi_return_annotations_bodyless_plain_unions_and_bearer(
+    return_annotation_openapi_schema,
+):
     # DELETE /delete/{item_id}: 204 bodyless, 404 ErrorDetail, 422, no 200.
-    del_res = schema["paths"]["/delete/{item_id}"]["delete"]["responses"]
+    del_res = return_annotation_openapi_schema["paths"]["/delete/{item_id}"]["delete"][
+        "responses"
+    ]
     assert list(del_res) == ["204", "404", "422"]
     assert del_res["204"] == {"description": "No Content"}
     assert "content" not in del_res["204"]
 
     # GET /multi: two plain return types form anyOf on 200, no 422 (no inputs).
-    multi_res = schema["paths"]["/multi"]["get"]["responses"]
+    multi_res = return_annotation_openapi_schema["paths"]["/multi"]["get"]["responses"]
     assert list(multi_res) == ["200"]
     assert multi_res["200"]["content"]["application/json"]["schema"] == {
         "anyOf": [
@@ -578,26 +619,32 @@ def test_openapi_from_return_annotations():
     }
 
     # GET /bearer: HTTPBearer documents 401 with no decorator, no 422.
-    bearer_res = schema["paths"]["/bearer"]["get"]["responses"]
+    bearer_res = return_annotation_openapi_schema["paths"]["/bearer"]["get"][
+        "responses"
+    ]
     assert list(bearer_res) == ["200", "401"]
     assert bearer_res["401"]["description"] == "Unauthorized"
 
-    # Annotated outcomes, Annotated aliases, unhashable metadata, alias defaults,
-    # generic-mixin subclasses, and @openapi(response_description) over dep 200.
-    ann_out = schema["paths"]["/annotated-outcome"]["post"]["responses"]
+
+# @lat: [[tests#Outcomes#OpenAPI from return annotations#Aliases and generics]]
+def test_openapi_return_annotations_annotated_and_generic_aliases(
+    return_annotation_openapi_schema,
+):
+    paths = return_annotation_openapi_schema["paths"]
+    ann_out = paths["/annotated-outcome"]["post"]["responses"]
     assert list(ann_out) == ["201"]
     assert ann_out["201"]["content"]["application/json"]["schema"] == {
         "type": "integer"
     }
 
-    ann_alias = schema["paths"]["/annotated-alias"]["post"]["responses"]
+    ann_alias = paths["/annotated-alias"]["post"]["responses"]
     assert list(ann_alias) == ["201", "404"]
 
-    unhash = schema["paths"]["/unhashable-meta"]["post"]["responses"]
+    unhash = paths["/unhashable-meta"]["post"]["responses"]
     assert list(unhash) == ["201"]
     assert unhash["201"]["content"]["application/json"]["schema"] == {"type": "integer"}
 
-    def_alias = schema["paths"]["/default-alias"]["post"]["responses"]
+    def_alias = paths["/default-alias"]["post"]["responses"]
     assert list(def_alias) == ["201", "404"]
     assert def_alias["201"]["content"]["application/json"]["schema"] == {
         "type": "integer"
@@ -606,27 +653,45 @@ def test_openapi_from_return_annotations():
         "$ref": "#/components/schemas/ErrorDetail"
     }
 
-    chained_res = schema["paths"]["/chained-default"]["post"]["responses"]
+    chained_res = paths["/chained-default"]["post"]["responses"]
     assert chained_res["201"]["content"]["application/json"]["schema"] == {
         "type": "integer"
     }
-    chained_str = schema["paths"]["/chained-override"]["post"]["responses"]
+    chained_str = paths["/chained-override"]["post"]["responses"]
     assert chained_str["201"]["content"]["application/json"]["schema"] == {
         "type": "string"
     }
 
-    ann_union = schema["paths"]["/annotated-union"]["get"]["responses"]["200"]
+    multi_res = paths["/multi-created"]["post"]["responses"]
+    assert list(multi_res) == ["201"]
+    assert multi_res["201"]["content"]["application/json"]["schema"] == {
+        "type": "integer"
+    }
+
+    mixin_res = paths["/mixin-not-found"]["get"]["responses"]
+    assert list(mixin_res) == ["404"]
+    assert mixin_res["404"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/ErrorDetail"
+    }
+
+
+# @lat: [[tests#Outcomes#OpenAPI from return annotations#Union meta and dep 200]]
+def test_openapi_return_annotations_annotated_unions_and_dep_override(
+    return_annotation_openapi_schema,
+):
+    paths = return_annotation_openapi_schema["paths"]
+    ann_union = paths["/annotated-union"]["get"]["responses"]["200"]
     assert ann_union["content"]["application/json"]["schema"] == {
         "anyOf": [{"type": "integer"}, {"type": "string"}],
         "description": "Keep me",
     }
-    ann_plain = schema["paths"]["/annotated-plain-alias"]["get"]["responses"]["200"]
+    ann_plain = paths["/annotated-plain-alias"]["get"]["responses"]["200"]
     assert ann_plain["content"]["application/json"]["schema"] == {
         "anyOf": [{"type": "integer"}, {"type": "string"}],
         "description": "Alias desc",
     }
 
-    ann_structs = schema["paths"]["/annotated-struct-union"]["get"]["responses"]["200"]
+    ann_structs = paths["/annotated-struct-union"]["get"]["responses"]["200"]
     assert ann_structs["content"]["application/json"]["schema"] == {
         "anyOf": [
             {"$ref": "#/components/schemas/Item"},
@@ -635,25 +700,16 @@ def test_openapi_from_return_annotations():
         "description": "Either model",
     }
 
-    multi_res = schema["paths"]["/multi-created"]["post"]["responses"]
-    assert list(multi_res) == ["201"]
-    assert multi_res["201"]["content"]["application/json"]["schema"] == {
-        "type": "integer"
-    }
-
-    mixin_res = schema["paths"]["/mixin-not-found"]["get"]["responses"]
-    assert list(mixin_res) == ["404"]
-    assert mixin_res["404"]["content"]["application/json"]["schema"] == {
-        "$ref": "#/components/schemas/ErrorDetail"
-    }
-
-    dep_200 = schema["paths"]["/dep-200"]["post"]["responses"]
+    dep_200 = paths["/dep-200"]["post"]["responses"]
     assert list(dep_200) == ["200", "201"]
     assert dep_200["200"]["description"] == "Custom 200"
 
 
 # @lat: [[tests#Outcomes#Queue retry on returned and raised Failure]]
-def test_queue_retry_on_returned_and_raised_failure(tmp_path, isolated_imports):
+@pytest.mark.parametrize("mode", ["return", "raise"])
+def test_queue_retry_on_returned_and_raised_failure(
+    tmp_path, isolated_imports, monkeypatch, mode
+):
     app_dir = tmp_path / "app"
     q_dir = app_dir / "jobs"
     q_dir.mkdir(parents=True)
@@ -669,19 +725,43 @@ def test_queue_retry_on_returned_and_raised_failure(tmp_path, isolated_imports):
         '    return {"ok": True}\n'
     )
 
-    loaded = load_queue(discover_queues(app_dir)[0])
-    subscriber = _make_queue_subscriber(loaded, "local")
+    registered: list[Any] = []
+    raised_errors: list[BaseException] = []
+    fake_vq: Any = types.ModuleType("vercel.queue")
 
-    async def deliver(sub: Any, payload: dict[str, str]) -> None:
-        await sub(payload)
+    def fake_subscribe(**_kwargs: Any) -> Any:
+        def decorator(fn: Any) -> Any:
+            registered.append(fn)
+            return fn
 
-    # Normal delivery succeeds (returns None -> ack).
-    asyncio.run(deliver(subscriber, {"mode": "ok"}))
+        return decorator
 
-    # Both returned and raised Failure raise out of the subscriber (triggers retry).
-    for mode in ("return", "raise"):
-        with pytest.raises(ServiceUnavailable):
-            asyncio.run(deliver(subscriber, {"mode": mode}))
+    async def fake_accept_and_handle(
+        body_iter: AsyncIterator[bytes], _headers: Mapping[str, str]
+    ) -> None:
+        chunks = [chunk async for chunk in body_iter]
+        try:
+            await registered[-1](b"".join(chunks))
+        except BaseException as exc:
+            raised_errors.append(exc)
+            raise
+
+    fake_vq.subscribe = fake_subscribe
+    fake_vq.accept_and_handle = fake_accept_and_handle
+    monkeypatch.setitem(sys.modules, "vercel.queue", fake_vq)
+    monkeypatch.setitem(sys.modules, "vercel_runtime.workers", None)
+
+    q_client = make_client(create_queue_app(app_dir, "_queues/jobs"))
+
+    # Normal delivery succeeds (204 ack, no error raised).
+    assert q_client("POST", "/_queues/jobs", json={"mode": "ok"}).status_code == 204
+    assert raised_errors == []
+
+    # Both returned and raised Failure raise out of the subscriber (500 retry).
+    assert q_client("POST", "/_queues/jobs", json={"mode": mode}).status_code == 500
+    assert len(raised_errors) == 1
+    assert isinstance(raised_errors[0], ServiceUnavailable)
+    assert raised_errors[0].content == ErrorDetail(detail="try later")
 
     # An ancestor boundary.py with guards, recover, and wrap is ignored by
     # queue consumers: both returned and raised failures still raise to retry.
@@ -698,12 +778,18 @@ def test_queue_retry_on_returned_and_raised_failure(tmp_path, isolated_imports):
         "    guards=[redirect_guard], recover=[recover_all], wrap=[never_wrap]\n"
         ")\n"
     )
-    loaded_with_boundary = load_queue(discover_queues(app_dir)[0])
-    bounded_subscriber = _make_queue_subscriber(loaded_with_boundary, "local")
-    asyncio.run(deliver(bounded_subscriber, {"mode": "ok"}))
-    for mode in ("return", "raise"):
-        with pytest.raises(ServiceUnavailable):
-            asyncio.run(deliver(bounded_subscriber, {"mode": mode}))
+    raised_errors.clear()
+    bounded_client = make_client(create_queue_app(app_dir, "_queues/jobs"))
+    assert (
+        bounded_client("POST", "/_queues/jobs", json={"mode": "ok"}).status_code == 204
+    )
+    assert raised_errors == []
+    assert (
+        bounded_client("POST", "/_queues/jobs", json={"mode": mode}).status_code == 500
+    )
+    assert len(raised_errors) == 1
+    assert isinstance(raised_errors[0], ServiceUnavailable)
+    assert raised_errors[0].content == ErrorDetail(detail="try later")
 
 
 class ApiUnprocessable(UnprocessableContent[Problem]):

@@ -158,10 +158,10 @@ def test_set_cookie_and_delete_cookie():
     response = Response()
     with pytest.raises(ValueError, match="samesite"):
         response.set_cookie("bad", samesite="sometimes")  # ty: ignore[invalid-argument-type]
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="invalid cookie name"):
         response.set_cookie("bad key", "x")
     # delete_cookie has exactly the spec's signature.
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match="secure"):
         response.delete_cookie("old", secure=False)  # ty: ignore[unknown-argument]
 
 

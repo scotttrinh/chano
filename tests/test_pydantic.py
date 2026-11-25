@@ -502,7 +502,9 @@ def test_pydantic_response_and_sse_serialization():
         "item": expected,
     }
 
-    with pytest.raises(TypeError):
+    with pytest.raises(
+        TypeError, match="Encoding objects of type object is unsupported"
+    ):
         JSONResponse(object())
 
 

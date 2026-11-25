@@ -173,6 +173,7 @@ def test_emit_build_preserves_public_and_config_isolation(
 
 
 # @lat: [[tests#Build output layout]]
+@pytest.mark.slow
 def test_build_output_layout(output):
     config = json.loads((output / "config.json").read_text())
     assert config["version"] == 3
@@ -211,20 +212,25 @@ def test_build_output_layout(output):
 
 
 # @lat: [[tests#Built function invocation]]
+@pytest.mark.slow
 def test_built_functions_handle_their_own_route(output):
     response = invoke(output, "api/items/[item_id]", "/api/items/42?q=1")
     assert response["statusCode"] == 200
     assert json.loads(response["body"]) == {"item_id": 42, "verbose": False}
 
     response = invoke(output, "index", "/")
+    assert response["statusCode"] == 200
     assert json.loads(response["body"]) == {"message": "Hello from Chano"}
 
     # Each function only knows its own route.
-    assert invoke(output, "api/hello", "/api/items/42")["statusCode"] == 404
-    assert invoke(output, "api/hello", "/docs")["statusCode"] == 404
+    for path in ("/api/items/42", "/docs"):
+        miss = invoke(output, "api/hello", path)
+        assert miss["statusCode"] == 404
+        assert json.loads(miss["body"]) == {"detail": "Not Found"}
 
 
 # @lat: [[tests#Prefixed build output]]
+@pytest.mark.slow
 def test_prefixed_build_output(prefixed_project, prefixed_output):
     output = prefixed_output
     assert output == prefixed_project / ".vercel" / "output"
@@ -256,10 +262,14 @@ def test_prefixed_build_output(prefixed_project, prefixed_output):
     }
 
     response = invoke(output, "api", "/api")
+    assert response["statusCode"] == 200
     assert json.loads(response["body"]) == {"route": "root"}
     response = invoke(output, "api/users/[id]", "/api/users/5")
+    assert response["statusCode"] == 200
     assert json.loads(response["body"]) == {"id": 5, "path": "/api/users/5"}
-    assert invoke(output, "api/users", "/users")["statusCode"] == 404
+    miss = invoke(output, "api/users", "/users")
+    assert miss["statusCode"] == 404
+    assert json.loads(miss["body"]) == {"detail": "Not Found"}
 
 
 # @lat: [[tests#Route module isolation]]
@@ -353,7 +363,7 @@ def test_prefixed_build_without_public(tmp_path, isolated_imports, stub_build_in
     assert (static / "api" / "docs.html").is_file()
 
 
-# @lat: [[tests#Custom build output directory]]
+# @lat: [[tests#Custom build output directory#Custom output directory]]
 def test_custom_build_output_directory(
     tmp_path, isolated_imports, monkeypatch, stub_build_install, capsys
 ):
@@ -408,22 +418,34 @@ def test_custom_build_output_directory(
     assert "cli-out" in capsys.readouterr().out
     assert not (project / ".vercel").exists()
 
-    # Output directories overlapping project source trees are rejected before deletion.
-    for bad in [
+
+# @lat: [[tests#Custom build output directory#Rejects overlapping output directory]]
+@pytest.mark.parametrize(
+    "relative_output",
+    [".", "..", "app", "app/out", "public", "public/out"],
+    ids=["project-root", "parent-dir", "app", "inside-app", "public", "inside-public"],
+)
+def test_build_rejects_overlapping_output_directory(
+    tmp_path, isolated_imports, relative_output
+):
+    project = tmp_path / "custom"
+    write_project(
         project,
-        project.parent,
-        project / "app",
-        project / "app" / "out",
-        project / "public",
-        project / "public" / "out",
-    ]:
-        with pytest.raises(ValueError, match="output directory"):
-            plan_build(project, output=bad)
-        assert (project / "app" / "route.py").is_file()
-        assert (project / "public" / "hello.txt").is_file()
+        {
+            "pyproject.toml": '[project]\nname = "custom"\nversion = "0"\n',
+            "app/route.py": "def GET():\n    return {'ok': True}\n",
+            "public/hello.txt": "hi\n",
+        },
+    )
+    bad = (project / relative_output).resolve()
+    with pytest.raises(ValueError, match="output directory"):
+        plan_build(project, output=bad)
+    assert (project / "app" / "route.py").is_file()
+    assert (project / "public" / "hello.txt").is_file()
 
 
 # @lat: [[tests#Locked lockfile]]
+@pytest.mark.slow
 def test_stale_lockfile_fails_build(tmp_path, isolated_imports):
     project = tmp_path / "stale"
     pyproject = (
@@ -444,13 +466,13 @@ def test_stale_lockfile_fails_build(tmp_path, isolated_imports):
     (project / "pyproject.toml").write_text(
         pyproject.replace("dependencies = []", 'dependencies = ["msgspec"]')
     )
-    with pytest.raises(RuntimeError, match="uv.lock"):
+    with pytest.raises(RuntimeError, match=r"uv\.lock"):
         build(project, platform=None, output=tmp_path / "out")
     assert (project / "uv.lock").read_text() == lock_before
 
     # Missing uv.lock also fails instead of resolving on the fly.
     (project / "uv.lock").unlink()
-    with pytest.raises(RuntimeError, match="uv.lock"):
+    with pytest.raises(RuntimeError, match=r"uv\.lock"):
         build(project, platform=None, output=tmp_path / "out2")
 
 
@@ -622,6 +644,7 @@ def test_workspace_root_discovery(tmp_path, isolated_imports):
 
 
 # @lat: [[tests#Workspace build]]
+@pytest.mark.slow
 def test_workspace_build(tmp_path, isolated_imports, monkeypatch):
     repo_root = Path(__file__).parent.parent.resolve()
     workspace = tmp_path / "workspace"
@@ -699,6 +722,7 @@ def test_workspace_build(tmp_path, isolated_imports, monkeypatch):
 
 
 # @lat: [[tests#Full-stack example build]]
+@pytest.mark.slow
 def test_fullstack_example_build(tmp_path, isolated_imports):
     backend = FULLSTACK / "backend"
     vercel = json.loads((FULLSTACK / "vercel.json").read_text())
@@ -776,6 +800,7 @@ def test_dev_requires_uvicorn(monkeypatch):
 
 
 # @lat: [[tests#Store index]]
+@pytest.mark.slow
 def test_store_index(tmp_path, output):
     from chano.build import index_store, normalize_dist_name
 
@@ -965,7 +990,7 @@ def test_build_size_report_and_limits(
     # distributions in descending size order, and build still succeeds.
     monkeypatch.setattr(build_module, "SIZE_WARN_BYTES", 4_096)
     monkeypatch.setattr(build_module, "SIZE_LIMIT_BYTES", 1024 * 1024)
-    with pytest.warns(UserWarning) as record:
+    with pytest.warns(UserWarning, match="big-pkg") as record:
         out_warn = build(project, platform=None, output=tmp_path / "out-warn")
     assert out_warn.is_dir()
     warn_messages = [str(item.message) for item in record]
