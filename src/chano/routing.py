@@ -24,27 +24,23 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
-import inspect
 import re
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from chano.app import AfterBackend, Chano, ErrorHandler, Middleware
+from chano.app import AfterBackend, Boundary, Chano
 from chano.config import normalize_base_path, project_base_path, project_config
-from chano.exceptions import HTTPException
-from chano.params import is_generator_callable
 from chano.requests import Request
 from chano.responses import Response
+from chano.status import NotFound
 
 HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 ROUTE_FILE = "route.py"
-MIDDLEWARE_FILE = "middleware.py"
-ERROR_FILE = "error.py"
-DEPENDENCIES_FILE = "dependencies.py"
+BOUNDARY_FILE = "boundary.py"
 
 
 def load_module(path: Path) -> ModuleType:
@@ -160,72 +156,22 @@ def discover_routes(app_dir: str | Path, base_path: str = "") -> list[Route]:
     return sorted(routes, key=lambda route: (route.rank, route.url_path, route.file))
 
 
-def _middleware(route: Route) -> list[Middleware]:
-    """Each ancestor ``middleware.py``'s ``middleware``, root to leaf."""
-    chain = []
-    for module in route.load_segments(MIDDLEWARE_FILE):
-        middleware = getattr(module, "middleware", None)
-        if not inspect.iscoroutinefunction(middleware):
-            raise TypeError(
-                f"invalid `middleware` in {module.__file__}: expected "
-                f"`async def middleware(request, call_next)`, got {middleware!r}"
-            )
-        chain.append(middleware)
-    return chain
-
-
-def load_segment_error_handlers(modules: Sequence[ModuleType]) -> list[ErrorHandler]:
-    """Validate and return ``handle_error`` from each ``error.py`` module."""
-    handlers = []
+def load_segment_boundaries(modules: Sequence[ModuleType]) -> tuple[Boundary, ...]:
+    """Validate and return ``boundary`` from each ``boundary.py`` module."""
+    boundaries: list[Boundary] = []
     for module in modules:
-        handler = getattr(module, "handle_error", None)
-        if not callable(handler):
+        boundary = getattr(module, "boundary", None)
+        if not isinstance(boundary, Boundary):
             raise TypeError(
-                f"invalid `handle_error` in {module.__file__}: expected "
-                f"`def handle_error(request, exc)`, got {handler!r}"
+                f"invalid `boundary` in {module.__file__}: expected a Boundary, "
+                f"got {boundary!r}"
             )
-        handlers.append(handler)
-    return handlers
-
-
-def _error_handlers(route: Route) -> list[ErrorHandler]:
-    """Each ancestor ``error.py``'s ``handle_error``, root to leaf."""
-    return load_segment_error_handlers(route.load_segments(ERROR_FILE))
-
-
-def load_segment_dependencies(
-    modules: Sequence[ModuleType],
-) -> list[list[Callable[..., Any]]]:
-    """Validate and return ``dependencies`` from each ``dependencies.py`` module."""
-    groups: list[list[Callable[..., Any]]] = []
-    for module in modules:
-        declared = getattr(module, "dependencies", None)
-        if not isinstance(declared, list | tuple) or not all(
-            callable(check) for check in declared
-        ):
-            raise TypeError(
-                f"invalid `dependencies` in {module.__file__}: expected a list "
-                f"or tuple of dependency callables, got {declared!r}"
-            )
-        if generators := [check for check in declared if is_generator_callable(check)]:
-            raise TypeError(
-                f"invalid `dependencies` in {module.__file__}: generator "
-                f"functions never run as checks, got {generators!r}"
-            )
-        groups.append(list(declared))
-    return groups
-
-
-def _dependencies(route: Route) -> list[list[Callable[..., Any]]]:
-    """Each ancestor ``dependencies.py``'s ``dependencies``, one group per
-    file, root to leaf and in declared order within each."""
-    return load_segment_dependencies(route.load_segments(DEPENDENCIES_FILE))
+        boundaries.append(boundary)
+    return tuple(boundaries)
 
 
 def _add_route(app: Chano, route: Route) -> None:
-    middleware = _middleware(route)
-    error_handlers = _error_handlers(route)
-    dependencies = _dependencies(route)
+    boundaries = load_segment_boundaries(route.load_segments(BOUNDARY_FILE))
     module = route.load()
     for method in HTTP_METHODS:
         handler = getattr(module, method, None)
@@ -234,9 +180,7 @@ def _add_route(app: Chano, route: Route) -> None:
                 route.url_path,
                 handler,
                 methods=[method],
-                middleware=middleware,
-                error_handlers=error_handlers,
-                dependencies=dependencies,
+                boundaries=boundaries,
             )
 
 
@@ -305,7 +249,7 @@ def create_app(
             try:
                 matches = resolve_queues(queues, topic, consumer=consumer)
             except QueueNotFoundError as exc:
-                raise HTTPException(404, str(exc)) from None
+                raise NotFound(str(exc)) from None
             body = await request.body()
             result = await invoke_resolved_queues(
                 matches,
@@ -348,7 +292,7 @@ def create_app(
             try:
                 resolved = resolve_schedule(schedules, target)
             except ScheduleNotFoundError as exc:
-                raise HTTPException(404, str(exc)) from None
+                raise NotFound(str(exc)) from None
             result = await invoke_loaded_schedule(resolved, headers=request.headers)
             if isinstance(result, Response):
                 return result

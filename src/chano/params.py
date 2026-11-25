@@ -9,8 +9,7 @@
 
 ``Annotated[T, Query()]``, ``Annotated[T, Header()]``, ``Annotated[T, Cookie()]``,
 and ``Annotated[T, Body()]`` override the inferred source.
-``lazy(factory)`` makes a process-wide value usable as ``Annotated[T, Depends(...)]``.
-``@raises(status, description)`` documents an error response in OpenAPI.
+``lazy(factory)`` makes a process-wide value usable as ``x: T = Depends(...)``.
 """
 
 from __future__ import annotations
@@ -24,7 +23,7 @@ import inspect
 import re
 import threading
 import types
-from collections.abc import Callable, Coroutine, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Annotated, Any, get_args, get_origin, overload
 
@@ -38,6 +37,7 @@ from chano._pydantic import (
 )
 from chano.exceptions import RequestValidationError
 from chano.requests import Request
+from chano.responses import Response
 from chano.security import HTTPBearer
 
 _MISSING: Any = object()
@@ -54,35 +54,12 @@ class ParamInfo:
         self.alias = alias
 
 
-def Depends(dependency: Callable[..., Any]) -> DependsInfo:
+@overload
+def Depends[T](dependency: Callable[..., Awaitable[T | Response]]) -> T: ...
+@overload
+def Depends[T](dependency: Callable[..., T | Response]) -> T: ...
+def Depends(dependency: Callable[..., Any]) -> Any:
     return DependsInfo(dependency)
-
-
-_RAISES = "__chano_raises__"
-
-
-def raises[F: Callable[..., Any]](
-    status_code: int, description: str
-) -> Callable[[F], F]:
-    """Document that a handler or dependency may respond with an error.
-
-    ``@raises(401, "Not authenticated")`` adds that response to every
-    operation using the decorated function. Stack it for several statuses.
-    It only documents: raise ``HTTPException`` to send the response. When
-    stacked decorators repeat a status, the outermost one wins.
-    """
-    if not isinstance(status_code, int) or isinstance(status_code, bool):
-        raise TypeError(f"raises() takes an int status code, got {status_code!r}")
-    if not 400 <= status_code <= 599:
-        raise ValueError(f"raises() takes an error status code, got {status_code}")
-
-    def decorate(func: F) -> F:
-        # Decorators apply inner first, so the outer one overwrites.
-        declared = getattr(func, _RAISES, {})
-        setattr(func, _RAISES, {**declared, status_code: description})
-        return func
-
-    return decorate
 
 
 def Query(*, alias: str | None = None) -> ParamInfo:
@@ -392,42 +369,43 @@ class Endpoint:
             if isinstance(endpoint, Endpoint) and isinstance(endpoint.func, HTTPBearer):
                 yield endpoint.func
 
-    def declared_responses(self) -> dict[int, str]:
-        """Error responses declared with ``raises``, here, in dependencies
-        and in inherited checks.
-
-        The first declaration of a status wins, visiting level by level: this
-        function; then its direct dependencies in parameter order, followed
-        by its inherited checks nearest segment first and in declared order
-        within a segment; then their dependencies, and so on. A nearer
-        declaration so beats a deeper one in any branch.
-        """
-        declared: dict[int, str] = {}
+    def response_endpoints(self) -> Iterator[Endpoint]:
+        """Yield this endpoint, then its direct dependencies, then its inherited
+        checks (nearest segment first), then their dependencies level by level."""
+        seen: set[Any] = set()
         level: list[Endpoint] = [self]
         checks = [check for group in reversed(self.check_groups) for check in group]
         while level:
-            for endpoint in level:
-                for status, description in getattr(endpoint.func, _RAISES, {}).items():
-                    declared.setdefault(status, description)
-            level = [f.dependency for e in level for f in e.fields if f.dependency]
-            level, checks = [*level, *checks], []
-        return declared
+            next_level: list[Endpoint] = []
+            for current in level:
+                key = _key(current.func)
+                if key in seen:
+                    continue
+                seen.add(key)
+                yield current
+                next_level.extend(f.dependency for f in current.fields if f.dependency)
+            level, checks = [*next_level, *checks], []
 
     async def call(self, request: Request) -> Any:
         errors: list[dict[str, Any]] = []
         cache: dict[Any, Any] = {}
-        for check in self.checks:  # root to leaf, before any argument
-            result = await _depend(check, request, cache, errors)
-            if errors:
-                raise RequestValidationError(errors)
-            if inspect.isgenerator(result) or inspect.isasyncgen(result):
-                # A wrapper hid a generator from is_generator_callable: its
-                # body never ran, so the check never passed.
-                raise TypeError(
-                    f"inherited check {check.func!r} returned a generator "
-                    "instead of running"
-                )
-        result = await self._call(request, cache, errors)
+        try:
+            for check in self.checks:  # root to leaf, before any argument
+                result = await _depend(check, request, cache, errors)
+                if errors:
+                    raise RequestValidationError(errors)
+                if inspect.isgenerator(result) or inspect.isasyncgen(result):
+                    # A wrapper hid a generator from is_generator_callable: its
+                    # body never ran, so the check never passed.
+                    raise TypeError(
+                        f"inherited check {check.func!r} returned a generator "
+                        "instead of running"
+                    )
+                if isinstance(result, Response):
+                    return result
+            result = await self._call(request, cache, errors)
+        except _ShortCircuit as stop:
+            return stop.response
         if errors:
             raise RequestValidationError(errors)
         return result
@@ -462,9 +440,10 @@ class Endpoint:
             if field.source == "request":
                 kwargs[field.name] = request
             elif field.dependency:
-                kwargs[field.name] = await _depend(
-                    field.dependency, request, cache, errors
-                )
+                value = await _depend(field.dependency, request, cache, errors)
+                if isinstance(value, Response):
+                    raise _ShortCircuit(value)
+                kwargs[field.name] = value
             elif field.source == "body" and not field.embed:
                 # Decode and validate straight from the bytes, in one pass.
                 value = _decode_body(
@@ -495,6 +474,11 @@ class Endpoint:
                         raw = values[-1]
                 kwargs[field.name] = _convert(field, raw, strict=False, errors=errors)
         return kwargs
+
+
+class _ShortCircuit(Exception):
+    def __init__(self, response: Response) -> None:
+        self.response = response
 
 
 async def _depend(
@@ -595,11 +579,11 @@ def _field(
     if default is inspect.Parameter.empty:
         default = _MISSING
 
-    # Markers and Depends() live in Annotated metadata: `q: Annotated[str, Query()]`.
+    # Depends() is a default value: `user: User = Depends(current_user)`.
+    # Source markers live in Annotated metadata: `q: Annotated[str, Query()]`.
     if isinstance(default, DependsInfo):
-        raise TypeError(
-            f"parameter {name!r}: Depends() must be placed inside Annotated[...]"
-        )
+        dependency = Endpoint(default.dependency, path_params)
+        return Field(name, "depends", name, annotation, dependency=dependency)
     if isinstance(default, ParamInfo):
         marker_name = f"{default.source.capitalize()}()"
         raise TypeError(
@@ -609,13 +593,8 @@ def _field(
     declared = annotation
     if get_origin(annotation) is Annotated:
         annotation, *metadata = get_args(annotation)
-        marker = next(
-            (m for m in metadata if isinstance(m, DependsInfo | ParamInfo)), None
-        )
+        marker = next((m for m in metadata if isinstance(m, ParamInfo)), None)
 
-    if isinstance(marker, DependsInfo):
-        dependency = Endpoint(marker.dependency, path_params)
-        return Field(name, "depends", name, declared, dependency=dependency)
     if annotation is Request:
         return Field(name, "request", name, declared)
 

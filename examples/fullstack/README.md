@@ -8,11 +8,11 @@ a uv workspace.
 - `vercel.json` — declares `web` (`frontend/`, Next.js) and `api` (`backend/`,
   Chano), routing `/api/:path*` to `api` and everything else to `web`.
 - `pyproject.toml`, `uv.lock`, `.python-version` — uv workspace root pinned to
-  Python 3.12 (matching the `python3.12` Vercel function runtime; `uv run` in a
+  Python 3.13 (matching the `python3.13` Vercel function runtime; `uv run` in a
   workspace reads `.python-version` here).
 - `backend/` — Chano service with `base_path = "/api"`, `chano[dev]` in
   `[dependency-groups].dev` (so `chano dev` has `uvicorn` without vendoring
-  it into built functions), a backup `backend/.python-version` (`3.12`) for
+  it into built functions), a backup `backend/.python-version` (`3.13`) for
   standalone commands inside `backend/`, and routes under `app/` (`/api`,
   `/api/hello`, `/api/items/{item_id}`, `/api/docs`, `/api/openapi.json`,
   `/api/hello.txt`).

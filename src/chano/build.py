@@ -54,9 +54,7 @@ from chano.config import (
 from chano.openapi import swagger_html
 from chano.queues import LoadedQueue, load_all_queues
 from chano.routing import (
-    DEPENDENCIES_FILE,
-    ERROR_FILE,
-    MIDDLEWARE_FILE,
+    BOUNDARY_FILE,
     Route,
     create_app,
     discover_routes,
@@ -79,7 +77,7 @@ ENTRYPOINT = "index.py"
 
 # Vercel's Python functions run on Amazon Linux 2023 (glibc 2.34).
 DEFAULT_PLATFORM = "x86_64-manylinux_2_28"
-DEFAULT_PYTHON = "3.12"
+DEFAULT_PYTHON = "3.13"
 
 # Vercel's maximum uncompressed Python function size is 500 MB.
 SIZE_WARN_BYTES = 250 * 1024 * 1024
@@ -577,7 +575,7 @@ def _plan_function(route: Route, python: str, base_path: str) -> FunctionSpec:
         vc_config=config,
         trace_roots=(
             route.file,
-            *route.segment_files(MIDDLEWARE_FILE, ERROR_FILE, DEPENDENCIES_FILE),
+            *route.segment_files(BOUNDARY_FILE),
         ),
         include=_read_module_include(module, route.file),
         source_file=route.file,
@@ -595,10 +593,7 @@ def _plan_queue_function(loaded: LoadedQueue, python: str) -> FunctionSpec:
         route=None,
         entrypoint=QUEUE_ENTRYPOINT_SOURCE.format(function=loaded.spec.function),
         vc_config=config,
-        trace_roots=(
-            loaded.spec.file,
-            *loaded.spec.segment_files(ERROR_FILE, DEPENDENCIES_FILE),
-        ),
+        trace_roots=(loaded.spec.file,),
         include=include,
         required_distributions=(vercel_queue,),
         source_file=loaded.spec.file,
@@ -613,10 +608,7 @@ def _plan_schedule_function(loaded: LoadedSchedule, python: str) -> FunctionSpec
         route=None,
         entrypoint=SCHEDULE_ENTRYPOINT_SOURCE.format(function=loaded.spec.function),
         vc_config=config,
-        trace_roots=(
-            loaded.spec.file,
-            *loaded.spec.segment_files(ERROR_FILE, DEPENDENCIES_FILE),
-        ),
+        trace_roots=(loaded.spec.file,),
         include=_read_module_include(loaded.module, loaded.spec.file),
         source_file=loaded.spec.file,
     )

@@ -26,19 +26,12 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from chano.app import (
     AfterBackend,
     EndpointASGIApp,
-    ErrorHandler,
     _after_state,
     _AfterState,
 )
 from chano.params import Endpoint, is_generator_callable
 from chano.requests import Message, Request, Scope
-from chano.routing import (
-    DEPENDENCIES_FILE,
-    ERROR_FILE,
-    load_module,
-    load_segment_dependencies,
-    load_segment_error_handlers,
-)
+from chano.routing import load_module
 
 SCHEDULE_FILE = "schedule.py"
 SCHEDULE_FUNCTION_PREFIX = "_schedules"
@@ -69,22 +62,9 @@ class ScheduleJob:
     file: Path
     function: str
     """Function path in the build output, e.g. ``_schedules/cleanup``."""
-    segments: tuple[Path, ...]
-    """Directories from ``app/`` down to the schedule's own, root to leaf."""
 
     def load(self) -> ModuleType:
         return load_module(self.file)
-
-    def segment_files(self, *filenames: str) -> list[Path]:
-        return [
-            segment / filename
-            for segment in self.segments
-            for filename in filenames
-            if (segment / filename).is_file()
-        ]
-
-    def load_segments(self, filename: str) -> list[ModuleType]:
-        return [load_module(path) for path in self.segment_files(filename)]
 
 
 @dataclass(frozen=True)
@@ -108,7 +88,6 @@ class LoadedSchedule:
     """Stable Vercel schedule key in ``config.json["schedules"]``."""
     trigger: ScheduleTrigger
     endpoint: Endpoint
-    error_handlers: tuple[ErrorHandler, ...]
     module: ModuleType
 
     def to_config_schedule(self) -> dict[str, str]:
@@ -236,10 +215,8 @@ def validate_schedule_name(name: object, file: Path) -> str:
 
 def _schedule_job(app_dir: Path, schedule_file: Path) -> ScheduleJob:
     parts = schedule_file.parent.relative_to(app_dir).parts
-    segments = [app_dir]
     name_parts: list[str] = []
     for part in parts:
-        segments.append(segments[-1] / part)
         if part.startswith("(") and part.endswith(")"):
             continue
         if part.startswith("[") and part.endswith("]"):
@@ -253,7 +230,6 @@ def _schedule_job(app_dir: Path, schedule_file: Path) -> ScheduleJob:
         name=name,
         file=schedule_file,
         function=f"{SCHEDULE_FUNCTION_PREFIX}/{name}",
-        segments=tuple(segments),
     )
 
 
@@ -302,15 +278,12 @@ def load_schedule(job: ScheduleJob) -> LoadedSchedule:
         )
     trigger = read_schedule_trigger(module, job.file)
     schedule_name = _read_schedule_name(module, job)
-    dependencies = load_segment_dependencies(job.load_segments(DEPENDENCIES_FILE))
-    error_handlers = tuple(load_segment_error_handlers(job.load_segments(ERROR_FILE)))
-    endpoint = Endpoint(handler, set(), dependencies)
+    endpoint = Endpoint(handler, set())
     return LoadedSchedule(
         spec=job,
         schedule_name=schedule_name,
         trigger=trigger,
         endpoint=endpoint,
-        error_handlers=error_handlers,
         module=module,
     )
 
@@ -456,7 +429,6 @@ def create_schedule_app(
             return EndpointASGIApp(
                 loaded.endpoint,
                 methods=("POST", "GET"),
-                error_handlers=loaded.error_handlers,
                 after_backend=after_backend,
             )
     raise ScheduleNotFoundError(

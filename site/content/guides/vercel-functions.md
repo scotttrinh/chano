@@ -35,9 +35,9 @@ Chano keeps familiar typed handler signatures, `Depends()`, automatic request va
 | Route registration | Route decorators on app or router | `def GET(id: int):` in `app/items/[id]/route.py` |
 | Validation and JSON | Pydantic | `msgspec` (with optional `pydantic.BaseModel` support) |
 | Dependencies | `Depends(fn)` | `Depends(fn)` (per-request cached) + `lazy(factory)` |
-| Router-level checks | Router dependency lists | `dependencies.py` in any route folder |
-| Middleware | App-wide HTTP middleware | `middleware.py` in any route folder |
-| Error handlers | App-wide exception handlers | `error.py` in any route folder |
+| Router-level checks | Router dependency lists | `Boundary(guards=[...])` in `boundary.py` |
+| Middleware | App-wide HTTP middleware | `Boundary(wrap=[...])` in `boundary.py` |
+| Error handlers | App-wide exception handlers | `Boundary(recover=[...])` in `boundary.py` |
 | Startup and lifespan | Lifespan context manager | `lazy(factory)` (initializes on first use per warm instance) |
 | Background tasks | In-process background tasks | `after(fn, *args, **kwargs)` (`wait_until` in production) |
 | Queue workers | Separate worker service / broker | `app/**/queue.py` (`CONSUME`) compiled to private `_queues/` functions |

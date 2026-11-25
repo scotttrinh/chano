@@ -16,7 +16,7 @@ Verify `422` `RequestValidationError` responses and `loc` paths for invalid path
 
 ## Body and dependencies
 
-Verify JSON body decoding alongside `Depends` and `HTTPBearer` resolution, a missing credential's `401` with `WWW-Authenticate: Bearer`, and a wrong token's `HTTPException` `401`.
+Verify JSON body decoding alongside `Depends` and `HTTPBearer` resolution, a missing credential's `401` with `WWW-Authenticate: Bearer`, and a wrong token's `Unauthorized` `401`.
 
 ## Dev docs and static files
 
@@ -72,51 +72,75 @@ Verify [[src/chano/routing.py#Route#load_segments]] loads only the route's own a
 
 ## Middleware
 
-Exercise `middleware.py` chains ([[routing#Middleware]]); each request test runs against both [[src/chano/routing.py#create_app]] and [[src/chano/routing.py#create_route_app]] to prove parity.
+Exercise `boundary.py` `wrap` chains ([[routing#Boundary]]); each request test runs against both [[src/chano/routing.py#create_app]] and [[src/chano/routing.py#create_route_app]] to prove parity.
 
 ### Runs outer to inner
 
-Root, `(group)` and leaf middleware enter outermost first, the handler runs, and they exit in reverse; a sibling outside the group runs only the root's middleware.
+Root, `(group)` and leaf wrappers enter outermost first, the handler runs, and they exit in reverse; a sibling outside the group runs only the root's wrapper.
 
 ### Short-circuits
 
-A middleware that returns a response without calling `call_next` skips inner middleware and the handler; outer middleware still sees its response.
+A wrapper that returns a response without calling `call_next` skips inner wrappers and the handler; outer wrappers still see its response.
 
 ### Sees the error response
 
-A handler's `HTTPException` 401 (with headers), a query `RequestValidationError` 422, and an unhandled 500 reach every middleware as a `Response` from `call_next`, which can still edit it.
+A handler's `Unauthorized` 401 (with headers), a query `RequestValidationError` 422, and an unhandled 500 reach every wrapper as a `Response` from `call_next`, which can still edit it.
 
 ### Middleware errors get the default mapping
 
-`HTTPException`, `RequestValidationError` and other exceptions raised by middleware propagate past the outer middleware and become JSON 403 with headers, JSON 422, and plain-text 500.
+`Failure`, `RequestValidationError` and other exceptions raised by a wrapper propagate past outer wrappers and become JSON 403 with headers, JSON 422, and plain-text 500.
 
 ### Skips unmatched paths but runs on 405
 
-A 404 runs no middleware. A literal route's 405 runs its chain; a path matching two dynamic routes is the first one's 405 through its chain, as the platform's first rewrite would send it, not the later catch-all.
+A 404 runs no wrapper. A literal route's 405 runs its chain; a path matching two dynamic routes is the first one's 405 through its chain, as the platform's first rewrite would send it, not the later catch-all.
 
 ### Skips dev files
 
-In `create_app`, `public_dir` files, `openapi.json`, and a docs 405 are served without running any middleware.
+In `create_app`, `public_dir` files, `openapi.json`, and a docs 405 are served without running any wrapper.
 
-### Invalid middleware
+## Boundary
 
-A `middleware.py` with no `middleware`, a non-callable one, or a sync function makes both factories raise `TypeError` naming the file.
+Exercise `boundary.py` loading, recover matching, conflict checks, and OpenAPI replacement ([[routing#Boundary]]).
 
-### Non-response result
+### Invalid boundary.py
 
-A middleware that returns something other than a `Response` becomes a plain-text 500 under both factories.
+A `boundary.py` with no `boundary` or a non-`Boundary` value makes both factories raise `TypeError` naming the file.
 
-### Conflicting chains for one path
+### Non-response wrap result
 
-Two route files with the same URL path but different ancestor middleware make `create_app` raise `ValueError` instead of picking one chain.
+A `wrap` function that returns something other than a `Response` becomes a plain-text 500 under both factories.
+
+### Conflicting boundaries for one path
+
+Two route files with the same URL path but different ancestor `boundary.py` chains make `create_app` raise `ValueError` instead of picking one chain.
+
+### Awaitable recover handlers
+
+A recover callable instance with `async def __call__` and a sync wrapper returning a coroutine both handle the error at the nearest boundary without unawaited-coroutine warnings, and a bare `raise` in the awaited body reaches the ancestor.
+
+### Recover matching and order
+
+Verify recover matches by exception class and `Failure[ContentType]`, runs nearest folder first then list order, passes raised exceptions outward, handles returned failures, and skips wrapper errors.
+
+### OpenAPI recover replacement
+
+Verify fixed-status `Outcome` recover functions replace matching documented `Failure` responses (such as `RequestValidationError` -> `ApiUnprocessable`), respect earlier catch-all precedence, and never rewrite non-`Failure` outcomes.
+
+### Local schedule runner ignores boundary
+
+Verify local schedule execution (`run_schedule`) ignores ancestor `boundary.py` (`guards`, `recover`, and `wrap`), returning a returned `Failure` directly and letting raised exceptions propagate.
+
+### HTTP-only boundary scoping for queues and schedules
+
+Verify an ancestor `boundary.py` applies `guards`, `recover`, and `wrap` to `route.py` while `queue.py` and `schedule.py` ignore it at runtime and exclude it from build `trace_roots` and vendored packages.
 
 ## Error boundaries
 
-Exercise `error.py` chains ([[routing#Error Boundaries]]) with sync root and leaf handlers and an async `(group)` handler; request tests run against both factories to prove parity.
+Exercise `boundary.py` `recover` chains ([[routing#Boundary]]) with sync root and leaf handlers and an async `(group)` handler; request tests run against both factories to prove parity.
 
-### Nearest error.py wins
+### Nearest recover wins
 
-The leaf-most `handle_error` (sync for `/admin`, async for `/other`, root for `/plain`) handles a handler error, a 422 and a 405; middleware sees its response, and successful requests skip it.
+The leaf-most recover function (sync for `/admin`, async for `/other`, root for `/plain`) handles a handler error, a 422 and a 405; wrappers see its response, and successful requests skip it.
 
 ### Re-raising passes to the next ancestor
 
@@ -124,27 +148,15 @@ A bare `raise` passes the same exception to the next ancestor, a new exception r
 
 ### Unhandled errors get the default mapping
 
-When every `error.py` re-raises the result is a plain-text 500 seen by middleware; a project without `error.py` keeps the JSON 401 with headers, 422, and plain-text 500.
+When every recover function re-raises the result is a plain-text 500 seen by wrappers; a project without `boundary.py` keeps the JSON 401 with headers, 422, and plain-text 500.
 
-### Middleware errors skip error.py
+### Wrapper errors skip recover
 
-Exceptions raised by middleware get the default 500, 403 and 422 without running any `handle_error`, and a 404 runs no segment file.
+Exceptions raised by wrappers get the default 500, 403 and 422 without running any recover function, and a 404 runs no segment file.
 
 ### Non-response result
 
-A `handle_error` returning `None` passes a `TypeError` to the next ancestor; if every handler does, the result is a plain-text 500.
-
-### Awaitable handlers
-
-A `handle_error` instance with `async def __call__` and a sync wrapper returning a coroutine both handle the error at the nearest boundary without unawaited-coroutine warnings, and a bare `raise` in the awaited body reaches the ancestor.
-
-### Invalid error.py
-
-An `error.py` with no `handle_error` or a non-callable one makes both factories raise `TypeError` naming the file.
-
-### Conflicting error.py for one path
-
-Two route files with the same URL path but different ancestor `error.py` chains make `create_app` raise `ValueError`.
+A recover function returning `None` passes a `TypeError` to the next ancestor; if every handler does, the result is a plain-text 500.
 
 ## Route module isolation
 
@@ -210,7 +222,7 @@ Verify [[src/chano/build.py#build]] on a uv workspace with `apps/api`, `packages
 
 ## Full-stack example build
 
-Verify [[examples/fullstack]] declares the Vercel Services config and Python 3.12 pin, builds [[examples/fullstack/backend]] as a uv workspace member under `/api`, emits prefixed docs/static/functions without `uvicorn` in `_vendor/`, and invokes each built function standalone.
+Verify [[examples/fullstack]] declares the Vercel Services config and Python 3.13 pin, builds [[examples/fullstack/backend]] as a uv workspace member under `/api`, emits prefixed docs/static/functions without `uvicorn` in `_vendor/`, and invokes each built function standalone.
 
 ## Dev requires uvicorn
 
@@ -242,9 +254,9 @@ Covers `vercel` inclusion with its closure, cyclic `Requires-Dist`, namespace pa
 
 ## Segment files as trace roots
 
-Verify [[src/chano/build.py#plan_build]] adds each route's ancestor `middleware.py` and `error.py` to its `trace_roots`, so their dependencies are bundled only under that subtree.
+Verify [[src/chano/build.py#plan_build]] adds each route's ancestor `boundary.py` files to its `trace_roots`, so their dependencies are bundled only under that subtree.
 
-A dependency imported only by `app/admin/middleware.py` or `app/admin/error.py` (directly or through a project helper) lands in every function under `app/admin/`, including route-group and dynamic descendants, but not in sibling functions; a sibling's own `middleware.py` never enters an admin function's roots. `--explain` names the segment file at the head of each reason chain.
+A dependency imported only by `app/admin/boundary.py` (directly or through a project helper) lands in every HTTP route function (`route.py`) under `app/admin/`, including route-group and dynamic descendants, but not in sibling routes, `queue.py`, or `schedule.py`; a sibling's own `boundary.py` never enters an admin function's roots. `--explain` names the segment file at the head of each reason chain.
 
 ## Build-time import check
 
@@ -366,9 +378,9 @@ Verify [[src/chano/openapi.py#openapi]] sets `summary`, `description`, `operatio
 
 ## Explicit security and responses
 
-Verify a protected operation references one `HTTPBearer` scheme in `security` with no credential header parameter, a public sibling has no `security`, and only `raises`-declared `401`/`403` join `200`/`422`.
+Verify a protected operation references one `HTTPBearer` scheme in `security` with no credential header parameter, a public sibling has no `security`, and `Outcome` return annotations document `401`/`403` alongside `200`/`422`.
 
-The same project checks that a dependency raising if called still documents its scheme, that a hidden protected route leaks no scheme into `components.securitySchemes`, that the build's static `openapi.json` matches dev, and that the protected route enforces its token.
+The same project checks that a dependency raising if called still documents its scheme and `HTTPBearer`'s `401`, that a hidden protected route leaks no scheme into `components.securitySchemes`, that the build's static `openapi.json` matches dev, and that the protected route enforces its token.
 
 ## HTTP bearer credentials
 
@@ -380,19 +392,11 @@ Verify `HTTPBearer` names outside the OpenAPI component-name pattern (empty, spa
 
 ## Declared response precedence
 
-Verify through the generated schema that the outermost stacked `raises` wins, a handler beats its dependencies, and a direct dependency beats a nested one in an earlier parameter.
-
-## Declared responses must be errors
-
-Verify `raises` rejects success, redirect-boundary and out-of-range statuses with `ValueError`, so only error responses can be declared.
-
-## Declared response statuses must be integers
-
-Verify `raises` rejects non-`int` statuses (`401.5`, `"401"`, `True`, `None`) with `TypeError`, so a response key such as `"401.5"` never reaches the schema.
+Verify through the generated schema that a handler's outcome docstring beats its dependencies, and a direct dependency beats a nested one in an earlier parameter.
 
 ## Inherited typed dependencies
 
-Verify `dependencies.py` checks on a project with a protected `(group)`, a nested `admin` check, a handler requesting the inherited callable, a newly added route and a public sibling.
+Verify `boundary.py` guards on a project with a protected `(group)`, a nested `admin` guard, a handler requesting the inherited callable, a newly added route and a public sibling.
 
 ### Run root to leaf before the handler
 
@@ -400,7 +404,7 @@ Under both factories, independent checks prove the group's run before the admin 
 
 ### Rejection stops the handler
 
-Under both factories, a missing bearer token (`401`) or a non-admin (`403`) answers through the group's `error.py` before the handler runs, keeping `WWW-Authenticate`.
+Under both factories, a missing bearer token (`401`) or a non-admin (`403`) answers through the group's `boundary.py` recover function before the handler runs, keeping `WWW-Authenticate`.
 
 ### Check validation stops the handler
 
@@ -418,7 +422,7 @@ The build's `openapi.json` matches dev, and the public sibling documents no secu
 
 ### Declared response precedence
 
-Verify a repeated `raises` status prefers the handler, then its direct dependency, then inherited checks nearest segment first and, within a segment, the first declared.
+Verify a repeated outcome status prefers the handler, then its direct dependency, then inherited checks nearest segment first and, within a segment, the first declared.
 
 ### Async callable checks
 
@@ -474,13 +478,9 @@ Verify whole-body consumers and a multi-field check document the request body as
 
 Verify an input reached through several dependencies and an inherited check, or a dependency used twice, is documented as one parameter while requests still resolve it.
 
-### Invalid dependencies.py
-
-Verify a missing `dependencies`, a string, a set, a non-callable item or a `Depends(...)` marker fails both factories with a `TypeError` naming `dependencies.py`.
-
 ### Trace roots and bundling
 
-Verify a group's `dependencies.py` is a trace root of the functions beneath it, its package is bundled only there and not into the sibling, and the built schema documents the check's header and `403`.
+Verify a group's `boundary.py` is a trace root of the functions beneath it, its package is bundled only there and not into the sibling, and the built schema documents the guard's header and `403`.
 
 ## Lazy values
 
@@ -626,7 +626,7 @@ Verify [[src/chano/queues.py#discover_queues]] strips `(group)` segments, maps t
 
 ### Sync, async, validation, and Depends
 
-Verify `CONSUME` supports sync/async handlers, `msgspec.Struct` body binding, `Depends()`, inherited `dependencies.py`, `after()`, and `RequestValidationError` `loc` reporting.
+Verify `CONSUME` supports sync/async handlers, `msgspec.Struct` body binding, `Depends()`, `after()`, and `RequestValidationError` `loc` reporting.
 
 ### Multi-consumer dev trigger and ASGI fallback
 
@@ -634,7 +634,7 @@ Verify multiple consumer groups on one topic dispatch via [[src/chano/app.py#Cha
 
 ### Delivery lifecycle, ack, and retry
 
-Verify [[src/chano/queues.py#create_queue_app]] registers with `vercel.queue`, acknowledges successful runs, retries on exceptions or `>= 400` responses, respects `error.py`, and supports both `create_queue_service_app()` and `accept_and_handle`.
+Verify [[src/chano/queues.py#create_queue_app]] registers with `vercel.queue`, acknowledges successful runs, retries on exceptions or `>= 400` responses, and supports both `create_queue_service_app()` and `accept_and_handle`.
 
 ### Real vercel-queue SDK registration and delivery
 
@@ -678,7 +678,7 @@ Verify [[src/chano/schedules.py#discover_schedules]] strips `(group)` segments, 
 
 ### Sync, async, Depends, and ASGI app
 
-Verify `RUN` supports sync/async handlers, `Depends()`, inherited `dependencies.py`, `after()`, and [[src/chano/schedules.py#create_schedule_app]] accepts `POST`/`GET` and returns `405` on other methods.
+Verify `RUN` supports sync/async handlers, `Depends()`, `after()`, and [[src/chano/schedules.py#create_schedule_app]] accepts `POST`/`GET` and returns `405` on other methods.
 
 ### Schedule build output and tree-shaking
 
@@ -739,3 +739,35 @@ Verify multi-namespace `Workflows` registries mount `/.well-known/workflow/v1/fl
 ## Combined Vercel primitives
 
 Verify a single project combining HTTP `route.py`, `queue.py`, `schedule.py`, and `[[tool.vercel.workflows]]` builds cleanly with all functions, `config.json` sections, and isolated OpenAPI output.
+
+## Outcomes
+
+Tests for [[src/chano/responses.py#Outcome]], [[src/chano/responses.py#Failure]], [[src/chano/status.py]], OpenAPI return-annotation schemas, queue retries, and static typing fixtures.
+
+### Returned and raised outcomes
+
+Verify status, body, headers, cookies, and bodyless framing (`1xx`, `204`, `304`, `None`) for returned and raised outcomes, `TypeError` on abstract `Outcome`/`Failure`, and `RequestValidationError` as a `Failure`.
+
+### Returned failures reach error boundaries
+
+Verify a returned `Failure` passes through `boundary.py` `recover` identically to a raised `Failure`.
+
+### OpenAPI from return annotations
+
+Verify union branches, PEP 695 aliases, generic envelope subclasses, custom media types, dependency and guard outcomes, same-status `anyOf`, docstring vs HTTP reason descriptions, `HTTPBearer`'s automatic `401`, and `422` on request inputs.
+
+### Queue retry on returned and raised Failure
+
+Verify a queue consumer returning or raising a `Failure` triggers a retry even when an ancestor `boundary.py` defines `guards`, `recover`, and `wrap`.
+
+### Static typing fixtures
+
+Verify `ty check` passes on [[tests/typing/ok.py]] and reports errors on the exact marked lines of [[tests/typing/bad.py]].
+
+## Checked Depends
+
+Tests for default-value [[src/chano/params.py#Depends]] short-circuiting and caching.
+
+### Short-circuiting and caching
+
+Verify a dependency or inherited check returning a `Failure` or `SeeOther` short-circuits later dependencies and the handler, while a shared dependency returning a value is cached once per request.

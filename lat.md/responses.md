@@ -4,6 +4,14 @@ Response classes are ASGI callables that [[src/chano/app.py#Chano#__call__]] inv
 
 [[src/chano/responses.py#Response#__call__]] takes `receive` as well as `send`, so streaming responses can watch for a client disconnect. Buffered responses ([[src/chano/responses.py#Response]], [[src/chano/responses.py#JSONResponse]], [[src/chano/responses.py#HTMLResponse]], [[src/chano/responses.py#PlainTextResponse]], [[src/chano/responses.py#RedirectResponse]]) render their body up front and send a `content-length`. [[src/chano/responses.py#JSONResponse#render]] passes [[src/chano/_pydantic.py#enc_hook]] to `msgspec.json.encode` so `pydantic.BaseModel` instances (directly or inside containers and `msgspec.Struct`s) serialize via `model_dump(mode="json")` without importing `pydantic` when unused.
 
+## Outcomes and Failures
+
+[[src/chano/responses.py#Outcome]] is a typed [[src/chano/responses.py#Response]] whose HTTP status is fixed by its class, and [[src/chano/responses.py#Failure]] is an `Outcome` that is also an `Exception`.
+
+- **Rendering**: [[src/chano/responses.py#Outcome]] JSON-encodes `content` with `msgspec` and [[src/chano/_pydantic.py#enc_hook]], keeping `Response.body`, `headers`, `set_cookie`, and `delete_cookie`. Bodyless statuses (`1xx`, `204`, `304`) and `None` content send no body and no default `content-type`; `1xx`, `204`, and `304` also omit `content-length`. Instantiating a class without a `status` (`Outcome`, `Failure`) raises `TypeError`.
+- **Failures and `ErrorDetail`**: [[src/chano/responses.py#Failure]] defaults its type parameter to [[src/chano/responses.py#ErrorDetail]] (`detail: str`), so `NotFound("gone")` renders `{"detail": "gone"}`. A failure may be returned (checked against the return union) or raised (from deep code); both flow identically through error boundaries and queue retries. [[src/chano/exceptions.py#RequestValidationError]] subclasses [[src/chano/status.py#UnprocessableContent]] with [[src/chano/exceptions.py#ValidationErrorDetail]] while keeping `.errors`.
+- **Named statuses**: [[src/chano/status.py]] provides `OK`, `Created`, `Accepted`, `NoContent`, `SeeOther`, `NotModified`, and the failures `BadRequest`, `Unauthorized`, `Forbidden`, `NotFound`, `MethodNotAllowed`, `Conflict`, `Gone`, `UnprocessableContent`, `TooManyRequests`, `InternalServerError`, and `ServiceUnavailable`. Envelopes and custom error formats are ordinary subclasses whose constructors build the wire payload.
+
 ## Headers and Cookies
 
 `Response.headers` stays a single-valued, lower-cased dict; `set-cookie` headers are kept apart by the private [[src/chano/responses.py#Response#_append_header]] and sent after it.

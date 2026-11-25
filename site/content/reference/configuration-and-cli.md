@@ -71,12 +71,12 @@ Requires `uvicorn`, installed via the `chano[dev]` extra. When `watchfiles` is i
 Compiles the project into a deterministic Vercel Build Output API v3 directory:
 
 ```sh
-uv run chano build [--python 3.12] [--platform x86_64-manylinux_2_28] [--output .vercel/output] [--explain FUNCTION]
+uv run chano build [--python 3.13] [--platform x86_64-manylinux_2_28] [--output .vercel/output] [--explain FUNCTION]
 ```
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--python` | `3.12` | Target Python version for vendored wheels and `.vc-config.json` |
+| `--python` | `3.13` | Target Python version for vendored wheels and `.vc-config.json` |
 | `--platform` | `x86_64-manylinux_2_28` | Target platform for `uv pip install`; pass `native` for the local host |
 | `--output` | `.vercel/output` | Destination Build Output directory |
 | `--explain` | `None` | Print why each distribution was included or excluded for one function |

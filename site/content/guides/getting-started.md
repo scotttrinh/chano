@@ -1,7 +1,7 @@
 ---
 title: Getting started
 description: Create a Chano project with uv, define your first route, and run the local development server.
-lede: Set up a Python 3.12+ Chano project with uv, write typed HTTP handlers, and explore the generated Swagger UI locally.
+lede: Set up a Python 3.13+ Chano project with uv, write typed HTTP handlers, and explore the generated Swagger UI locally.
 section: guides
 order: 1
 nav_title: Getting started
@@ -9,7 +9,7 @@ nav_title: Getting started
 
 ## Prerequisites
 
-Chano targets **Python 3.12+** and uses [`uv`](https://docs.astral.sh/uv/) for dependency resolution and vendoring during production builds.
+Chano targets **Python 3.13+** and uses [`uv`](https://docs.astral.sh/uv/) for dependency resolution and vendoring during production builds.
 
 ## Project layout
 
@@ -36,7 +36,7 @@ Declare `chano` as a runtime dependency and `chano[dev]` in `[dependency-groups]
 [project]
 name = "my-app"
 version = "0.1.0"
-requires-python = ">=3.12"
+requires-python = ">=3.13"
 dependencies = ["chano"]
 
 [dependency-groups]

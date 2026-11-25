@@ -84,41 +84,35 @@ def DELETE() -> dict[str, bool]:
 
 Stacking `@openapi(...)` decorators lets the outermost decorator override each specified field and deep-merge `openapi_extra` with outer keys winning.
 
-## Folder-scoped special files
+## Folder-scoped `boundary.py`
 
-Special files placed in any folder under `app/` apply to every `route.py` in that folder and all nested subfolders, including inside route groups `(group)` and dynamic segments `[param]`. Sibling folders are never affected.
+A `boundary.py` placed in any folder under `app/` exports `boundary = Boundary(guards=..., recover=..., wrap=...)` and applies to every HTTP route (`route.py`) in that folder and all nested subfolders, including inside route groups `(group)` and dynamic segments `[param]`. Private `queue.py` and `schedule.py` functions do not inherit `boundary.py`, and sibling folders are never affected. Missing or non-`Boundary` exports raise `TypeError` naming the file.
 
-### `middleware.py`
+### `guards`
 
-Exports `async def middleware(request: Request, call_next) -> Response`:
-
-- Executes **root-to-leaf** (outermost directory first).
-- Only runs after a route matches (including `405` responses). Does not run for `404` responses, `/docs`, or `public/` files.
-- `call_next(request)` always returns a `Response`, because endpoint errors pass through `error.py` before returning to middleware.
-- Returning without calling `call_next` short-circuits inner middleware and the handler.
-- Non-async or missing `middleware` raises `TypeError` at load time.
-
-### `error.py`
-
-Exports `def handle_error(request: Request, exc: Exception) -> Response` or `async def handle_error(...)`:
-
-- Executes **leaf-to-root** (nearest directory first) inside the innermost middleware.
-- Handles `HTTPException`, `RequestValidationError`, `405` method mismatches, and unhandled endpoint exceptions.
-- Re-raising (a bare `raise` or a new exception) passes the exception to the next ancestor `error.py`, then to Chano's default error mapping (`422` for validation, `HTTPException` JSON, or `500` plain text).
-- Exceptions raised by middleware bypass `error.py` and use Chano's default error mapping.
-
-### `dependencies.py`
-
-Exports `dependencies: list[Callable] | tuple[Callable, ...]`:
-
+- Sequence of dependency callables (`Callable[..., object]`); generator callables are rejected with `TypeError`.
 - Executes **root-to-leaf** in declared order before any handler argument is resolved.
-- Each item is a bare callable (not wrapped in `Depends(...)`) and must not be a generator or async generator.
-- Shares the per-request dependency cache with handler `Depends(...)`, so a callable listed in `dependencies.py` and requested via `Depends()` runs once per request.
-- Any `HTTPBearer` or `@raises` declarations on inherited checks are included in generated OpenAPI schemas.
+- Shares the per-request dependency cache with handler `Depends(...)`, and short-circuits if any guard returns a `Response`.
+- Any `HTTPBearer` or `Outcome` return annotations on guards are included in generated OpenAPI schemas.
+
+### `recover`
+
+- Sequence of sync or async callables `(request: Request, error: ...) -> Response`.
+- Selected by parameter 2's annotation: `C` matches `isinstance(error, C)`; `C[B]` where `C` is an `Outcome` and `B` is a class also requires `isinstance(error.content, B)`.
+- Executes **leaf-to-root** (nearest folder first), then list order. Handles returned and raised `Failure` outcomes, `RequestValidationError`, `405` method mismatches, and unhandled endpoint exceptions.
+- A returned `Response` is final; raising passes the exception outward to remaining candidates, then to Chano's default error mapping (`Failure` sent as-is, or `500` plain text).
+- When both parameter 2 and return annotations are fixed-status `Outcome` classes, OpenAPI replaces matching documented responses with the return type (for example `RequestValidationError -> ApiUnprocessable`).
+
+### `wrap`
+
+- Sequence of async callables `async def wrap(request: Request, call_next: CallNext) -> Response`.
+- Executes **root-to-leaf** (outermost first) for HTTP routes only, after a route matches (including `405` responses; never for `404`, `/docs`, `public/` files, queues, or schedules).
+- `call_next(request)` always returns a `Response`, because endpoint errors pass through `recover` before returning to wrappers.
+- Returning without calling `call_next` short-circuits inner wrappers and the handler. Exceptions raised by a wrapper skip `recover` and use Chano's default error mapping.
 
 ## Private Vercel primitive files
 
-Queue consumers (`queue.py`) and private schedules (`schedule.py`) live under `app/` alongside routes, inherit ancestor `dependencies.py` and `error.py` (never `middleware.py`), support `max_duration`, `memory`, `regions`, and `include`, and are excluded from public HTTP routes and OpenAPI. Route groups `(group)` are stripped from function names; dynamic `[param]` segments are rejected.
+Queue consumers (`queue.py`) and private schedules (`schedule.py`) live under `app/` alongside routes, do not inherit ancestor `boundary.py` files (which apply to HTTP routes only), support `max_duration`, `memory`, `regions`, and `include`, and are excluded from public HTTP routes and OpenAPI. Route groups `(group)` are stripped from function names; dynamic `[param]` segments are rejected.
 
 ### `queue.py` (Vercel Queues)
 
