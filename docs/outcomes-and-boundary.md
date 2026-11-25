@@ -237,9 +237,9 @@ def Depends[T](fn: Callable[..., T | Response]) -> T: ...
 
 ### 3.1 The file
 
-A `boundary.py` in any folder under `app/` exports `boundary`, applying to every function at or
-below that folder. Route groups count, so `app/(admin)/boundary.py` covers the group without
-changing URLs.
+A `boundary.py` in any folder under `app/` exports `boundary`, applying to every HTTP route
+(`route.py`) at or below that folder. Route groups count, so `app/(admin)/boundary.py` covers the
+group without changing URLs.
 
 ```python
 # app/api/boundary.py
@@ -262,7 +262,7 @@ type Wrap = Callable[[Request, CallNext], Awaitable[Response]]
   runtime check: `boundary` must be a `Boundary`, else `TypeError` naming the file.
 - **Hard break.** `middleware.py`, `error.py` and `dependencies.py` stop being special files.
   Nothing looks for them or warns about them.
-- Build trace roots use `boundary.py` in place of the three old names.
+- Build trace roots for HTTP routes use `boundary.py` in place of the three old names.
 
 ### 3.2 Guards
 
@@ -315,10 +315,10 @@ error raised by a wrapper skips recover and gets the default mapping, as today.
 
 ### 3.6 Queues and schedules
 
-`queue.py` and `schedule.py` inherit `guards` and `recover` from ancestor boundaries and never
-`wrap`, matching what they inherit today. Queue acknowledgement is unchanged in meaning: a
-returned or raised `Failure`, or any exception, triggers a retry unless a recover function
-returns a response below `400`.
+`queue.py` and `schedule.py` do not inherit `boundary.py` (`guards`, `recover`, and `wrap` apply to
+HTTP routes only) and do not trace ancestor `boundary.py` files at build time. Queue
+acknowledgement stays simple: returning normally acknowledges the message; raising an exception or
+returning a `Failure` or `>= 400` `Response` triggers a retry.
 
 ---
 
@@ -391,15 +391,15 @@ documentation; neither leaves docs describing removed API.
 
 - **Code.**
   - Add `Boundary` and its loader; compose guards, recover and wrap per §3.5.
-  - Replace the three loaders in `routing.py`, their use in `queues.py` and `schedules.py`, and
-    the trace roots in `build.py`.
+  - Replace the three loaders in `routing.py`, remove segment boundary inheritance from `queues.py`
+    and `schedules.py`, and update HTTP route trace roots in `build.py`.
   - Implement recover matching and its OpenAPI replacement.
 - **Tests.**
   - Port the middleware, error-boundary and inherited-check tests to `boundary.py`.
   - Recover: match by class, match by content type, nearest first, list order, raise to pass
     outward, sync and async, returned failures reach it, wrapper errors skip it.
   - OpenAPI: a recover function replaces the 422 schema.
-  - Queue and schedule inheritance without `wrap`.
+  - HTTP-only scoping: queues and schedules ignore ancestor `boundary.py` at runtime and build time.
   - Extend the typing fixtures with `Boundary(...)` shapes.
 - **Docs.**
   - `lat.md/routing.md` (Middleware, Error Boundaries, Inherited Dependencies become one

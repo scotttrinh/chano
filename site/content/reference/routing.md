@@ -86,7 +86,7 @@ Stacking `@openapi(...)` decorators lets the outermost decorator override each s
 
 ## Folder-scoped `boundary.py`
 
-A `boundary.py` placed in any folder under `app/` exports `boundary = Boundary(guards=..., recover=..., wrap=...)` and applies to every function in that folder and all nested subfolders, including inside route groups `(group)` and dynamic segments `[param]`. Sibling folders are never affected. Missing or non-`Boundary` exports raise `TypeError` naming the file.
+A `boundary.py` placed in any folder under `app/` exports `boundary = Boundary(guards=..., recover=..., wrap=...)` and applies to every HTTP route (`route.py`) in that folder and all nested subfolders, including inside route groups `(group)` and dynamic segments `[param]`. Private `queue.py` and `schedule.py` functions do not inherit `boundary.py`, and sibling folders are never affected. Missing or non-`Boundary` exports raise `TypeError` naming the file.
 
 ### `guards`
 
@@ -112,7 +112,7 @@ A `boundary.py` placed in any folder under `app/` exports `boundary = Boundary(g
 
 ## Private Vercel primitive files
 
-Queue consumers (`queue.py`) and private schedules (`schedule.py`) live under `app/` alongside routes, inherit `guards` and `recover` from ancestor `boundary.py` files (never `wrap`), support `max_duration`, `memory`, `regions`, and `include`, and are excluded from public HTTP routes and OpenAPI. Route groups `(group)` are stripped from function names; dynamic `[param]` segments are rejected.
+Queue consumers (`queue.py`) and private schedules (`schedule.py`) live under `app/` alongside routes, do not inherit ancestor `boundary.py` files (which apply to HTTP routes only), support `max_duration`, `memory`, `regions`, and `include`, and are excluded from public HTTP routes and OpenAPI. Route groups `(group)` are stripped from function names; dynamic `[param]` segments are rejected.
 
 ### `queue.py` (Vercel Queues)
 

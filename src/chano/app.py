@@ -541,8 +541,9 @@ class EndpointASGIApp:
     """Single-endpoint ASGI app for private Vercel functions (queues, schedules).
 
     Accepts any path on ``methods``, runs the ``Endpoint`` with Chano's
-    ``after()`` context and error boundaries, and serializes non-``Response``
-    return values as JSON (or empty 200 for ``None``).
+    ``after()`` context, maps raised exceptions with ``error_response()``, and
+    serializes non-``Response`` return values as JSON (or empty 200 for
+    ``None``).
     """
 
     def __init__(
@@ -550,7 +551,6 @@ class EndpointASGIApp:
         endpoint: Endpoint,
         *,
         methods: Sequence[str] = ("POST",),
-        boundaries: Sequence[Boundary] = (),
         after_backend: AfterBackend = "local",
     ) -> None:
         if after_backend not in _AFTER_BACKENDS:
@@ -560,7 +560,6 @@ class EndpointASGIApp:
             )
         self.endpoint = endpoint
         self.methods = tuple(dict.fromkeys(m.upper() for m in methods))
-        self.boundaries = tuple(boundaries)
         self.after_backend: AfterBackend = after_backend
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -592,9 +591,7 @@ class EndpointASGIApp:
                 else:
                     response = JSONResponse(result)
             except Exception as exc:
-                response = await _run_recover(
-                    _recover_candidates(self.boundaries), request, exc
-                )
+                response = error_response(exc)
             await response(receive, send, include_body=request.method != "HEAD")
         except asyncio.CancelledError:
             cancelled = True

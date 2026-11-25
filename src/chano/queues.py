@@ -40,17 +40,14 @@ from chano._pydantic import enc_hook as _pydantic_enc_hook
 from chano.app import (
     AfterBackend,
     ASGIApp,
-    Boundary,
     EndpointASGIApp,
     _after_state,
     _AfterState,
-    _recover_candidates,
-    _run_recover,
 )
 from chano.params import Endpoint, is_generator_callable
 from chano.requests import Message, Receive, Request, Scope, Send
 from chano.responses import Failure, PlainTextResponse, Response
-from chano.routing import BOUNDARY_FILE, load_module, load_segment_boundaries
+from chano.routing import load_module
 
 QUEUE_FILE = "queue.py"
 QUEUE_FUNCTION_PREFIX = "_queues"
@@ -73,22 +70,9 @@ class QueueConsumer:
     file: Path
     function: str
     """Function path in the build output, e.g. ``_queues/orders``."""
-    segments: tuple[Path, ...]
-    """Directories from ``app/`` down to the queue's own, root to leaf."""
 
     def load(self) -> ModuleType:
         return load_module(self.file)
-
-    def segment_files(self, *filenames: str) -> list[Path]:
-        return [
-            segment / filename
-            for segment in self.segments
-            for filename in filenames
-            if (segment / filename).is_file()
-        ]
-
-    def load_segments(self, filename: str) -> list[ModuleType]:
-        return [load_module(path) for path in self.segment_files(filename)]
 
 
 @dataclass(frozen=True)
@@ -123,16 +107,13 @@ class LoadedQueue:
     spec: QueueConsumer
     trigger: QueueTrigger
     endpoint: Endpoint
-    boundaries: tuple[Boundary, ...]
     module: ModuleType
 
 
 def _queue_consumer(app_dir: Path, queue_file: Path) -> QueueConsumer:
     parts = queue_file.parent.relative_to(app_dir).parts
-    segments = [app_dir]
     function_parts: list[str] = []
     for part in parts:
-        segments.append(segments[-1] / part)
         if part.startswith("(") and part.endswith(")"):
             continue
         if part.startswith("[") and part.endswith("]"):
@@ -145,7 +126,6 @@ def _queue_consumer(app_dir: Path, queue_file: Path) -> QueueConsumer:
     return QueueConsumer(
         file=queue_file,
         function=f"{QUEUE_FUNCTION_PREFIX}/{suffix}",
-        segments=tuple(segments),
     )
 
 
@@ -271,15 +251,11 @@ def load_queue(queue: QueueConsumer) -> LoadedQueue:
             "supported as queue consumers"
         )
     trigger = read_queue_trigger(module, queue.file)
-    boundaries = load_segment_boundaries(queue.load_segments(BOUNDARY_FILE))
-    endpoint = Endpoint(
-        handler, set(), [b.guards for b in boundaries], default_source="body"
-    )
+    endpoint = Endpoint(handler, set(), default_source="body")
     return LoadedQueue(
         spec=queue,
         trigger=trigger,
         endpoint=endpoint,
-        boundaries=boundaries,
         module=module,
     )
 
@@ -539,16 +515,9 @@ def _make_queue_subscriber(
         token = _after_state.set(after_state)
         cancelled = False
         try:
-            try:
-                result = await loaded.endpoint.call(request)
-                if isinstance(result, Failure):
-                    raise result
-            except Exception as exc:
-                if candidates := _recover_candidates(loaded.boundaries):
-                    response = await _run_recover(candidates, request, exc)
-                    if response.status_code < 400:
-                        return
-                raise
+            result = await loaded.endpoint.call(request)
+            if isinstance(result, Failure):
+                raise result
             if isinstance(result, Response) and result.status_code >= 400:
                 raise RuntimeError(
                     f"queue consumer {loaded.spec.function!r} returned error "
@@ -799,7 +768,6 @@ def create_queue_app(
                 EndpointASGIApp(
                     loaded.endpoint,
                     methods=("POST",),
-                    boundaries=loaded.boundaries,
                     after_backend=after_backend,
                 )
             )

@@ -697,21 +697,27 @@ def test_queue_retry_on_returned_and_raised_failure(tmp_path):
         with pytest.raises(ServiceUnavailable):
             asyncio.run(deliver(subscriber, {"mode": mode}))
 
-    # A boundary.py recover function returning < 400 acknowledges both returned
-    # and raised failures, while wrap is never executed for queues.
+    # An ancestor boundary.py with guards, recover, and wrap is ignored by
+    # queue consumers: both returned and raised failures still raise to retry.
     (app_dir / "boundary.py").write_text(
-        "from chano import Boundary, Request\n"
+        "from chano import Boundary, RedirectResponse, Request\n"
         "from chano.status import NoContent\n\n"
+        "def redirect_guard():\n"
+        "    return RedirectResponse('/login')\n\n"
         "def recover_all(request: Request, exc: Exception):\n"
         "    return NoContent()\n\n"
         "async def never_wrap(request: Request, call_next):\n"
         "    raise AssertionError('wrap must not run on queues')\n\n"
-        "boundary = Boundary(recover=[recover_all], wrap=[never_wrap])\n"
+        "boundary = Boundary(\n"
+        "    guards=[redirect_guard], recover=[recover_all], wrap=[never_wrap]\n"
+        ")\n"
     )
-    loaded_recovered = load_queue(discover_queues(app_dir)[0])
-    recovered_subscriber = _make_queue_subscriber(loaded_recovered, "local")
-    asyncio.run(deliver(recovered_subscriber, {"mode": "return"}))
-    asyncio.run(deliver(recovered_subscriber, {"mode": "raise"}))
+    loaded_with_boundary = load_queue(discover_queues(app_dir)[0])
+    bounded_subscriber = _make_queue_subscriber(loaded_with_boundary, "local")
+    asyncio.run(deliver(bounded_subscriber, {"mode": "ok"}))
+    for mode in ("return", "raise"):
+        with pytest.raises(ServiceUnavailable):
+            asyncio.run(deliver(bounded_subscriber, {"mode": mode}))
 
 
 class ApiUnprocessable(UnprocessableContent[Problem]):
@@ -913,19 +919,23 @@ def test_boundary_openapi_recover_replaces_422():
     }
 
 
-# @lat: [[tests#Boundary#Local schedule runner applies recover]]
-def test_local_schedule_runner_applies_recover(tmp_path):
+# @lat: [[tests#Boundary#Local schedule runner ignores boundary]]
+def test_local_schedule_runner_ignores_boundary(tmp_path):
     app_dir = tmp_path / "app"
     (app_dir / "ret").mkdir(parents=True)
     (app_dir / "exc").mkdir(parents=True)
     (app_dir / "boundary.py").write_text(
-        "from chano import Boundary, Request\n"
+        "from chano import Boundary, RedirectResponse, Request\n"
         "from chano.status import OK, NotFound\n\n"
+        "def redirect_guard():\n"
+        "    return RedirectResponse('/login')\n\n"
         "def recover_missing(request: Request, exc: NotFound) -> OK[dict[str, str]]:\n"
         "    return OK({'recovered': exc.content.detail})\n\n"
         "async def never_wrap(request: Request, call_next):\n"
         "    raise AssertionError('wrap must not run on schedules')\n\n"
-        "boundary = Boundary(recover=[recover_missing], wrap=[never_wrap])\n"
+        "boundary = Boundary(\n"
+        "    guards=[redirect_guard], recover=[recover_missing], wrap=[never_wrap]\n"
+        ")\n"
     )
     (app_dir / "ret" / "schedule.py").write_text(
         "from chano.status import NotFound\n\n"
@@ -942,14 +952,12 @@ def test_local_schedule_runner_applies_recover(tmp_path):
 
     app = create_app(app_dir)
     res_ret = asyncio.run(app.run_schedule("ret"))
-    assert isinstance(res_ret, Response)
-    assert res_ret.status_code == 200
-    assert json.loads(res_ret.body) == {"recovered": "returned"}
+    assert isinstance(res_ret, NotFound)
+    assert res_ret.content.detail == "returned"
 
-    res_exc = asyncio.run(app.run_schedule("exc"))
-    assert isinstance(res_exc, Response)
-    assert res_exc.status_code == 200
-    assert json.loads(res_exc.body) == {"recovered": "raised"}
+    with pytest.raises(NotFound) as exc_info:
+        asyncio.run(app.run_schedule("exc"))
+    assert exc_info.value.content.detail == "raised"
 
 
 # @lat: [[tests#Outcomes#Static typing fixtures]]

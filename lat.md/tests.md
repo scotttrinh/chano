@@ -126,9 +126,13 @@ Verify recover matches by exception class and `Failure[ContentType]`, runs neare
 
 Verify fixed-status `Outcome` recover functions replace matching documented `Failure` responses (such as `RequestValidationError` -> `ApiUnprocessable`), respect earlier catch-all precedence, and never rewrite non-`Failure` outcomes.
 
-### Local schedule runner applies recover
+### Local schedule runner ignores boundary
 
-Verify local schedule execution (`run_schedule`) applies inherited `boundary.py` `recover` to both returned `Failure`s and raised exceptions without running `wrap`.
+Verify local schedule execution (`run_schedule`) ignores ancestor `boundary.py` (`guards`, `recover`, and `wrap`), returning a returned `Failure` directly and letting raised exceptions propagate.
+
+### HTTP-only boundary scoping for queues and schedules
+
+Verify an ancestor `boundary.py` applies `guards`, `recover`, and `wrap` to `route.py` while `queue.py` and `schedule.py` ignore it at runtime and exclude it from build `trace_roots` and vendored packages.
 
 ## Error boundaries
 
@@ -252,7 +256,7 @@ Covers `vercel` inclusion with its closure, cyclic `Requires-Dist`, namespace pa
 
 Verify [[src/chano/build.py#plan_build]] adds each route's ancestor `boundary.py` files to its `trace_roots`, so their dependencies are bundled only under that subtree.
 
-A dependency imported only by `app/admin/boundary.py` (directly or through a project helper) lands in every function under `app/admin/`, including route-group and dynamic descendants, but not in sibling functions; a sibling's own `boundary.py` never enters an admin function's roots. `--explain` names the segment file at the head of each reason chain.
+A dependency imported only by `app/admin/boundary.py` (directly or through a project helper) lands in every HTTP route function (`route.py`) under `app/admin/`, including route-group and dynamic descendants, but not in sibling routes, `queue.py`, or `schedule.py`; a sibling's own `boundary.py` never enters an admin function's roots. `--explain` names the segment file at the head of each reason chain.
 
 ## Build-time import check
 
@@ -622,7 +626,7 @@ Verify [[src/chano/queues.py#discover_queues]] strips `(group)` segments, maps t
 
 ### Sync, async, validation, and Depends
 
-Verify `CONSUME` supports sync/async handlers, `msgspec.Struct` body binding, `Depends()`, inherited `boundary.py` guards (without `wrap`), `after()`, and `RequestValidationError` `loc` reporting.
+Verify `CONSUME` supports sync/async handlers, `msgspec.Struct` body binding, `Depends()`, `after()`, and `RequestValidationError` `loc` reporting.
 
 ### Multi-consumer dev trigger and ASGI fallback
 
@@ -630,7 +634,7 @@ Verify multiple consumer groups on one topic dispatch via [[src/chano/app.py#Cha
 
 ### Delivery lifecycle, ack, and retry
 
-Verify [[src/chano/queues.py#create_queue_app]] registers with `vercel.queue`, acknowledges successful runs, retries on exceptions or `>= 400` responses, respects `boundary.py` recover, and supports both `create_queue_service_app()` and `accept_and_handle`.
+Verify [[src/chano/queues.py#create_queue_app]] registers with `vercel.queue`, acknowledges successful runs, retries on exceptions or `>= 400` responses, and supports both `create_queue_service_app()` and `accept_and_handle`.
 
 ### Real vercel-queue SDK registration and delivery
 
@@ -674,7 +678,7 @@ Verify [[src/chano/schedules.py#discover_schedules]] strips `(group)` segments, 
 
 ### Sync, async, Depends, and ASGI app
 
-Verify `RUN` supports sync/async handlers, `Depends()`, inherited `boundary.py` guards (without `wrap`), `after()`, and [[src/chano/schedules.py#create_schedule_app]] accepts `POST`/`GET` and returns `405` on other methods.
+Verify `RUN` supports sync/async handlers, `Depends()`, `after()`, and [[src/chano/schedules.py#create_schedule_app]] accepts `POST`/`GET` and returns `405` on other methods.
 
 ### Schedule build output and tree-shaking
 
@@ -754,7 +758,7 @@ Verify union branches, PEP 695 aliases, generic envelope subclasses, custom medi
 
 ### Queue retry on returned and raised Failure
 
-Verify a queue consumer returning or raising a `Failure` triggers a retry unless an inherited `boundary.py` `recover` function returns a status below `400`, while `wrap` never runs.
+Verify a queue consumer returning or raising a `Failure` triggers a retry even when an ancestor `boundary.py` defines `guards`, `recover`, and `wrap`.
 
 ### Static typing fixtures
 

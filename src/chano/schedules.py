@@ -25,17 +25,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from chano.app import (
     AfterBackend,
-    Boundary,
     EndpointASGIApp,
     _after_state,
     _AfterState,
-    _recover_candidates,
-    _run_recover,
 )
 from chano.params import Endpoint, is_generator_callable
 from chano.requests import Message, Request, Scope
-from chano.responses import Failure
-from chano.routing import BOUNDARY_FILE, load_module, load_segment_boundaries
+from chano.routing import load_module
 
 SCHEDULE_FILE = "schedule.py"
 SCHEDULE_FUNCTION_PREFIX = "_schedules"
@@ -66,22 +62,9 @@ class ScheduleJob:
     file: Path
     function: str
     """Function path in the build output, e.g. ``_schedules/cleanup``."""
-    segments: tuple[Path, ...]
-    """Directories from ``app/`` down to the schedule's own, root to leaf."""
 
     def load(self) -> ModuleType:
         return load_module(self.file)
-
-    def segment_files(self, *filenames: str) -> list[Path]:
-        return [
-            segment / filename
-            for segment in self.segments
-            for filename in filenames
-            if (segment / filename).is_file()
-        ]
-
-    def load_segments(self, filename: str) -> list[ModuleType]:
-        return [load_module(path) for path in self.segment_files(filename)]
 
 
 @dataclass(frozen=True)
@@ -105,7 +88,6 @@ class LoadedSchedule:
     """Stable Vercel schedule key in ``config.json["schedules"]``."""
     trigger: ScheduleTrigger
     endpoint: Endpoint
-    boundaries: tuple[Boundary, ...]
     module: ModuleType
 
     def to_config_schedule(self) -> dict[str, str]:
@@ -233,10 +215,8 @@ def validate_schedule_name(name: object, file: Path) -> str:
 
 def _schedule_job(app_dir: Path, schedule_file: Path) -> ScheduleJob:
     parts = schedule_file.parent.relative_to(app_dir).parts
-    segments = [app_dir]
     name_parts: list[str] = []
     for part in parts:
-        segments.append(segments[-1] / part)
         if part.startswith("(") and part.endswith(")"):
             continue
         if part.startswith("[") and part.endswith("]"):
@@ -250,7 +230,6 @@ def _schedule_job(app_dir: Path, schedule_file: Path) -> ScheduleJob:
         name=name,
         file=schedule_file,
         function=f"{SCHEDULE_FUNCTION_PREFIX}/{name}",
-        segments=tuple(segments),
     )
 
 
@@ -299,14 +278,12 @@ def load_schedule(job: ScheduleJob) -> LoadedSchedule:
         )
     trigger = read_schedule_trigger(module, job.file)
     schedule_name = _read_schedule_name(module, job)
-    boundaries = load_segment_boundaries(job.load_segments(BOUNDARY_FILE))
-    endpoint = Endpoint(handler, set(), [b.guards for b in boundaries])
+    endpoint = Endpoint(handler, set())
     return LoadedSchedule(
         spec=job,
         schedule_name=schedule_name,
         trigger=trigger,
         endpoint=endpoint,
-        boundaries=boundaries,
         module=module,
     )
 
@@ -402,17 +379,7 @@ async def invoke_loaded_schedule(
     token = _after_state.set(after_state)
     cancelled = False
     try:
-        try:
-            result = await loaded.endpoint.call(request)
-            if isinstance(result, Failure) and (
-                candidates := _recover_candidates(loaded.boundaries)
-            ):
-                return await _run_recover(candidates, request, result)
-            return result
-        except Exception as exc:
-            if candidates := _recover_candidates(loaded.boundaries):
-                return await _run_recover(candidates, request, exc)
-            raise
+        return await loaded.endpoint.call(request)
     except asyncio.CancelledError:
         cancelled = True
         raise
@@ -462,7 +429,6 @@ def create_schedule_app(
             return EndpointASGIApp(
                 loaded.endpoint,
                 methods=("POST", "GET"),
-                boundaries=loaded.boundaries,
                 after_backend=after_backend,
             )
     raise ScheduleNotFoundError(

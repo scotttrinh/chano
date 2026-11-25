@@ -593,10 +593,7 @@ def _plan_queue_function(loaded: LoadedQueue, python: str) -> FunctionSpec:
         route=None,
         entrypoint=QUEUE_ENTRYPOINT_SOURCE.format(function=loaded.spec.function),
         vc_config=config,
-        trace_roots=(
-            loaded.spec.file,
-            *loaded.spec.segment_files(BOUNDARY_FILE),
-        ),
+        trace_roots=(loaded.spec.file,),
         include=include,
         required_distributions=(vercel_queue,),
         source_file=loaded.spec.file,
@@ -611,10 +608,7 @@ def _plan_schedule_function(loaded: LoadedSchedule, python: str) -> FunctionSpec
         route=None,
         entrypoint=SCHEDULE_ENTRYPOINT_SOURCE.format(function=loaded.spec.function),
         vc_config=config,
-        trace_roots=(
-            loaded.spec.file,
-            *loaded.spec.segment_files(BOUNDARY_FILE),
-        ),
+        trace_roots=(loaded.spec.file,),
         include=_read_module_include(loaded.module, loaded.spec.file),
         source_file=loaded.spec.file,
     )

@@ -51,7 +51,7 @@ def DELETE(item_id: int) -> NoContent | NotFound:
 - `Created(item)` sends `201 Created` JSON and documents `201` in OpenAPI without inventing a `200`.
 - `NoContent()` sends `204 No Content` with no body, no `content-type`, and no `content-length`.
 - `NotFound("gone")` wraps the string in `ErrorDetail(detail="gone")` and sends `{"detail": "gone"}` with status `404`.
-- A `Failure` is both a `Response` and an `Exception`: return it for static checking against the return union, or raise it from deep helper code. Both flow identically through `boundary.py` `recover` functions, `wrap` chains, and queue retries.
+- A `Failure` is both a `Response` and an `Exception`: return it for static checking against the return union, or raise it from deep helper code. On HTTP routes, both flow identically through `boundary.py` `recover` functions and `wrap` chains; in queue consumers, returning or raising a `Failure` triggers a retry.
 
 ## Named statuses in `chano.status`
 
@@ -129,3 +129,5 @@ def GET(item_id: int, user: User = Depends(current_user)) -> Item | ItemNotFound
 - `Depends(current_user)` strips `Response` branches from `current_user`'s return type, so `user` has static type `User` and annotating `user: str = Depends(current_user)` is a type error.
 - If any dependency or `boundary.py` guard returns a `Response` (such as `Unauthorized(...)` or `SeeOther("/login")`), Chano short-circuits immediately and sends that response without running later dependencies or the handler.
 - OpenAPI reads `Outcome` branches from the handler, its dependencies, nested dependencies, and inherited checks automatically—including `HTTPBearer`'s `401`—with no extra decorators.
+
+For infrastructure and domain dependencies (such as database connections or service clients), keep them as plain functions that raise normal exceptions. Handle those exceptions in `boundary.py` `recover` on HTTP routes, and let them propagate naturally in `queue.py` and `schedule.py`. Reserve returning `Outcome` or `Failure` for HTTP adapter dependencies such as `HTTPBearer` and request-level auth checks.

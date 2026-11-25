@@ -287,8 +287,7 @@ def test_queue_multi_consumer_dev_trigger_and_asgi_app(
     assert q_client("GET", "/_queues/billing").status_code == 405
     assert q_client("POST", "/_queues/billing", content=b"{bad").status_code == 422
     boom = q_client("POST", "/_queues/billing", json={"boom": True})
-    assert boom.status_code == 503
-    assert boom.json() == {"handled": "retry me"}
+    assert boom.status_code == 500
     ce_without_sdk = q_client(
         "POST",
         "/_queues/billing",
@@ -2266,3 +2265,288 @@ def test_combined_build_with_all_primitives(
             }
         },
     }
+
+
+# @lat: [[tests#Boundary#HTTP-only boundary scoping for queues and schedules]]
+def test_boundary_is_http_only_for_routes_queues_and_schedules(
+    tmp_path: Path, monkeypatch: Any, isolated_sys_path: Any
+):
+    project = write_files(
+        tmp_path,
+        {
+            "pyproject.toml": '[project]\nname = "httpbound"\nversion = "0.1.0"\n',
+            "app/boundary.py": (
+                "import boundary_only_pkg\n"
+                "from chano import (\n"
+                "    Boundary, JSONResponse, RedirectResponse, Request\n"
+                ")\n\n"
+                "events = []\n\n"
+                "def require_auth(request: Request):\n"
+                '    events.append(("guard", request.path))\n'
+                '    if request.headers.get("authorization") != "Bearer secret":\n'
+                '        return RedirectResponse("/login")\n\n'
+                "def recover_value(request: Request, exc: ValueError):\n"
+                '    events.append(("recover", str(exc)))\n'
+                '    return JSONResponse({"recovered": str(exc)}, status_code=200)\n\n'
+                "async def add_header(request: Request, call_next):\n"
+                '    events.append(("wrap", request.path))\n'
+                "    resp = await call_next(request)\n"
+                '    resp.headers["x-boundary"] = boundary_only_pkg.TAG\n'
+                "    return resp\n\n"
+                "boundary = Boundary(\n"
+                "    guards=[require_auth],\n"
+                "    recover=[recover_value],\n"
+                "    wrap=[add_header],\n"
+                ")\n"
+            ),
+            "app/orders/route.py": (
+                "def GET(fail: bool = False):\n"
+                "    if fail:\n"
+                '        raise ValueError("route-boom")\n'
+                '    return {"ok": True}\n'
+            ),
+            "app/orders/queue.py": (
+                "from chano import Depends, after\n"
+                'topic = "orders"\n'
+                "after_log = []\n"
+                "def get_prefix() -> str:\n"
+                '    return "q"\n'
+                "async def CONSUME(\n"
+                "    payload: dict,\n"
+                "    prefix: str = Depends(get_prefix),\n"
+                "):\n"
+                '    if payload.get("fail"):\n'
+                '        raise ValueError("queue-boom")\n'
+                "    tag = f\"{prefix}:{payload['id']}\"\n"
+                "    after(lambda v: after_log.append(v), tag)\n"
+                '    return {"handled": tag}\n'
+            ),
+            "app/orders/schedule.py": (
+                "from chano import Depends, after\n"
+                'schedule = "0 * * * *"\n'
+                "after_log = []\n"
+                "def get_label() -> str:\n"
+                '    return "nightly"\n'
+                "async def RUN(label: str = Depends(get_label)):\n"
+                "    after(lambda v: after_log.append(v), label)\n"
+                '    return {"ran": label}\n'
+            ),
+            "app/orders/failing/schedule.py": (
+                'schedule = "0 * * * *"\n'
+                "def RUN():\n"
+                '    raise ValueError("schedule-boom")\n'
+            ),
+        },
+    )
+
+    fake_pkg: Any = types.ModuleType("boundary_only_pkg")
+    fake_pkg.TAG = "yes"
+    monkeypatch.setitem(sys.modules, "boundary_only_pkg", fake_pkg)
+
+    # 1. HTTP route enforces guards, recover, and wrap.
+    app = create_app(project / "app")
+    client = make_client(app)
+
+    unauth = client("GET", "/orders")
+    assert unauth.status_code == 307
+    assert unauth.headers["location"] == "/login"
+    assert unauth.headers["x-boundary"] == "yes"
+
+    ok = client("GET", "/orders", headers={"authorization": "Bearer secret"})
+    assert ok.status_code == 200
+    assert ok.json() == {"ok": True}
+    assert ok.headers["x-boundary"] == "yes"
+
+    recovered = client(
+        "GET", "/orders?fail=true", headers={"authorization": "Bearer secret"}
+    )
+    assert recovered.status_code == 200
+    assert recovered.json() == {"recovered": "route-boom"}
+    assert recovered.headers["x-boundary"] == "yes"
+
+    from chano.routing import load_module
+
+    boundary_mod = load_module((project / "app" / "boundary.py").resolve())
+    boundary_mod.events.clear()
+
+    # 2. Queue ignores ancestor boundary.py (local & deployed), keeps Depends/after.
+    q_res = asyncio.run(app.dispatch_queue("orders", {"id": "1"}))
+    assert q_res == {"handled": "q:1"}
+    q_invoked = asyncio.run(invoke_queue(project / "app", "orders", {"id": "2"}))
+    assert q_invoked == {"handled": "q:2"}
+    orders_queue = next(q for q in app.queues if q.trigger.topic == "orders")
+    assert orders_queue.module.after_log == ["q:1", "q:2"]
+
+    with pytest.raises(ValueError, match="queue-boom"):
+        asyncio.run(app.dispatch_queue("orders", {"id": "3", "fail": True}))
+
+    from chano.queues import _make_queue_subscriber
+
+    subscriber = _make_queue_subscriber(orders_queue, "local")
+
+    async def deliver(payload: dict[str, Any]) -> None:
+        await subscriber(payload)
+
+    asyncio.run(deliver({"id": "4"}))
+    assert orders_queue.module.after_log == ["q:1", "q:2", "q:4"]
+    with pytest.raises(ValueError, match="queue-boom"):
+        asyncio.run(deliver({"id": "5", "fail": True}))
+
+    monkeypatch.setitem(sys.modules, "vercel.queue", None)
+    q_app = create_queue_app(project / "app", "_queues/orders")
+    q_client = make_client(q_app)
+    assert q_client("POST", "/_queues/orders", json={"id": "6"}).json() == {
+        "handled": "q:6"
+    }
+    assert (
+        q_client("POST", "/_queues/orders", json={"id": "7", "fail": True}).status_code
+        == 500
+    )
+
+    # 3. Schedule ignores ancestor boundary.py (local & deployed), keeps Depends/after.
+    s_res = asyncio.run(app.run_schedule("orders"))
+    assert s_res == {"ran": "nightly"}
+    s_invoked = asyncio.run(invoke_schedule(project / "app", "orders"))
+    assert s_invoked == {"ran": "nightly"}
+    orders_schedule = next(s for s in app.schedules if s.spec.name == "orders")
+    assert orders_schedule.module.after_log == ["nightly", "nightly"]
+
+    with pytest.raises(ValueError, match="schedule-boom"):
+        asyncio.run(app.run_schedule("orders/failing"))
+
+    s_app = create_schedule_app(project / "app", "_schedules/orders")
+    s_client = make_client(s_app)
+    assert s_client("POST", "/_schedules/orders").json() == {"ran": "nightly"}
+    s_fail_app = create_schedule_app(project / "app", "_schedules/orders/failing")
+    s_fail_client = make_client(s_fail_app)
+    assert s_fail_client("POST", "/_schedules/orders/failing").status_code == 500
+
+    # No boundary hook ever fired for any queue or schedule call.
+    assert boundary_mod.events == []
+
+    # 4. Build tracing: route traces boundary.py and bundles boundary-only-pkg;
+    # queue and schedule do not trace boundary.py or bundle boundary-only-pkg.
+    def fake_install(_workspace, vendor_dir, _python, _platform, _package=None):
+        write_files(
+            vendor_dir,
+            _fake_store_files(
+                {
+                    "chano": {"chano/__init__.py": "X = 1\n"},
+                    "vercel-runtime": {"vercel_runtime/__init__.py": ""},
+                    "vercel": {"vercel/__init__.py": ""},
+                    "vercel-queue": {"vercel_queue/__init__.py": ""},
+                    "boundary-only-pkg": {
+                        "boundary_only_pkg/__init__.py": 'TAG = "yes"\n'
+                    },
+                }
+            ),
+        )
+
+    monkeypatch.setattr(build_module, "_install_dependencies", fake_install)
+    monkeypatch.setattr(build_module, "_check_function_imports", lambda *args: None)
+
+    plan = plan_build(project, python="3.12", platform=None)
+    by_name = {f.name: f for f in plan.functions}
+    app_dir = (project / "app").resolve()
+    boundary_file = app_dir / "boundary.py"
+
+    assert boundary_file in by_name["orders"].trace_roots
+    assert by_name["_queues/orders"].trace_roots == (app_dir / "orders" / "queue.py",)
+    assert by_name["_schedules/orders"].trace_roots == (
+        app_dir / "orders" / "schedule.py",
+    )
+
+    out = emit_build(plan)
+    route_dists = set(
+        build_module.index_store(
+            out / "functions" / "orders.func" / "_vendor"
+        ).distributions
+    )
+    queue_dists = set(
+        build_module.index_store(
+            out / "functions" / "_queues" / "orders.func" / "_vendor"
+        ).distributions
+    )
+    schedule_dists = set(
+        build_module.index_store(
+            out / "functions" / "_schedules" / "orders.func" / "_vendor"
+        ).distributions
+    )
+    assert "boundary-only-pkg" in route_dists
+    assert "boundary-only-pkg" not in queue_dists
+    assert "boundary-only-pkg" not in schedule_dists
+
+    # 5. Private entrypoints never even import ancestor boundary.py (create_app is
+    # never called on this project, and app/boundary.py raises at import time).
+    private_project = write_files(
+        tmp_path / "private_only",
+        {
+            "pyproject.toml": '[project]\nname = "privonly"\nversion = "0.1.0"\n',
+            "app/boundary.py": (
+                'raise RuntimeError("boundary.py must not be imported by private '
+                'functions")\n'
+            ),
+            "app/jobs/queue.py": (
+                'topic = "jobs"\n'
+                "def CONSUME(payload: dict):\n"
+                '    if payload.get("fail"):\n'
+                '        raise RuntimeError("job-boom")\n'
+                '    return {"job": payload["id"]}\n'
+            ),
+            "app/nightly/schedule.py": (
+                'schedule = "0 0 * * *"\ndef RUN():\n    return {"nightly": True}\n'
+            ),
+        },
+    )
+    private_app_dir = private_project / "app"
+
+    assert asyncio.run(invoke_queue(private_app_dir, "jobs", {"id": "j1"})) == {
+        "job": "j1"
+    }
+    assert asyncio.run(invoke_schedule(private_app_dir, "nightly")) == {"nightly": True}
+
+    # Deployed queue app via public create_queue_app with fake vercel.queue SDK.
+    registered: list[Any] = []
+    fake_vq: Any = types.ModuleType("vercel.queue")
+
+    def fake_subscribe(**_kwargs: Any) -> Any:
+        def decorator(fn: Any) -> Any:
+            registered.append(fn)
+            return fn
+
+        return decorator
+
+    async def fake_accept_and_handle(
+        body_iter: AsyncIterator[bytes], _headers: Mapping[str, str]
+    ) -> None:
+        chunks = [chunk async for chunk in body_iter]
+        await registered[-1](b"".join(chunks))
+
+    fake_vq.subscribe = fake_subscribe
+    fake_vq.accept_and_handle = fake_accept_and_handle
+    monkeypatch.setitem(sys.modules, "vercel.queue", fake_vq)
+    monkeypatch.setitem(sys.modules, "vercel_runtime.workers", None)
+
+    deployed_q_app = create_queue_app(private_app_dir, "_queues/jobs")
+    deployed_q_client = make_client(deployed_q_app)
+    assert (
+        deployed_q_client("POST", "/_queues/jobs", json={"id": "j2"}).status_code == 204
+    )
+    assert (
+        deployed_q_client(
+            "POST", "/_queues/jobs", json={"id": "j3", "fail": True}
+        ).status_code
+        == 500
+    )
+
+    # Local fallback queue app and deployed schedule app also never import boundary.py.
+    monkeypatch.setitem(sys.modules, "vercel.queue", None)
+    fallback_q_client = make_client(create_queue_app(private_app_dir, "_queues/jobs"))
+    assert fallback_q_client("POST", "/_queues/jobs", json={"id": "j4"}).json() == {
+        "job": "j4"
+    }
+
+    deployed_s_client = make_client(
+        create_schedule_app(private_app_dir, "_schedules/nightly")
+    )
+    assert deployed_s_client("POST", "/_schedules/nightly").json() == {"nightly": True}

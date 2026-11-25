@@ -61,7 +61,7 @@ def GET(page: Pagination = Depends(pagination)):
 
 ## Folder-scoped `boundary.py`
 
-To share guards, error recovery, and HTTP wrappers across a subtree of routes without repeating wiring in every handler, add a `boundary.py` file to any folder under `app/` exporting `boundary = Boundary(...)`:
+To share guards, error recovery, and HTTP wrappers across a subtree of HTTP routes (`route.py`) without repeating wiring in every handler, add a `boundary.py` file to any folder under `app/` exporting `boundary = Boundary(...)`. Ancestor `boundary.py` files apply to HTTP routes only, not `queue.py` or `schedule.py`:
 
 ```python
 # app/(admin)/boundary.py
@@ -192,7 +192,7 @@ Beyond HTTP `route.py` endpoints, Chano compiles Vercel Queues, Schedules, and W
 
 ### Queue consumers (`queue.py`)
 
-Add a `queue.py` file anywhere under `app/` exporting `topic` and a `CONSUME` handler (sync or async). Typed parameters bind from the JSON message payload, and `Depends()`, `after()`, and `boundary.py` (`guards` and `recover`, never `wrap`) work just like HTTP routes:
+Add a `queue.py` file anywhere under `app/` exporting `topic` and a `CONSUME` handler (sync or async). Typed parameters bind from the JSON message payload, and `Depends()` and `after()` work just like HTTP routes. Ancestor `boundary.py` files apply to HTTP routes only and are ignored by `queue.py`:
 
 ```python
 # app/orders/queue.py
