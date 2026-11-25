@@ -350,6 +350,66 @@ Verify `SSEResponse` always sends `content-type: text/event-stream` and `cache-c
 
 Verify `SSEResponse` rejects zero, negative, and non-finite `ping` values with `ValueError`.
 
+## Request body streaming
+
+Verify [[src/chano/requests.py#Request#stream]], [[src/chano/exceptions.py#ClientDisconnect]], and [[src/chano/requests.py#Request#_response_receive]] coordination through ASGI.
+
+### Streams chunks incrementally
+
+Verify `request.stream()` delivers each non-empty chunk to the handler before the next ASGI `http.request` message is produced, skipping empty chunks.
+
+### Empty body yields zero chunks
+
+Verify `request.stream()` yields zero chunks when the ASGI `http.request` body is empty.
+
+### Stream after body yields cached bytes
+
+Verify calling `request.stream()` after `await request.body()` yields the cached payload for non-empty bodies and zero chunks for an empty body.
+
+### Consumed stream raises RuntimeError
+
+Verify reading a second time via `request.stream()` or `await request.body()` after streaming raises `RuntimeError("Stream consumed")`.
+
+### Disconnect raises ClientDisconnect
+
+Verify an `http.disconnect` message during `request.stream()` or `await request.body()` raises [[src/chano/exceptions.py#ClientDisconnect]].
+
+### Unexpected ASGI message raises RuntimeError
+
+Verify an unrecognized ASGI message type during `request.stream()` raises `RuntimeError`.
+
+### Full-duplex echo with StreamingResponse
+
+Verify `StreamingResponse(request.stream())` through `Chano` echoes every chunk in order without `_listen_for_disconnect` stealing `http.request` messages.
+
+### Disconnect after stream cancels response
+
+Verify `http.disconnect` arriving after `request.stream()` finishes still cancels a continuing `StreamingResponse` producer and runs its cleanup.
+
+### Disconnect during stream stops response
+
+Verify a disconnect seen by `request.stream()` is replayed to `StreamingResponse`'s disconnect listener without calling the underlying ASGI `receive` again.
+
+### SSEResponse receives all request stream chunks
+
+Verify `SSEResponse(request.stream())` receives every `http.request` chunk without `_listen_for_disconnect` stealing messages before the inner SSE task starts.
+
+### Disconnect while paused on terminal chunk
+
+Verify `http.disconnect` still cancels a `StreamingResponse` producer that pauses after receiving the terminal (`more_body=False`) chunk from `request.stream()`.
+
+### StreamingResponse ignores ClientDisconnect
+
+Verify a direct `StreamingResponse(request.stream())` sends chunks received before disconnect and exits cleanly without re-raising `ClientDisconnect`.
+
+### Lazy stream after await loses no chunks
+
+Verify a `StreamingResponse` producer that calls `request.stream()` lazily after an `await` receives every `http.request` chunk without losing any to `_listen_for_disconnect`.
+
+### Backpressure prevents draining receive ahead
+
+Verify `StreamingResponse(request.stream())` does not drain upcoming `http.request` frames from `receive()` while `send()` is blocked on an earlier chunk.
+
 ## Request cookies
 
 Verify [[src/chano/requests.py#Request#cookies]] for a missing or empty header, several cookies, stray whitespace and `;`, `=` in values, quoted and escaped values, name-less pairs, several `cookie` headers, and first-wins repeats.

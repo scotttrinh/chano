@@ -7,12 +7,14 @@ import msgspec
 from chano import (
     Boundary,
     CallNext,
+    ClientDisconnect,
     Depends,
     ErrorDetail,
     HTTPBearer,
     Request,
     RequestValidationError,
     Response,
+    StreamingResponse,
     lazy,
 )
 from chano.status import (
@@ -173,3 +175,17 @@ valid_boundary = Boundary(
     recover=[recover_invalid, recover_missing],
     wrap=[request_id],
 )
+
+
+async def stream_upload(request: Request) -> int:
+    total = 0
+    try:
+        async for chunk in request.stream():
+            total += len(chunk)
+    except ClientDisconnect:
+        return total
+    return total
+
+
+def echo_stream(request: Request) -> StreamingResponse:
+    return StreamingResponse(request.stream())
