@@ -8,6 +8,8 @@ import functools
 import importlib
 import io
 import json
+import shutil
+import subprocess
 import sys
 import tomllib
 import types
@@ -20,14 +22,14 @@ import httpx
 import pytest
 
 from chano import (
+    Chano,
     ChanoConfig,
     RequestValidationError,
     WorkflowConfig,
     create_app,
     create_queue_app,
     create_schedule_app,
-    create_workflow_flow_app,
-    create_workflow_step_app,
+    create_workflow_app,
     invoke_queue,
     invoke_schedule,
     load_config,
@@ -38,60 +40,17 @@ from chano.cli import main as cli_main
 from chano.queues import QueueNotFoundError, discover_queues
 from chano.requests import Message
 from chano.schedules import ScheduleNotFoundError, discover_schedules
-
-
-def make_client(app: Any) -> Any:
-    def request(method: str, url: str, **kwargs: Any) -> httpx.Response:
-        async def send() -> httpx.Response:
-            transport = httpx.ASGITransport(app=app)
-            async with httpx.AsyncClient(
-                transport=transport, base_url="http://test"
-            ) as http:
-                return await http.request(method, url, **kwargs)
-
-        return asyncio.run(send())
-
-    return request
-
-
-def write_files(root: Path, files: dict[str, str]) -> Path:
-    for rel, content in files.items():
-        path = root / rel
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
-    return root
-
-
-def _fake_store_files(packages: dict[str, dict[str, str]]) -> dict[str, str]:
-    """Build synthetic dist-info + module files for a fake dependency store."""
-    files: dict[str, str] = {}
-    for dist_name, mod_files in packages.items():
-        dist_dir = f"{dist_name.replace('-', '_')}-1.0.dist-info"
-        files[f"{dist_dir}/METADATA"] = (
-            f"Metadata-Version: 2.1\nName: {dist_name}\nVersion: 1.0\n"
-        )
-        record_lines = [f"{rel},," for rel in sorted(mod_files)]
-        record_lines.append(f"{dist_dir}/METADATA,,")
-        record_lines.append(f"{dist_dir}/RECORD,,")
-        files[f"{dist_dir}/RECORD"] = "\n".join(record_lines) + "\n"
-        files.update(mod_files)
-    return files
-
-
-@pytest.fixture
-def isolated_sys_path():
-    before_path = list(sys.path)
-    before_modules = set(sys.modules)
-    try:
-        yield
-    finally:
-        sys.path[:] = before_path
-        for name in list(sys.modules):
-            if name not in before_modules and (
-                name.startswith("chano_routes.") or name.startswith("wf_test_")
-            ):
-                sys.modules.pop(name, None)
-
+from chano.workflows import (
+    get_step_topic_prefix,
+    get_workflow_topic_prefix,
+    introspect_workflow_triggers,
+    load_workflow_entrypoint,
+    mount_workflows,
+    resolve_workflow_trace_roots,
+    validate_workflow_namespace,
+    workflow_flow_trigger,
+)
+from tests.helpers import make_client, make_dist, write_project
 
 # ---------------------------------------------------------------------------
 # Vercel Queues
@@ -99,8 +58,10 @@ def isolated_sys_path():
 
 
 # @lat: [[tests#Vercel Queues#Discovery and OpenAPI isolation]]
-def test_queue_discovery_and_openapi_isolation(tmp_path: Path, isolated_sys_path: Any):
-    project = write_files(
+def test_queue_discovery_and_openapi_isolation(
+    tmp_path: Path, isolated_project_imports: Any
+):
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "qdemo"\nversion = "0.1.0"\n',
@@ -138,9 +99,9 @@ def test_queue_discovery_and_openapi_isolation(tmp_path: Path, isolated_sys_path
 
 # @lat: [[tests#Vercel Queues#Sync, async, validation, and Depends]]
 def test_queue_consume_sync_async_validation_and_depends(
-    tmp_path: Path, isolated_sys_path: Any
+    tmp_path: Path, isolated_project_imports: Any
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "qval"\nversion = "0.1.0"\n',
@@ -217,9 +178,9 @@ def test_queue_consume_sync_async_validation_and_depends(
 
 # @lat: [[tests#Vercel Queues#Multi-consumer dev trigger and ASGI fallback]]
 def test_queue_multi_consumer_dev_trigger_and_asgi_app(
-    tmp_path: Path, monkeypatch: Any, isolated_sys_path: Any
+    tmp_path: Path, monkeypatch: Any, isolated_project_imports: Any
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "qmulti"\nversion = "0.1.0"\n',
@@ -273,7 +234,7 @@ def test_queue_multi_consumer_dev_trigger_and_asgi_app(
         ).status_code
         == 500
     )
-    with pytest.raises(KeyError):
+    with pytest.raises(KeyError, match="'id'"):
         asyncio.run(app.dispatch_queue("orders", {}, consumer="billing"))
 
     # Deployed single-consumer ASGI app (simulating vercel-queue absent):
@@ -304,7 +265,7 @@ def test_queue_multi_consumer_dev_trigger_and_asgi_app(
 
 # @lat: [[tests#Vercel Queues#Delivery lifecycle, ack, and retry]]
 def test_queue_delivery_lifecycle_accept_renew_ack_and_retry(
-    tmp_path: Path, monkeypatch: Any, isolated_sys_path: Any
+    tmp_path: Path, monkeypatch: Any, isolated_project_imports: Any
 ):
     """Platform CloudEvent push delivery runs through vercel.queue +
     vercel_runtime.workers.create_queue_service_app: subscribe, accept, lease
@@ -448,7 +409,7 @@ def test_queue_delivery_lifecycle_accept_renew_ack_and_retry(
     monkeypatch.setitem(sys.modules, "vercel_runtime", fake_vr)
     monkeypatch.setitem(sys.modules, "vercel_runtime.workers", fake_workers)
 
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "qlife"\nversion = "0.1.0"\n',
@@ -540,7 +501,7 @@ def test_queue_delivery_lifecycle_accept_renew_ack_and_retry(
 
 # @lat: [[tests#Vercel Queues#Real vercel-queue SDK registration and delivery]]
 def test_queue_real_sdk_registration_sanitization_and_delivery(
-    tmp_path: Path, isolated_sys_path: Any
+    tmp_path: Path, isolated_project_imports: Any
 ):
     """End-to-end test with the real vercel-queue SDK: Message[bytes] metadata,
     SanitizedName consumer normalization matching .vc-config.json, and real
@@ -548,7 +509,7 @@ def test_queue_real_sdk_registration_sanitization_and_delivery(
     import vercel.queue as vq
     from vercel.queue._internal.embedded import embedded_queue_service
 
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "realq"\nversion = "0.1.0"\n',
@@ -617,9 +578,9 @@ def test_queue_real_sdk_registration_sanitization_and_delivery(
 
 # @lat: [[tests#Vercel Queues#Build requires vercel-queue in store]]
 def test_queue_build_fails_when_vercel_queue_missing_from_store(
-    tmp_path: Path, monkeypatch: Any, isolated_sys_path: Any
+    tmp_path: Path, isolated_project_imports: Any, stub_build_install: Any
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "qmissing"\nversion = "0.1.0"\n',
@@ -630,21 +591,12 @@ def test_queue_build_fails_when_vercel_queue_missing_from_store(
         },
     )
 
-    def fake_install_without_queue(_root: Path, vendor_dir: Path, *_args: Any) -> None:
-        write_files(
-            vendor_dir,
-            _fake_store_files(
-                {
-                    "chano": {"chano/__init__.py": ""},
-                    "vercel-runtime": {"vercel_runtime/__init__.py": ""},
-                }
-            ),
-        )
-
-    monkeypatch.setattr(
-        build_module, "_install_dependencies", fake_install_without_queue
+    stub_build_install(
+        {
+            **make_dist("chano", "chano"),
+            **make_dist("vercel-runtime", "vercel_runtime"),
+        }
     )
-    monkeypatch.setattr(build_module, "_check_function_imports", lambda *args: None)
 
     plan = plan_build(project, python="3.12", platform=None)
     with pytest.raises(RuntimeError, match="requires 'vercel-queue'"):
@@ -737,13 +689,13 @@ def test_queue_build_fails_when_vercel_queue_missing_from_store(
 )
 def test_queue_validation_errors(
     tmp_path: Path,
-    isolated_sys_path: Any,
+    isolated_project_imports: Any,
     rel_path: str,
     source: str,
     exc_type: type[Exception],
     match: str,
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "qerr"\nversion = "0.1.0"\n',
@@ -756,9 +708,9 @@ def test_queue_validation_errors(
 
 # @lat: [[tests#Vercel Queues#Duplicate topic and consumer rejected]]
 def test_queue_duplicate_topic_consumer_rejected(
-    tmp_path: Path, isolated_sys_path: Any
+    tmp_path: Path, isolated_project_imports: Any
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "qdup"\nversion = "0.1.0"\n',
@@ -772,9 +724,9 @@ def test_queue_duplicate_topic_consumer_rejected(
 
 # @lat: [[tests#Vercel Queues#Wildcard dispatch and consumer sanitization]]
 def test_queue_wildcard_dispatch_and_deterministic_consumer_matching(
-    tmp_path: Path, isolated_sys_path: Any
+    tmp_path: Path, isolated_project_imports: Any
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "qwild"\nversion = "0.1.0"\n',
@@ -845,10 +797,10 @@ def test_queue_wildcard_dispatch_and_deterministic_consumer_matching(
 
 # @lat: [[tests#Vercel Queues#Overlapping wildcard topics rejected]]
 def test_queue_overlapping_wildcard_topics_rejected(
-    tmp_path: Path, isolated_sys_path: Any
+    tmp_path: Path, isolated_project_imports: Any
 ):
     # Wildcard + exact topic on same consumer group -> rejected.
-    exact_overlap = write_files(
+    exact_overlap = write_project(
         tmp_path / "exact",
         {
             "pyproject.toml": '[project]\nname = "qov1"\nversion = "0.1.0"\n',
@@ -860,7 +812,7 @@ def test_queue_overlapping_wildcard_topics_rejected(
         plan_build(exact_overlap)
 
     # Overlapping wildcard prefixes on same consumer group -> rejected.
-    wild_overlap = write_files(
+    wild_overlap = write_project(
         tmp_path / "wild",
         {
             "pyproject.toml": '[project]\nname = "qov2"\nversion = "0.1.0"\n',
@@ -872,7 +824,7 @@ def test_queue_overlapping_wildcard_topics_rejected(
         plan_build(wild_overlap)
 
     # Same overlapping topics on DIFFERENT consumer groups -> allowed.
-    distinct_groups = write_files(
+    distinct_groups = write_project(
         tmp_path / "distinct",
         {
             "pyproject.toml": '[project]\nname = "qov3"\nversion = "0.1.0"\n',
@@ -893,9 +845,12 @@ def test_queue_overlapping_wildcard_topics_rejected(
 
 # @lat: [[tests#Vercel Queues#Queue build output and tree-shaking]]
 def test_queue_build_output_and_tree_shaking(
-    tmp_path: Path, monkeypatch: Any, isolated_sys_path: Any
+    tmp_path: Path,
+    monkeypatch: Any,
+    isolated_project_imports: Any,
+    stub_build_install: Any,
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "qbuild"\nversion = "0.1.0"\n',
@@ -917,25 +872,22 @@ def test_queue_build_output_and_tree_shaking(
         },
     )
 
-    def fake_install(_root: Path, vendor_dir: Path, *_args: Any) -> None:
-        write_files(
-            vendor_dir,
-            _fake_store_files(
-                {
-                    "chano": {"chano/__init__.py": ""},
-                    "vercel-runtime": {"vercel_runtime/__init__.py": ""},
-                    "vercel-queue": {"vercel/queue/__init__.py": ""},
-                    "queue-only-pkg": {"queue_only_pkg/__init__.py": "VALUE = 1\n"},
-                    "extra-queue-pkg": {"extra_queue_pkg/__init__.py": ""},
-                }
-            ),
-        )
-
     monkeypatch.setitem(
         sys.modules, "queue_only_pkg", types.ModuleType("queue_only_pkg")
     )
-    monkeypatch.setattr(build_module, "_install_dependencies", fake_install)
-    monkeypatch.setattr(build_module, "_check_function_imports", lambda *args: None)
+    stub_build_install(
+        {
+            **make_dist("chano", "chano"),
+            **make_dist("vercel-runtime", "vercel_runtime"),
+            **make_dist("vercel-queue", "vercel/queue"),
+            **make_dist(
+                "queue-only-pkg",
+                "queue_only_pkg",
+                extra_files={"queue_only_pkg/__init__.py": "VALUE = 1\n"},
+            ),
+            **make_dist("extra-queue-pkg", "extra_queue_pkg"),
+        }
+    )
 
     plan = plan_build(project, python="3.12", platform=None)
     by_name = {f.name: f for f in plan.functions}
@@ -996,9 +948,9 @@ def test_queue_build_output_and_tree_shaking(
 
 # @lat: [[tests#Vercel Queues#Queue CLI list and send]]
 def test_queue_cli_list_and_send(
-    tmp_path: Path, monkeypatch: Any, capsys: Any, isolated_sys_path: Any
+    tmp_path: Path, monkeypatch: Any, capsys: Any, isolated_project_imports: Any
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "qcli"\nversion = "0.1.0"\n',
@@ -1035,9 +987,9 @@ def test_queue_cli_list_and_send(
 
 # @lat: [[tests#Vercel Schedules#Discovery and OpenAPI isolation]]
 def test_schedule_discovery_and_openapi_isolation(
-    tmp_path: Path, isolated_sys_path: Any
+    tmp_path: Path, isolated_project_imports: Any
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "sdemo"\nversion = "0.1.0"\n',
@@ -1070,9 +1022,9 @@ def test_schedule_discovery_and_openapi_isolation(
 
 # @lat: [[tests#Vercel Schedules#Sync, async, Depends, and ASGI app]]
 def test_schedule_run_sync_async_depends_and_asgi(
-    tmp_path: Path, isolated_sys_path: Any
+    tmp_path: Path, isolated_project_imports: Any
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "srun"\nversion = "0.1.0"\n',
@@ -1130,9 +1082,12 @@ def test_schedule_run_sync_async_depends_and_asgi(
 
 # @lat: [[tests#Vercel Schedules#Schedule build output and tree-shaking]]
 def test_schedule_build_output_and_tree_shaking(
-    tmp_path: Path, monkeypatch: Any, isolated_sys_path: Any
+    tmp_path: Path,
+    monkeypatch: Any,
+    isolated_project_imports: Any,
+    stub_build_install: Any,
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": (
@@ -1163,24 +1118,21 @@ def test_schedule_build_output_and_tree_shaking(
         },
     )
 
-    def fake_install(_root: Path, vendor_dir: Path, *_args: Any) -> None:
-        write_files(
-            vendor_dir,
-            _fake_store_files(
-                {
-                    "chano": {"chano/__init__.py": ""},
-                    "vercel-runtime": {"vercel_runtime/__init__.py": ""},
-                    "sched-only-pkg": {"sched_only_pkg/__init__.py": "OK = True\n"},
-                    "extra-sched-pkg": {"extra_sched_pkg/__init__.py": ""},
-                }
-            ),
-        )
-
     monkeypatch.setitem(
         sys.modules, "sched_only_pkg", types.ModuleType("sched_only_pkg")
     )
-    monkeypatch.setattr(build_module, "_install_dependencies", fake_install)
-    monkeypatch.setattr(build_module, "_check_function_imports", lambda *args: None)
+    stub_build_install(
+        {
+            **make_dist("chano", "chano"),
+            **make_dist("vercel-runtime", "vercel_runtime"),
+            **make_dist(
+                "sched-only-pkg",
+                "sched_only_pkg",
+                extra_files={"sched_only_pkg/__init__.py": "OK = True\n"},
+            ),
+            **make_dist("extra-sched-pkg", "extra_sched_pkg"),
+        }
+    )
 
     plan = plan_build(project, python="3.12", platform=None)
     by_name = {f.name: f for f in plan.functions}
@@ -1343,13 +1295,13 @@ def test_schedule_build_output_and_tree_shaking(
 )
 def test_schedule_validation_errors(
     tmp_path: Path,
-    isolated_sys_path: Any,
+    isolated_project_imports: Any,
     rel_path: str,
     source: str,
     exc_type: type[Exception],
     match: str,
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "serr"\nversion = "0.1.0"\n',
@@ -1361,8 +1313,10 @@ def test_schedule_validation_errors(
 
 
 # @lat: [[tests#Vercel Schedules#Schedule name collision rejected]]
-def test_schedule_name_collision_rejected(tmp_path: Path, isolated_sys_path: Any):
-    project = write_files(
+def test_schedule_name_collision_rejected(
+    tmp_path: Path, isolated_project_imports: Any
+):
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "scollide"\nversion = "0.1.0"\n',
@@ -1376,9 +1330,9 @@ def test_schedule_name_collision_rejected(tmp_path: Path, isolated_sys_path: Any
 
 # @lat: [[tests#Vercel Schedules#Schedule handler KeyError returns 500]]
 def test_schedule_handler_keyerror_returns_500_and_runs_once(
-    tmp_path: Path, isolated_sys_path: Any
+    tmp_path: Path, isolated_project_imports: Any
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "skeyerr"\nversion = "0.1.0"\n',
@@ -1405,16 +1359,16 @@ def test_schedule_handler_keyerror_returns_500_and_runs_once(
     assert resp.status_code == 500
     assert job.module.calls == 1
 
-    with pytest.raises(KeyError):
+    with pytest.raises(KeyError, match="'missing'"):
         asyncio.run(app.run_schedule("buggy"))
     assert job.module.calls == 2
 
 
 # @lat: [[tests#Vercel Schedules#Schedule dev trigger and CLI]]
 def test_schedule_dev_trigger_and_cli(
-    tmp_path: Path, capsys: Any, isolated_sys_path: Any
+    tmp_path: Path, capsys: Any, isolated_project_imports: Any
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "scli"\nversion = "0.1.0"\n',
@@ -1473,7 +1427,7 @@ def test_workflow_config_parsing_and_optional_dependency(tmp_path: Path):
 
     # Parse [[tool.vercel.workflows]] alongside [tool.chano].
     pyproject = (
-        write_files(
+        write_project(
             tmp_path,
             {
                 "pyproject.toml": (
@@ -1543,13 +1497,16 @@ def test_workflow_config_validation_errors(tmp_path: Path, toml_text: str, match
 
 # @lat: [[tests#Vercel Workflows#Build output and sequential replays]]
 def test_workflow_build_output_and_sequential_replays(
-    tmp_path: Path, monkeypatch: Any, isolated_sys_path: Any
+    tmp_path: Path,
+    monkeypatch: Any,
+    isolated_project_imports: Any,
+    stub_build_install: Any,
 ):
     """Build introspects real vercel-workflow subscriptions, emits flow.func
     matching actual SDK subscriptions (no unbacked step.func), traces step
     imports, and reflects WORKFLOW_SEQUENTIAL_REPLAYS=1."""
     monkeypatch.setenv("WORKFLOW_LOCAL_DATA_DIR", str(tmp_path / ".wf-data"))
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": (
@@ -1568,23 +1525,20 @@ def test_workflow_build_output_and_sequential_replays(
         },
     )
 
-    def fake_install(_root: Path, vendor_dir: Path, *_args: Any) -> None:
-        write_files(
-            vendor_dir,
-            _fake_store_files(
-                {
-                    "chano": {"chano/__init__.py": ""},
-                    "vercel-runtime": {"vercel_runtime/__init__.py": ""},
-                    "vercel-workflow": {"vercel/workflow/__init__.py": ""},
-                    "vercel-queue": {"vercel/queue/__init__.py": ""},
-                    "wf-step-dep": {"wf_step_dep/__init__.py": "X = 1\n"},
-                }
-            ),
-        )
-
     monkeypatch.setitem(sys.modules, "wf_step_dep", types.ModuleType("wf_step_dep"))
-    monkeypatch.setattr(build_module, "_install_dependencies", fake_install)
-    monkeypatch.setattr(build_module, "_check_function_imports", lambda *args: None)
+    stub_build_install(
+        {
+            **make_dist("chano", "chano"),
+            **make_dist("vercel-runtime", "vercel_runtime"),
+            **make_dist("vercel-workflow", "vercel/workflow"),
+            **make_dist("vercel-queue", "vercel/queue"),
+            **make_dist(
+                "wf-step-dep",
+                "wf_step_dep",
+                extra_files={"wf_step_dep/__init__.py": "X = 1\n"},
+            ),
+        }
+    )
 
     monkeypatch.delenv("WORKFLOW_SEQUENTIAL_REPLAYS", raising=False)
     plan = plan_build(project, python="3.12", platform=None)
@@ -1609,8 +1563,6 @@ def test_workflow_build_output_and_sequential_replays(
             }
         ],
     }
-    assert "create_workflow_flow_app" in flow_spec.entrypoint
-
     out = emit_build(plan)
     config_json = json.loads((out / "config.json").read_text())
     assert config_json == {
@@ -1663,9 +1615,9 @@ def test_workflow_build_output_and_sequential_replays(
 
 # @lat: [[tests#Vercel Workflows#Build fails without SDK or subscriptions]]
 def test_workflow_build_fails_without_sdk_or_subscriptions(
-    tmp_path: Path, monkeypatch: Any, isolated_sys_path: Any
+    tmp_path: Path, monkeypatch: Any, isolated_project_imports: Any
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": (
@@ -1699,7 +1651,7 @@ def test_workflow_build_fails_without_sdk_or_subscriptions(
         'non_serving = workflow.Workflows(namespace="shared", as_vercel_job=False)\n'
         'unconfigured = workflow.Workflows(namespace="other")\n'
     )
-    unbacked = write_files(
+    unbacked = write_project(
         tmp_path / "unbacked",
         {
             "pyproject.toml": (
@@ -1716,7 +1668,7 @@ def test_workflow_build_fails_without_sdk_or_subscriptions(
 
     # Configuring only `serving` emits ONLY `__shared_wkf_workflow_*` and does
     # NOT emit `unconfigured`'s `__other_wkf_workflow_*` subscription.
-    configured = write_files(
+    configured = write_project(
         tmp_path / "configured",
         {
             "pyproject.toml": (
@@ -1746,9 +1698,9 @@ def test_workflow_build_fails_without_sdk_or_subscriptions(
 
 # @lat: [[tests#Vercel Workflows#Local dev without SDK is graceful]]
 def test_workflow_local_dev_without_sdk_is_graceful(
-    tmp_path: Path, monkeypatch: Any, isolated_sys_path: Any
+    tmp_path: Path, monkeypatch: Any, isolated_project_imports: Any
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": (
@@ -1769,21 +1721,61 @@ def test_workflow_local_dev_without_sdk_is_graceful(
 
     app = create_app(project / "app")
     assert app.workflows == (WorkflowConfig(entrypoint="wf_test_nosdk:wf"),)
-    assert app.workflows_mounted is False
     client = make_client(app)
     assert client("GET", "/").json() == {"ok": True}
+    assert client("POST", "/.well-known/workflow/v1/flow").status_code == 404
 
-    write_files(project, {"wf_test_plain.py": "wf = object()\n"})
+    write_project(project, {"wf_test_plain.py": "wf = object()\n"})
     sys.path.insert(0, str(project))
     with pytest.raises(RuntimeError, match="vercel-workflow is required"):
-        create_workflow_flow_app(["wf_test_plain:wf"])
-    with pytest.raises(RuntimeError, match="vercel-workflow is required"):
-        create_workflow_step_app(["wf_test_plain:wf"])
+        create_workflow_app(["wf_test_plain:wf"])
+
+
+# @lat: [[tests#Vercel Workflows#Partial SDK fallback to http_handler]]
+def test_workflow_app_falls_back_on_partial_vercel_sdk(
+    tmp_path: Path, monkeypatch: Any, isolated_project_imports: Any
+):
+    project = tmp_path / "wf-partial-sdk"
+    write_project(
+        project,
+        {
+            "wf_test_partial.py": (
+                "from types import SimpleNamespace\n\n"
+                "class _Registry:\n"
+                "    namespace = None\n\n"
+                "    async def http_handler(self, req):\n"
+                "        return SimpleNamespace(\n"
+                "            status=200,\n"
+                '            headers={"content-type": "application/json"},\n'
+                "            body=b'{\"fallback\": true}',\n"
+                "        )\n\n"
+                "wf = _Registry()\n"
+            ),
+            "vercel_runtime/__init__.py": "",
+            "vercel_runtime/workers.py": "import vercel_workflow.dependencies\n",
+            "vercel_workflow/__init__.py": "",
+        },
+    )
+    sys.path.insert(0, str(project))
+
+    fake_vr = types.ModuleType("vercel_runtime")
+    fake_vr.__path__ = [str(project / "vercel_runtime")]
+    monkeypatch.setitem(sys.modules, "vercel_runtime", fake_vr)
+    monkeypatch.delitem(sys.modules, "vercel_runtime.workers", raising=False)
+    monkeypatch.delitem(sys.modules, "vercel_workflow", raising=False)
+    monkeypatch.delitem(sys.modules, "vercel_workflow.dependencies", raising=False)
+
+    app = create_workflow_app(["wf_test_partial:wf"])
+    client = make_client(app)
+    resp = client("POST", "/.well-known/workflow/v1/flow", json={"ok": True})
+    assert resp.status_code == 200
+    assert resp.json() == {"fallback": True}
 
 
 # @lat: [[tests#Vercel Workflows#Real vercel-workflow SDK end-to-end run and build]]
+@pytest.mark.slow
 def test_workflow_real_sdk_end_to_end_run_and_build(
-    tmp_path: Path, monkeypatch: Any, isolated_sys_path: Any
+    tmp_path: Path, monkeypatch: Any, isolated_project_imports: Any
 ):
     """End-to-end test using the REAL vercel-workflow + vercel-queue SDKs:
     runs a real workflow with a @wf.step to completion under create_app(),
@@ -1796,7 +1788,7 @@ def test_workflow_real_sdk_end_to_end_run_and_build(
     monkeypatch.setenv("WORKFLOW_PUBLIC_MANIFEST", "1")
     monkeypatch.delenv("WORKFLOW_SEQUENTIAL_REPLAYS", raising=False)
 
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": (
@@ -1819,7 +1811,6 @@ def test_workflow_real_sdk_end_to_end_run_and_build(
     )
 
     app = create_app(project / "app")
-    assert app.workflows_mounted is True
 
     async def run_end_to_end() -> tuple[Any, Any, Any, Any]:
         in_q: asyncio.Queue[Message] = asyncio.Queue()
@@ -1877,7 +1868,7 @@ def test_workflow_real_sdk_end_to_end_run_and_build(
 
 # @lat: [[tests#Vercel Workflows#Ignores unrelated queue subscribers]]
 def test_workflow_ignores_unrelated_queue_subscriber_on_step_topic(
-    tmp_path: Path, monkeypatch: Any, isolated_sys_path: Any
+    tmp_path: Path, monkeypatch: Any, isolated_project_imports: Any
 ):
     """Real-SDK regression test: an unrelated @vercel.queue.subscribe on
     `__review_wkf_step_*` must NOT be attributed to Workflows(namespace="review")."""
@@ -1886,7 +1877,7 @@ def test_workflow_ignores_unrelated_queue_subscriber_on_step_topic(
     monkeypatch.setenv("WORKFLOW_LOCAL_DATA_DIR", str(tmp_path / ".wf-review"))
     monkeypatch.delenv("WORKFLOW_SEQUENTIAL_REPLAYS", raising=False)
 
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": (
@@ -1930,7 +1921,10 @@ def test_workflow_ignores_unrelated_queue_subscriber_on_step_topic(
 
 # @lat: [[tests#Vercel Workflows#Real SDK shape local dev and build]]
 def test_workflow_real_sdk_shape_local_dev_and_build(
-    tmp_path: Path, monkeypatch: Any, isolated_sys_path: Any
+    tmp_path: Path,
+    monkeypatch: Any,
+    isolated_project_imports: Any,
+    stub_build_install: Any,
 ):
     """Tests the real vercel-workflow SDK API shape: Workflows(namespace=...),
     http_handler(HTTPRequest) -> HTTPResponse, manifest_handler, ENDPOINT_PATH,
@@ -2040,8 +2034,8 @@ def test_workflow_real_sdk_shape_local_dev_and_build(
     monkeypatch.setitem(sys.modules, "vercel.workflow._internal.world", fake_wf_world)
     monkeypatch.setitem(sys.modules, "vercel.queue", fake_queue)
 
-    project = write_files(
-        tmp_path,
+    project = write_project(
+        tmp_path / "proj",
         {
             "pyproject.toml": (
                 '[project]\nname = "wfsdk"\nversion = "0.1.0"\n'
@@ -2060,7 +2054,6 @@ def test_workflow_real_sdk_shape_local_dev_and_build(
     )
 
     app = create_app(project / "app")
-    assert app.workflows_mounted is True
     client = make_client(app)
     assert client("GET", "/").json() == {"app": "ok"}
 
@@ -2136,7 +2129,9 @@ def test_workflow_real_sdk_shape_local_dev_and_build(
             consumer_group="default",
         )
     )
-    plan_with_step = plan_build(project, python="3.12", platform=None)
+    plan_with_step = plan_build(
+        project, python="3.12", platform=None, output=tmp_path / "emitted_out"
+    )
     by_name_step = {f.name: f for f in plan_with_step.functions}
     assert by_name_step[".well-known/workflow/v1/step"].vc_config[
         "experimentalTriggers"
@@ -2170,22 +2165,118 @@ def test_workflow_real_sdk_shape_local_dev_and_build(
     monkeypatch.setitem(sys.modules, "vercel_runtime", fake_vr)
     monkeypatch.setitem(sys.modules, "vercel_runtime.workers", fake_workers)
 
-    flow_app = create_workflow_flow_app(["wf_test_real:default_wf"])
-    step_app = create_workflow_step_app(["wf_test_real:default_wf"])
-    assert make_client(flow_app)("POST", "/.well-known/workflow/v1/flow").json() == {
+    wf_app = create_workflow_app(["wf_test_real:default_wf"])
+    assert make_client(wf_app)("POST", "/.well-known/workflow/v1/flow").json() == {
         "served_by": "create_queue_service_app"
     }
-    assert make_client(step_app)("POST", "/.well-known/workflow/v1/step").json() == {
+    assert make_client(wf_app)("POST", "/.well-known/workflow/v1/step").json() == {
         "served_by": "create_queue_service_app"
     }
+
+    stub_build_install(
+        {
+            **make_dist("chano", "chano"),
+            **make_dist("vercel-runtime", "vercel_runtime"),
+            **make_dist("vercel-workflow", "vercel/workflow"),
+            **make_dist("vercel-queue", "vercel/queue"),
+        }
+    )
+    emitted_out = emit_build(plan_with_step)
+    shutil.rmtree(project)
+
+    runner = (
+        "import asyncio, json, sys, types, httpx\n"
+        "from dataclasses import dataclass\n"
+        "@dataclass\n"
+        "class FakeHTTPResponse:\n"
+        "    status: int\n"
+        "    body: bytes\n"
+        "    headers: dict[str, str]\n"
+        "class FakeWorkflows:\n"
+        "    def __init__(self, *, namespace=None):\n"
+        "        self.namespace = namespace\n"
+        "    @property\n"
+        "    def http_handler(self):\n"
+        "        ns = self.namespace\n"
+        "        async def handle(request):\n"
+        '            body = b"".join([c async for c in request.aiter_bytes()])\n'
+        "            return FakeHTTPResponse(\n"
+        "                200,\n"
+        "                json.dumps({\n"
+        '                    "namespace": ns,\n'
+        '                    "method": request.method,\n'
+        '                    "url": request.url,\n'
+        '                    "queue": request.headers.get("x-vqs-queue-name"),\n'
+        '                    "body": json.loads(body) if body else None,\n'
+        "                }).encode(),\n"
+        '                {"content-type": "application/json"},\n'
+        "            )\n"
+        "        return handle\n"
+        'fake_vercel = types.ModuleType("vercel")\n'
+        'fake_wf = types.ModuleType("vercel.workflow")\n'
+        "fake_wf.Workflows = FakeWorkflows\n"
+        "fake_vercel.workflow = fake_wf\n"
+        'sys.modules["vercel"] = fake_vercel\n'
+        'sys.modules["vercel.workflow"] = fake_wf\n'
+        'sys.modules["vercel_runtime"] = None\n'
+        'sys.modules["vercel_runtime.workers"] = None\n'
+        "import index\n"
+        "func_kind, queue_name = sys.argv[1], sys.argv[2]\n"
+        "async def run():\n"
+        "    async with httpx.AsyncClient(\n"
+        "        transport=httpx.ASGITransport(app=index.app),\n"
+        '        base_url="http://test",\n'
+        "    ) as client:\n"
+        "        r = await client.post(\n"
+        '            f"/.well-known/workflow/v1/{func_kind}",\n'
+        '            json={"run": func_kind},\n'
+        '            headers={"x-vqs-queue-name": queue_name},\n'
+        "        )\n"
+        '        print(json.dumps({"status": r.status_code, "body": r.json()}))\n'
+        "asyncio.run(run())\n"
+    )
+    for func_kind, queue_name in (
+        ("flow", "__payments_wkf_workflow_emitted"),
+        ("step", "__payments_wkf_step_emitted"),
+    ):
+        func_dir = (
+            emitted_out
+            / "functions"
+            / ".well-known"
+            / "workflow"
+            / "v1"
+            / f"{func_kind}.func"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", runner, func_kind, queue_name],
+            cwd=func_dir,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert proc.returncode == 0, proc.stderr
+        payload = json.loads(proc.stdout.strip().splitlines()[-1])
+        assert payload == {
+            "status": 200,
+            "body": {
+                "namespace": "payments",
+                "method": "POST",
+                "url": f"/.well-known/workflow/v1/{func_kind}",
+                "queue": queue_name,
+                "body": {"run": func_kind},
+            },
+        }
 
 
 # @lat: [[tests#Combined Vercel primitives]]
 def test_combined_build_with_all_primitives(
-    tmp_path: Path, monkeypatch: Any, isolated_sys_path: Any
+    tmp_path: Path,
+    monkeypatch: Any,
+    isolated_project_imports: Any,
+    stub_build_install: Any,
 ):
     monkeypatch.setenv("WORKFLOW_LOCAL_DATA_DIR", str(tmp_path / ".wf-data"))
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": (
@@ -2208,22 +2299,15 @@ def test_combined_build_with_all_primitives(
         },
     )
 
-    def fake_install(_root: Path, vendor_dir: Path, *_args: Any) -> None:
-        write_files(
-            vendor_dir,
-            _fake_store_files(
-                {
-                    "chano": {"chano/__init__.py": ""},
-                    "vercel-runtime": {"vercel_runtime/__init__.py": ""},
-                    "vercel-queue": {"vercel/queue/__init__.py": ""},
-                    "vercel-workflow": {"vercel/workflow/__init__.py": ""},
-                }
-            ),
-        )
-
     monkeypatch.delenv("WORKFLOW_SEQUENTIAL_REPLAYS", raising=False)
-    monkeypatch.setattr(build_module, "_install_dependencies", fake_install)
-    monkeypatch.setattr(build_module, "_check_function_imports", lambda *args: None)
+    stub_build_install(
+        {
+            **make_dist("chano", "chano"),
+            **make_dist("vercel-runtime", "vercel_runtime"),
+            **make_dist("vercel-queue", "vercel/queue"),
+            **make_dist("vercel-workflow", "vercel/workflow"),
+        }
+    )
 
     out = build(project, platform=None, output=tmp_path / "out")
     flow_cfg = json.loads(
@@ -2269,9 +2353,12 @@ def test_combined_build_with_all_primitives(
 
 # @lat: [[tests#Boundary#HTTP-only boundary scoping for queues and schedules]]
 def test_boundary_is_http_only_for_routes_queues_and_schedules(
-    tmp_path: Path, monkeypatch: Any, isolated_sys_path: Any
+    tmp_path: Path,
+    monkeypatch: Any,
+    isolated_project_imports: Any,
+    stub_build_install: Any,
 ):
-    project = write_files(
+    project = write_project(
         tmp_path,
         {
             "pyproject.toml": '[project]\nname = "httpbound"\nversion = "0.1.0"\n',
@@ -2426,24 +2513,19 @@ def test_boundary_is_http_only_for_routes_queues_and_schedules(
 
     # 4. Build tracing: route traces boundary.py and bundles boundary-only-pkg;
     # queue and schedule do not trace boundary.py or bundle boundary-only-pkg.
-    def fake_install(_workspace, vendor_dir, _python, _platform, _package=None):
-        write_files(
-            vendor_dir,
-            _fake_store_files(
-                {
-                    "chano": {"chano/__init__.py": "X = 1\n"},
-                    "vercel-runtime": {"vercel_runtime/__init__.py": ""},
-                    "vercel": {"vercel/__init__.py": ""},
-                    "vercel-queue": {"vercel_queue/__init__.py": ""},
-                    "boundary-only-pkg": {
-                        "boundary_only_pkg/__init__.py": 'TAG = "yes"\n'
-                    },
-                }
+    stub_build_install(
+        {
+            **make_dist("chano", "chano", extra_files={"chano/__init__.py": "X = 1\n"}),
+            **make_dist("vercel-runtime", "vercel_runtime"),
+            **make_dist("vercel", "vercel"),
+            **make_dist("vercel-queue", "vercel_queue"),
+            **make_dist(
+                "boundary-only-pkg",
+                "boundary_only_pkg",
+                extra_files={"boundary_only_pkg/__init__.py": 'TAG = "yes"\n'},
             ),
-        )
-
-    monkeypatch.setattr(build_module, "_install_dependencies", fake_install)
-    monkeypatch.setattr(build_module, "_check_function_imports", lambda *args: None)
+        }
+    )
 
     plan = plan_build(project, python="3.12", platform=None)
     by_name = {f.name: f for f in plan.functions}
@@ -2478,7 +2560,7 @@ def test_boundary_is_http_only_for_routes_queues_and_schedules(
 
     # 5. Private entrypoints never even import ancestor boundary.py (create_app is
     # never called on this project, and app/boundary.py raises at import time).
-    private_project = write_files(
+    private_project = write_project(
         tmp_path / "private_only",
         {
             "pyproject.toml": '[project]\nname = "privonly"\nversion = "0.1.0"\n',
@@ -2550,3 +2632,358 @@ def test_boundary_is_http_only_for_routes_queues_and_schedules(
         create_schedule_app(private_app_dir, "_schedules/nightly")
     )
     assert deployed_s_client("POST", "/_schedules/nightly").json() == {"nightly": True}
+
+
+# @lat: [[tests#Vercel Workflows#Multi-namespace step topic routing]]
+def test_workflow_multi_namespace_step_prefix_routing(
+    tmp_path: Path, monkeypatch: Any, isolated_project_imports: Any
+):
+    write_project(
+        tmp_path,
+        {
+            "wf_test_step_routing.py": (
+                "import json\n"
+                "from types import SimpleNamespace\n"
+                "\n"
+                "class FakeRegistry:\n"
+                "    def __init__(self, namespace=None):\n"
+                "        self.namespace = namespace\n"
+                "\n"
+                "    async def http_handler(self, req):\n"
+                "        chunks = [c async for c in req.aiter_bytes()]\n"
+                "        return SimpleNamespace(\n"
+                "            status=200,\n"
+                '            headers={"content-type": "application/json"},\n'
+                "            body=json.dumps({\n"
+                '                "namespace": self.namespace,\n'
+                '                "queue": req.headers.get("x-vqs-queue-name"),\n'
+                '                "body": json.loads(b"".join(chunks) or b"{}"),\n'
+                "            }).encode(),\n"
+                "        )\n"
+                "\n"
+                "default_wf = FakeRegistry()\n"
+                'payments_wf = FakeRegistry(namespace="payments")\n'
+            ),
+        },
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setitem(sys.modules, "vercel_runtime", None)
+    monkeypatch.setitem(sys.modules, "vercel_runtime.workers", None)
+
+    app = create_workflow_app(
+        ["wf_test_step_routing:default_wf", "wf_test_step_routing:payments_wf"]
+    )
+    client = make_client(app)
+
+    flow_resp = client(
+        "POST",
+        "/.well-known/workflow/v1/flow",
+        json={"kind": "flow"},
+        headers={"x-vqs-queue-name": "__payments_wkf_workflow_1"},
+    )
+    assert flow_resp.status_code == 200
+    assert flow_resp.json()["namespace"] == "payments"
+
+    step_resp = client(
+        "POST",
+        "/.well-known/workflow/v1/step",
+        json={"kind": "step"},
+        headers={"x-vqs-queue-name": "__payments_wkf_step_1"},
+    )
+    assert step_resp.status_code == 200
+    assert step_resp.json()["namespace"] == "payments"
+
+    messages = iter([{"type": "websocket.receive"}, {"type": "http.disconnect"}])
+
+    async def receive() -> Message:
+        return next(messages)
+
+    async def send(_message: Message) -> None:
+        pass
+
+    scope: dict[str, Any] = {
+        "type": "http",
+        "method": "POST",
+        "path": "/.well-known/workflow/v1/flow",
+        "query_string": b"",
+        "headers": [],
+    }
+
+    async def invoke_raw() -> None:
+        await app(scope, receive, send)
+
+    with pytest.raises(ValueError, match="unexpected ASGI message"):
+        asyncio.run(invoke_raw())
+
+
+# @lat: [[tests#Vercel Queues#Consumer lookup strips whitespace]]
+def test_queue_consumer_lookup_strips_whitespace(tmp_path: Path):
+    project = write_project(
+        tmp_path,
+        {
+            "app/orders/queue.py": (
+                'topic = "orders"\n'
+                'consumer = " default "\n'
+                'def CONSUME(item_id: int):\n    return {"item_id": item_id}\n'
+            ),
+        },
+    )
+    result = asyncio.run(
+        invoke_queue(project / "app", "orders", 7, consumer=" default ")
+    )
+    assert result == {"item_id": 7}
+    assert asyncio.run(
+        invoke_queue(project / "app", "orders", 8, consumer="default")
+    ) == {"item_id": 8}
+
+
+# @lat: [[tests#Vercel Workflows#Namespace validation and prefix fallback]]
+@pytest.mark.parametrize(
+    "bad_ns",
+    ["", "1abc", "Upper", "a-b", "a_b"],
+    ids=["empty", "leading-digit", "uppercase", "hyphen", "underscore"],
+)
+def test_workflow_rejects_invalid_namespace(bad_ns: str):
+    with pytest.raises(ValueError, match="Invalid queue namespace"):
+        validate_workflow_namespace(bad_ns)
+    with pytest.raises(ValueError, match="Invalid queue namespace"):
+        get_workflow_topic_prefix(bad_ns)
+    with pytest.raises(ValueError, match="Invalid queue namespace"):
+        get_step_topic_prefix(bad_ns)
+
+
+# @lat: [[tests#Vercel Workflows#Topic prefix fallback and concurrency]]
+def test_workflow_prefix_fallback_and_flow_trigger_concurrency(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setitem(sys.modules, "vercel.workflow._internal.world", None)
+    assert get_workflow_topic_prefix() == "__wkf_workflow_"
+    assert get_workflow_topic_prefix("billing") == "__billing_wkf_workflow_"
+
+    trigger = workflow_flow_trigger(max_concurrency=4, sequential_replays=False)
+    assert trigger["maxConcurrency"] == 4
+
+
+# @lat: [[tests#Vercel Workflows#Src trace roots and missing attribute]]
+def test_workflow_trace_roots_src_layout_and_missing_attr(
+    tmp_path: Path, isolated_project_imports: Any
+):
+    project = write_project(
+        tmp_path / "src_wf",
+        {
+            "src/my_wf/__init__.py": "wf = object()\n",
+        },
+    )
+    roots = resolve_workflow_trace_roots([WorkflowConfig("my_wf:wf")], project)
+    assert roots == ((project / "src" / "my_wf" / "__init__.py").resolve(),)
+
+    with pytest.raises(AttributeError, match="attribute 'does_not_exist' not found"):
+        load_workflow_entrypoint("chano.workflows:does_not_exist")
+
+
+# @lat: [[tests#Vercel Workflows#Trigger introspection error paths]]
+def test_workflow_introspection_error_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_project_imports: Any
+):
+    project = write_project(
+        tmp_path / "wf_errs",
+        {
+            "wf_missing_sdk.py": "import vercel.workflow\nwf = object()\n",
+            "wf_missing_user_dep.py": "import no_such_user_dep_xyz\nwf = object()\n",
+            "wf_bad_ns.py": (
+                "class _Reg:\n"
+                "    namespace = 123\n"
+                "    async def http_handler(self, req):\n"
+                "        return None\n"
+                "wf = _Reg()\n"
+            ),
+            "wf_no_subs.py": (
+                "class _Reg:\n"
+                '    namespace = "orphan"\n'
+                "    async def http_handler(self, req):\n"
+                "        return None\n"
+                "wf = _Reg()\n"
+            ),
+        },
+    )
+
+    monkeypatch.setitem(sys.modules, "vercel.queue", types.ModuleType("vercel.queue"))
+    with pytest.raises(RuntimeError, match="does not expose get_subscriptions"):
+        introspect_workflow_triggers([WorkflowConfig("wf_no_subs:wf")], project)
+
+    fake_queue: Any = types.ModuleType("vercel.queue")
+    fake_queue.get_subscriptions = lambda: []
+    monkeypatch.setitem(sys.modules, "vercel.queue", fake_queue)
+    monkeypatch.setitem(sys.modules, "vercel.workflow", None)
+    with pytest.raises(RuntimeError, match="'vercel-workflow' is not installed"):
+        introspect_workflow_triggers([WorkflowConfig("wf_missing_sdk:wf")], project)
+
+    with pytest.raises(ModuleNotFoundError, match="no_such_user_dep_xyz"):
+        introspect_workflow_triggers(
+            [WorkflowConfig("wf_missing_user_dep:wf")], project
+        )
+
+    with pytest.raises(ValueError, match="invalid namespace"):
+        introspect_workflow_triggers([WorkflowConfig("wf_bad_ns:wf")], project)
+
+    with pytest.raises(
+        RuntimeError, match=r"did not register any vercel\.queue subscription"
+    ):
+        introspect_workflow_triggers([WorkflowConfig("wf_no_subs:wf")], project)
+
+
+# @lat: [[tests#Vercel Workflows#ASGI adapter lifespan and chunking]]
+def test_workflow_asgi_adapter_lifespan_chunking_disconnect_and_str_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_project_imports: Any
+):
+    project = write_project(
+        tmp_path / "wf_asgi",
+        {
+            "wf_asgi_mod.py": (
+                "from dataclasses import dataclass, field\n"
+                "@dataclass\n"
+                "class _Resp:\n"
+                "    status: int\n"
+                "    body: str\n"
+                "    headers: dict[str, str] = field(default_factory=dict)\n"
+                "class _Reg:\n"
+                "    namespace = None\n"
+                "    async def http_handler(self, req):\n"
+                "        chunks = [c async for c in req.aiter_bytes(chunk_size=3)]\n"
+                '        joined = "café:" + "|".join(c.decode() for c in chunks)\n'
+                '        return _Resp(200, joined, {"x-ok": "1"})\n'
+                "wf = _Reg()\n"
+            ),
+        },
+    )
+    sys.path.insert(0, str(project))
+    monkeypatch.setitem(sys.modules, "vercel_runtime.workers", None)
+    app = create_workflow_app(["wf_asgi_mod:wf"])
+
+    async def run_asgi(scope: dict[str, Any], receive: Any, send: Any) -> None:
+        await app(scope, receive, send)
+
+    lifespan_msgs = iter([{"type": "lifespan.startup"}, {"type": "lifespan.shutdown"}])
+    lifespan_sent: list[Message] = []
+
+    async def lifespan_receive() -> Message:
+        return next(lifespan_msgs)
+
+    async def lifespan_send(msg: Message) -> None:
+        lifespan_sent.append(msg)
+
+    asyncio.run(run_asgi({"type": "lifespan"}, lifespan_receive, lifespan_send))
+    assert lifespan_sent == [
+        {"type": "lifespan.startup.complete"},
+        {"type": "lifespan.shutdown.complete"},
+    ]
+
+    ws_sent: list[Message] = []
+
+    async def ws_send(msg: Message) -> None:
+        ws_sent.append(msg)
+
+    asyncio.run(run_asgi({"type": "websocket"}, lifespan_receive, ws_send))
+    assert ws_sent == []
+
+    client = make_client(app)
+    resp = client("POST", "/.well-known/workflow/v1/flow", content=b"abcdefg")
+    assert resp.status_code == 200
+    assert resp.headers["x-ok"] == "1"
+    assert resp.content == "café:abc|def|g".encode()
+
+    disc_msgs = iter(
+        [
+            {"type": "http.request", "body": b"hi", "more_body": True},
+            {"type": "http.disconnect"},
+        ]
+    )
+    disc_sent: list[Message] = []
+
+    async def disc_receive() -> Message:
+        return next(disc_msgs)
+
+    async def disc_send(msg: Message) -> None:
+        disc_sent.append(msg)
+
+    asyncio.run(
+        run_asgi(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/.well-known/workflow/v1/flow",
+                "query_string": b"",
+                "headers": [],
+            },
+            disc_receive,
+            disc_send,
+        )
+    )
+    assert disc_sent[0]["status"] == 200
+    assert disc_sent[1]["body"] == "café:hi".encode()
+
+
+# @lat: [[tests#Vercel Workflows#Dev mount edge cases]]
+def test_workflow_mount_workflows_edge_cases(
+    tmp_path: Path, isolated_project_imports: Any
+):
+    project = write_project(
+        tmp_path / "wf_mount",
+        {
+            "wf_non_serving.py": (
+                "class _Reg:\n"
+                "    @property\n"
+                "    def http_handler(self):\n"
+                '        raise RuntimeError("not serving")\n'
+                "wf = _Reg()\n"
+            ),
+            "wf_bad_dep.py": "import no_such_mount_dep_xyz\nwf = object()\n",
+            "wf_no_manifest.py": (
+                "from dataclasses import dataclass, field\n"
+                "@dataclass\n"
+                "class _Resp:\n"
+                "    status: int\n"
+                "    body: bytes\n"
+                "    headers: dict[str, str] = field(default_factory=dict)\n"
+                "class _Reg:\n"
+                "    namespace = None\n"
+                "    async def http_handler(self, req):\n"
+                '        return _Resp(200, b"flow-ok")\n'
+                "    @property\n"
+                "    def manifest_handler(self):\n"
+                '        raise RuntimeError("no manifest")\n'
+                "wf = _Reg()\n"
+            ),
+        },
+    )
+
+    assert mount_workflows(Chano(docs=False), []) is False
+
+    app_ns = Chano(docs=False)
+    assert (
+        mount_workflows(
+            app_ns, [WorkflowConfig("wf_non_serving:wf")], project_root=project
+        )
+        is False
+    )
+    client_ns = make_client(app_ns)
+    assert client_ns("POST", "/.well-known/workflow/v1/flow").status_code == 404
+    assert client_ns("GET", "/.well-known/workflow/v1/manifest.json").status_code == 404
+
+    with pytest.raises(ModuleNotFoundError, match="no_such_mount_dep_xyz"):
+        mount_workflows(
+            Chano(docs=False),
+            [WorkflowConfig("wf_bad_dep:wf")],
+            project_root=project,
+        )
+
+    app_nm = Chano(docs=False)
+    assert (
+        mount_workflows(
+            app_nm, [WorkflowConfig("wf_no_manifest:wf")], project_root=project
+        )
+        is True
+    )
+    client = make_client(app_nm)
+    assert client("POST", "/.well-known/workflow/v1/flow").text == "flow-ok"
+    assert client("GET", "/.well-known/workflow/v1/manifest.json").status_code == 404

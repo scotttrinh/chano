@@ -10,6 +10,7 @@
 ## Useful commands
 
 - uv run pytest
+- uv run pytest -m "not slow"
 - uv run ty check
 - uv run ruff check .
 - uv run ruff format --check src tests examples site/build.py

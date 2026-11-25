@@ -4,8 +4,8 @@ Each ``queue.py`` module exports a ``CONSUME`` handler (sync or async) and
 module-level ``topic`` (required), plus optional queue tuning:
 
 - ``consumer`` (str, default ``"default"``)
-- ``retry_after`` (int >= 0 -> ``retryAfterSeconds``)
-- ``initial_delay`` (int >= 0 -> ``initialDelaySeconds``)
+- ``retry_after`` (int in ``1..86400`` -> ``retryAfterSeconds``)
+- ``initial_delay`` (int in ``0..86400`` -> ``initialDelaySeconds``)
 - ``max_concurrency`` (int >= 1 -> ``maxConcurrency``)
 
 Plus the standard Vercel function options (``max_duration``, ``memory``,
@@ -22,12 +22,10 @@ preserve retry semantics.
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import importlib
 import logging
 import re
-import sys
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,18 +34,25 @@ from typing import Any, cast
 
 import msgspec
 
+from chano._primitives import (
+    discover_app_files,
+    handle_noop_lifespan,
+    headers_from_scope,
+    load_module,
+    synthetic_post_request,
+    try_import_optional,
+    validate_handler,
+)
 from chano._pydantic import enc_hook as _pydantic_enc_hook
 from chano.app import (
     AfterBackend,
     ASGIApp,
     EndpointASGIApp,
-    _after_state,
-    _AfterState,
+    _after_scope,
 )
-from chano.params import Endpoint, is_generator_callable
-from chano.requests import Message, Receive, Request, Scope, Send
+from chano.params import Endpoint
+from chano.requests import Receive, Request, Scope, Send
 from chano.responses import Failure, PlainTextResponse, Response
-from chano.routing import load_module
 
 QUEUE_FILE = "queue.py"
 QUEUE_FUNCTION_PREFIX = "_queues"
@@ -110,37 +115,12 @@ class LoadedQueue:
     module: ModuleType
 
 
-def _queue_consumer(app_dir: Path, queue_file: Path) -> QueueConsumer:
-    parts = queue_file.parent.relative_to(app_dir).parts
-    function_parts: list[str] = []
-    for part in parts:
-        if part.startswith("(") and part.endswith(")"):
-            continue
-        if part.startswith("[") and part.endswith("]"):
-            raise ValueError(
-                f"invalid queue path {queue_file}: queue.py cannot live inside "
-                f"dynamic segment {part!r}"
-            )
-        function_parts.append(part)
-    suffix = "/".join(function_parts) or "index"
-    return QueueConsumer(
-        file=queue_file,
-        function=f"{QUEUE_FUNCTION_PREFIX}/{suffix}",
-    )
-
-
 def discover_queues(app_dir: str | Path) -> list[QueueConsumer]:
     """Find all ``queue.py`` consumers under ``app_dir``, sorted deterministically."""
-    app_path = Path(app_dir).resolve()
-    if not app_path.is_dir():
-        raise FileNotFoundError(f"app directory not found: {app_path}")
-
-    project_root = str(app_path.parent)
-    if project_root not in sys.path:
-        sys.path.insert(0, project_root)
-
-    queues = [_queue_consumer(app_path, file) for file in app_path.rglob(QUEUE_FILE)]
-    return sorted(queues, key=lambda q: (q.function, q.file))
+    return [
+        QueueConsumer(file=file, function=f"{QUEUE_FUNCTION_PREFIX}/{suffix}")
+        for suffix, file in discover_app_files(app_dir, QUEUE_FILE, label="queue")
+    ]
 
 
 def sanitize_queue_name(name: str) -> str:
@@ -239,17 +219,9 @@ def read_queue_trigger(module: ModuleType, file: Path) -> QueueTrigger:
 def load_queue(queue: QueueConsumer) -> LoadedQueue:
     """Import ``queue`` and validate its ``CONSUME`` handler and trigger config."""
     module = queue.load()
-    handler = getattr(module, "CONSUME", None)
-    if not callable(handler):
-        raise TypeError(
-            f"invalid `CONSUME` in {queue.file}: expected a callable handler, "
-            f"got {handler!r}"
-        )
-    if is_generator_callable(handler):
-        raise TypeError(
-            f"invalid `CONSUME` in {queue.file}: generator functions are not "
-            "supported as queue consumers"
-        )
+    handler = validate_handler(
+        module, "CONSUME", queue.file, kind_plural="queue consumers"
+    )
     trigger = read_queue_trigger(module, queue.file)
     endpoint = Endpoint(handler, set(), default_source="body")
     return LoadedQueue(
@@ -322,7 +294,7 @@ def resolve_queues(
     to each ``queue.py``'s ``consumer`` declaration).
     """
     normalized_consumer = (
-        sanitize_queue_name(consumer) if consumer is not None else None
+        sanitize_queue_name(consumer.strip()) if consumer is not None else None
     )
     matches = [
         q
@@ -353,38 +325,18 @@ def _synthetic_queue_request(
     *,
     topic: str | None = None,
 ) -> Request:
-    merged: dict[str, str] = {
+    default_headers = {
         "content-type": "application/json",
         "ce-type": "com.vercel.queue.v2beta",
         "ce-vqsqueuename": topic or loaded.trigger.topic,
         "ce-vqsconsumergroup": loaded.trigger.consumer,
     }
-    if headers:
-        for key, value in headers.items():
-            merged[key.lower()] = value
-    scope: Scope = {
-        "type": "http",
-        "asgi": {"version": "3.0"},
-        "http_version": "1.1",
-        "method": "POST",
-        "scheme": "http",
-        "path": f"/{loaded.spec.function}",
-        "raw_path": f"/{loaded.spec.function}".encode(),
-        "query_string": b"",
-        "headers": [
-            (k.encode("latin-1"), v.encode("latin-1")) for k, v in merged.items()
-        ],
-    }
-    sent = False
-
-    async def receive() -> Message:
-        nonlocal sent
-        if not sent:
-            sent = True
-            return {"type": "http.request", "body": body, "more_body": False}
-        return {"type": "http.disconnect"}
-
-    return Request(scope, receive)
+    return synthetic_post_request(
+        f"/{loaded.spec.function}",
+        body=body,
+        default_headers=default_headers,
+        headers=headers,
+    )
 
 
 async def invoke_loaded_queue(
@@ -397,20 +349,8 @@ async def invoke_loaded_queue(
     """Invoke a ``LoadedQueue`` with ``payload`` and local ``after()`` support."""
     body = _encode_payload(payload)
     request = _synthetic_queue_request(loaded, body, headers, topic=topic)
-    after_state = _AfterState("local")
-    token = _after_state.set(after_state)
-    cancelled = False
-    try:
+    async with _after_scope("local"):
         return await loaded.endpoint.call(request)
-    except asyncio.CancelledError:
-        cancelled = True
-        raise
-    finally:
-        tasks = after_state.close_and_take()
-        _after_state.reset(token)
-        if not cancelled:
-            for task in tasks:
-                await task()
 
 
 async def invoke_resolved_queues(
@@ -511,10 +451,7 @@ def _make_queue_subscriber(
         headers = _headers_from_message_metadata(metadata)
         body = _encode_payload(payload)
         request = _synthetic_queue_request(loaded, body, headers)
-        after_state = _AfterState(after_backend)
-        token = _after_state.set(after_state)
-        cancelled = False
-        try:
+        async with _after_scope(after_backend):
             result = await loaded.endpoint.call(request)
             if isinstance(result, Failure):
                 raise result
@@ -523,15 +460,6 @@ def _make_queue_subscriber(
                     f"queue consumer {loaded.spec.function!r} returned error "
                     f"status {result.status_code}"
                 )
-        except asyncio.CancelledError:
-            cancelled = True
-            raise
-        finally:
-            tasks = after_state.close_and_take()
-            _after_state.reset(token)
-            if not cancelled:
-                for task in tasks:
-                    await task()
 
     subscriber.__name__ = f"chano_queue_{loaded.spec.function.replace('/', '_')}"
     subscriber.__annotations__ = {"message": message_annotation, "return": None}
@@ -587,13 +515,6 @@ def _register_vercel_queue_subscriber(
     return subscriber
 
 
-def _headers_from_scope(scope: Scope) -> dict[str, str]:
-    headers: dict[str, str] = {}
-    for raw_k, raw_v in scope.get("headers", ()):
-        headers[raw_k.decode("latin-1").lower()] = raw_v.decode("latin-1")
-    return headers
-
-
 def _is_vercel_queue_delivery(headers: Mapping[str, str]) -> bool:
     ce_type = headers.get("ce-type", "")
     return (
@@ -643,11 +564,8 @@ class _VercelQueueCallbackASGIApp:
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "lifespan":
-            while True:
-                msg = await receive()
-                await send({"type": f"{msg['type']}.complete"})
-                if msg["type"] == "lifespan.shutdown":
-                    return
+            await handle_noop_lifespan(receive, send)
+            return
         if scope["type"] != "http":
             return
         if scope.get("method") != "POST":
@@ -659,7 +577,7 @@ class _VercelQueueCallbackASGIApp:
         ):
             headers = self._headers_module.headers_from_asgi_scope(scope)
         else:
-            headers = _headers_from_scope(scope)
+            headers = headers_from_scope(scope)
 
         ctx = (
             self._headers_module.HeadersContext(headers).use()
@@ -693,7 +611,7 @@ class _LocalQueueASGIApp:
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "http" and _is_vercel_queue_delivery(
-            _headers_from_scope(scope)
+            headers_from_scope(scope)
         ):
             response = PlainTextResponse(
                 "vercel-queue is required to accept and acknowledge Vercel Queue "
@@ -703,17 +621,6 @@ class _LocalQueueASGIApp:
             await response(receive, send)
             return
         await self._inner(scope, receive, send)
-
-
-def _try_import_optional(name: str) -> Any | None:
-    try:
-        return importlib.import_module(name)
-    except ModuleNotFoundError as exc:
-        missing = exc.name or ""
-        top = name.split(".", 1)[0]
-        if missing == top or missing.startswith(f"{top}."):
-            return None
-        raise
 
 
 class _BoundQueueASGIApp:
@@ -747,12 +654,12 @@ def create_queue_app(
     for queue in discover_queues(app_dir):
         if queue.function == function:
             loaded = load_queue(queue)
-            queue_module = _try_import_optional("vercel.queue")
+            queue_module = try_import_optional("vercel.queue")
             if queue_module is not None and hasattr(queue_module, "subscribe"):
                 subscriber = _register_vercel_queue_subscriber(
                     queue_module, loaded, after_backend
                 )
-                workers_module = _try_import_optional("vercel_runtime.workers")
+                workers_module = try_import_optional("vercel_runtime.workers")
                 if workers_module is not None and hasattr(
                     workers_module, "create_queue_service_app"
                 ):

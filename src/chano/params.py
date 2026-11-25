@@ -25,7 +25,7 @@ import threading
 import types
 from collections.abc import Awaitable, Callable, Coroutine, Iterator, Sequence
 from dataclasses import dataclass
-from typing import Annotated, Any, get_args, get_origin, overload
+from typing import Annotated, Any, Union, get_args, get_origin, overload
 
 import msgspec
 
@@ -37,7 +37,7 @@ from chano._pydantic import (
 )
 from chano.exceptions import RequestValidationError
 from chano.requests import Request
-from chano.responses import Response
+from chano.responses import Response, _unwrap_type
 from chano.security import HTTPBearer
 
 _MISSING: Any = object()
@@ -228,10 +228,20 @@ class Field:
 
     @property
     def is_list(self) -> bool:
-        annotation = self.annotation
-        if get_origin(annotation) is Annotated:
-            annotation = get_args(annotation)[0]
-        return get_origin(annotation) in (list, set, tuple)
+        return _is_list_type(self.annotation)
+
+
+def _is_list_type(annotation: Any) -> bool:
+    annotation = _unwrap_type(annotation)
+    origin = get_origin(annotation)
+    if origin in (Union, types.UnionType):
+        non_none = [
+            arg
+            for arg in get_args(annotation)
+            if _unwrap_type(arg) not in (None, type(None))
+        ]
+        return bool(non_none) and all(_is_list_type(arg) for arg in non_none)
+    return origin in (list, set, tuple) or annotation in (list, set, tuple)
 
 
 def _key(func: Callable[..., Any]) -> Any:
@@ -454,6 +464,8 @@ class Endpoint:
                 )
                 kwargs[field.name] = _or_default(field, value, ["body"], errors)
             elif field.source == "body":
+                if body is None:
+                    continue
                 raw = (
                     body.get(field.alias, _MISSING) if isinstance(body, dict) else body
                 )

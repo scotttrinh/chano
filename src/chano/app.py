@@ -10,15 +10,16 @@ import re
 import sys
 import traceback
 import types
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Union, get_args, get_origin
 
+from chano._primitives import handle_noop_lifespan
 from chano.config import WorkflowConfig, normalize_base_path
 from chano.openapi import openapi_info, openapi_schema, swagger_html
-from chano.params import Endpoint
+from chano.params import Endpoint, _is_async
 from chano.requests import Receive, Request, Scope, Send
 from chano.responses import (
     Failure,
@@ -86,6 +87,33 @@ class _AfterState:
 _after_state: ContextVar[_AfterState | None] = ContextVar(
     "chano_after_state", default=None
 )
+
+
+def _validate_after_backend(after_backend: AfterBackend) -> AfterBackend:
+    if after_backend not in _AFTER_BACKENDS:
+        raise ValueError(
+            f"unknown after_backend {after_backend!r}: "
+            f"expected one of {_AFTER_BACKENDS}"
+        )
+    return after_backend
+
+
+@contextlib.asynccontextmanager
+async def _after_scope(backend: AfterBackend) -> AsyncGenerator[None]:
+    after_state = _AfterState(backend)
+    token = _after_state.set(after_state)
+    cancelled = False
+    try:
+        yield
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
+    finally:
+        tasks = after_state.close_and_take()
+        _after_state.reset(token)
+        if not cancelled:
+            for task in tasks:
+                await task()
 
 
 def after(fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> None:
@@ -164,13 +192,6 @@ def _call_sync_handler(handler: Recover, request: Request, exc: Exception) -> An
     except Exception:
         exc.__traceback__ = tb
         return handler(request, exc)
-
-
-def _is_async(handler: Callable[..., Any]) -> bool:
-    """An ``async def`` function or an instance with ``async def __call__``."""
-    return inspect.iscoroutinefunction(handler) or inspect.iscoroutinefunction(
-        type(handler).__call__
-    )
 
 
 def _recover_annotation(fn: Recover) -> Any:
@@ -278,17 +299,12 @@ class Chano:
         base_path: str = "",
         after_backend: AfterBackend = "local",
     ) -> None:
-        if after_backend not in _AFTER_BACKENDS:
-            raise ValueError(
-                f"unknown after_backend {after_backend!r}: "
-                f"expected one of {_AFTER_BACKENDS}"
-            )
+        self.after_backend: AfterBackend = _validate_after_backend(after_backend)
         self.title = title
         self.base_path = normalize_base_path(base_path)
         self.version = version
         self.docs = docs
         self.public_dir = Path(public_dir).resolve() if public_dir else None
-        self.after_backend: AfterBackend = after_backend
         self.routes: list[tuple[str, re.Pattern[str], dict[str, Endpoint]]] = []
         self.hidden_operations: set[tuple[str, str]] = set()
         """``(path, method)`` pairs served but left out of the OpenAPI schema."""
@@ -302,8 +318,6 @@ class Chano:
         """Discovered schedule jobs attached by ``create_app``."""
         self.workflows: tuple[WorkflowConfig, ...] = ()
         """Configured workflow entrypoints from ``[[tool.vercel.workflows]]``."""
-        self.workflows_mounted: bool = False
-        """Whether LocalWorld workflow endpoints are mounted on this app."""
         self._queue_dispatcher: Callable[..., Awaitable[Any]] | None = None
         self._schedule_runner: Callable[..., Awaitable[Any]] | None = None
         self._startup_hooks: list[Callable[[], Awaitable[None]]] = []
@@ -412,24 +426,12 @@ class Chano:
             return
 
         request = Request(scope, receive)
-        after_state = _AfterState(self.after_backend)
-        token = _after_state.set(after_state)
-        cancelled = False
-        try:
+        async with _after_scope(self.after_backend):
             try:
                 response = await self._handle(request)
             except Exception as exc:  # unmatched paths and middleware errors
                 response = error_response(exc)
             await response(receive, send, include_body=request.method != "HEAD")
-        except asyncio.CancelledError:
-            cancelled = True
-            raise
-        finally:
-            tasks = after_state.close_and_take()
-            _after_state.reset(token)
-            if not cancelled:
-                for task in tasks:
-                    await task()
 
     async def _handle(self, request: Request) -> Response:
         """Match in Build Output order: literal routes, then docs and
@@ -553,30 +555,19 @@ class EndpointASGIApp:
         methods: Sequence[str] = ("POST",),
         after_backend: AfterBackend = "local",
     ) -> None:
-        if after_backend not in _AFTER_BACKENDS:
-            raise ValueError(
-                f"unknown after_backend {after_backend!r}: "
-                f"expected one of {_AFTER_BACKENDS}"
-            )
+        self.after_backend: AfterBackend = _validate_after_backend(after_backend)
         self.endpoint = endpoint
         self.methods = tuple(dict.fromkeys(m.upper() for m in methods))
-        self.after_backend: AfterBackend = after_backend
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "lifespan":
-            while True:
-                message = await receive()
-                await send({"type": f"{message['type']}.complete"})
-                if message["type"] == "lifespan.shutdown":
-                    return
+            await handle_noop_lifespan(receive, send)
+            return
         if scope["type"] != "http":
             return
 
         request = Request(scope, receive)
-        after_state = _AfterState(self.after_backend)
-        token = _after_state.set(after_state)
-        cancelled = False
-        try:
+        async with _after_scope(self.after_backend):
             try:
                 if request.method not in self.methods:
                     headers = {"allow": ", ".join(sorted(self.methods))}
@@ -593,12 +584,3 @@ class EndpointASGIApp:
             except Exception as exc:
                 response = error_response(exc)
             await response(receive, send, include_body=request.method != "HEAD")
-        except asyncio.CancelledError:
-            cancelled = True
-            raise
-        finally:
-            tasks = after_state.close_and_take()
-            _after_state.reset(token)
-            if not cancelled:
-                for task in tasks:
-                    await task()

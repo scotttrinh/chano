@@ -125,6 +125,6 @@ For testing (for example with `httpx.AsyncClient(transport=httpx.ASGITransport(a
 - `create_app(app_dir="app", *, public_dir=None, base_path=None) -> Chano`: discovers all routes, enables `/docs` and `/openapi.json`, serves optional `public_dir`, and wires local queue/schedule triggers (`app.dispatch_queue`, `app.run_schedule`) and optional workflow mounts.
 - `create_route_app(app_dir, function, *, base_path=None, after_backend="local") -> Chano`: mounts only a single route function with docs disabled (used by built Vercel entrypoints with `after_backend="wait_until"`).
 - `create_queue_app(app_dir, function, *, after_backend="local")` and `create_schedule_app(app_dir, function, *, after_backend="local")`: single-function ASGI apps for deployed queue consumers and private schedules.
-- `create_workflow_flow_app(entrypoints)` and `create_workflow_step_app(entrypoints)`: ASGI apps for deployed workflow flow and step functions.
+- `create_workflow_app(entrypoints)`: ASGI app for deployed workflow flow and step functions.
 - `invoke_queue(app_dir, topic, payload, *, consumer=None, headers=None)` and `invoke_schedule(app_dir, target, *, headers=None)`: async helpers to invoke local queues and schedules in tests.
 - `load_config(pyproject) -> ChanoConfig`: reads and validates `[tool.chano]` and `[[tool.vercel.workflows]]` from a `pyproject.toml` path.

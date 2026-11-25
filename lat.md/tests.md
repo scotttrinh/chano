@@ -4,7 +4,7 @@ lat:
 ---
 # Tests
 
-Test specifications for Chano, anchored to [[tests/test_chano.py]] and [[tests/test_vercel_primitives.py]].
+Test specifications for Chano, anchored to [[tests]].
 
 ## Routes and parameters
 
@@ -26,21 +26,41 @@ It also checks the hello `PUT`'s bearer `security` and declared `401`, with no `
 
 ## Project config
 
-Verify [[src/chano/config.py#load_config]] defaults, parsing of all three keys, `base_path` normalization, and `ValueError` for unknown keys, strict type errors, non-table `tool` values and invalid prefixes.
+Verify [[src/chano/config.py#load_config]] and [[src/chano/config.py#normalize_base_path]] parsing, normalization, and validation errors.
 
-Invalid prefixes include control characters, `%`, quotes, `\`, `<>`, `$`, non-ASCII and segments ending in `.func`. A separate test checks [[src/chano/openapi.py#swagger_html]] escapes its title and URL, with no `<` left inside the inline script.
+### Defaults and keys
+
+Verify default [[src/chano/config.py#ChanoConfig]] values, explicit `[tool.chano]` keys, NUL and `.func` rejection, and `.funcs` acceptance.
+
+### Base path normalization
+
+Verify [[src/chano/config.py#ChanoConfig]] normalizes empty, root, trailing-slash, nested, and punctuation-bearing `base_path` values.
+
+### Invalid tool.chano table
+
+Verify unknown keys, wrong types, control characters, `%`, quotes, `\`, `<>`, `$`, non-ASCII, and `.func` segments raise `ValueError`.
+
+### Invalid tool table
+
+Verify non-table `tool` and `tool.chano` values raise `ValueError` referencing `[tool.chano]`.
 
 ## Prefixed dev routing
 
 Verify a `base_path = "/api/"` project served by `create_app` picks up the config: prefixed routes, static files, docs and `openapi.json` paths, and JSON 404s outside the prefix.
 
-Uses `isolated_imports`. Also checks raw-scope traversal rejection (httpx would normalize `..`), that `/api/` misses the root route, and that an explicit `base_path=""` overrides the config.
+Uses `isolated_project_imports`. Also checks raw-scope traversal rejection (httpx would normalize `..`), that `/api/` misses the root route, and that an explicit `base_path=""` overrides the config.
 
 ## Root path reconstruction
 
 Verify [[src/chano/requests.py#Request#path]] joins `root_path + path` with the prefix-root exception and no `startswith` check, and that routing matches the reconstructed path.
 
-Covers the five spec cases: `/api` + `/` hits `app/route.py`, unstripped `/api/` misses it, `/api` + `/users` matches, `/apiary` becomes `/api/apiary`, and `/api` + `/api/users` becomes `/api/api/users` and misses. A `create_route_app` function also serves its stripped path.
+### Request path joining
+
+Verify `Request.path` joins `root_path` and `path` across empty, prefixed, trailing-slash, `/apiary`, and missing `root_path` scopes.
+
+### Routing with root_path
+
+Verify `create_app` and `create_route_app` route requests using the reconstructed path and return JSON 404s for unstripped or double-prefixed misses.
 
 ## Dev routing priority
 
@@ -64,7 +84,7 @@ Verify `Route.segments` lists the directories from `app/` to the route's own dir
 
 ## Segment module loading
 
-Verify [[src/chano/routing.py#load_module]] runs a segment file once when two sibling routes load it, shares the cache with [[src/chano/routing.py#Route#load]], and leaves `sys.modules` clean after a failing import that raises again on retry.
+Verify [[src/chano/_primitives.py#load_module]] runs a segment file once when two sibling routes load it, shares the cache with [[src/chano/routing.py#Route#load]], and leaves `sys.modules` clean after a failing import that raises again on retry.
 
 ## Ancestor segment loading
 
@@ -170,7 +190,7 @@ Verify a project whose `app` symlinks to `src/app` reads `base_path` from the ro
 
 Verify [[src/chano/build.py#plan_build]] on a temporary project without writing output: paths, functions, entrypoints, `.vc-config.json` overrides, generated docs, and `config.json` routes.
 
-The `isolated_imports` fixture restores `sys.path` and `sys.modules` after loading route modules and disables bytecode writes.
+The `isolated_project_imports` fixture restores `sys.path` and evicts non-installed modules added to `sys.modules` while keeping installed environment modules (stdlib, site-packages, built-in, and frozen). The test session never writes bytecode.
 
 ## Build emit
 
@@ -198,9 +218,15 @@ Verify a prefixed build with no `public/` writes only `static/api/` docs, and th
 
 ## Custom build output directory
 
-Verify [[src/chano/build.py#plan_build]], [[src/chano/build.py#build]], and [[src/chano/cli.py#main]] (`--output`) write to a custom directory without creating `.vercel/output`.
+Verify [[src/chano/build.py#plan_build]], [[src/chano/build.py#build]], and [[src/chano/cli.py#main]] (`--output`) handle custom output paths and reject unsafe overlapping directories.
 
-Checks output paths both outside and inside `project_dir` (ensuring neither the output directory nor `.chano-*` staging dirs leak into `.func` payloads across repeated builds) and `ValueError` rejection for paths containing the project or overlapping `app/` or `public/`.
+### Custom output directory
+
+Verify builds to paths outside or inside `project_dir` do not create `.vercel/output` and never leak output or `.chano-*` staging directories into `.func` payloads.
+
+### Rejects overlapping output directory
+
+Verify [[src/chano/build.py#plan_build]] rejects output directories containing the project or overlapping `app/` or `public/` with `ValueError` before deleting files.
 
 ## Locked lockfile
 
@@ -230,13 +256,13 @@ Verify [[src/chano/cli.py#main]] exits with a `SystemExit` message pointing to `
 
 ## Store index
 
-Verify [[src/chano/build.py#normalize_dist_name]] and [[src/chano/build.py#index_store]] record PEP 503 names, in-store `RECORD` paths, top-level import names, `Requires-Dist` names, and byte sizes.
+Verify [[src/chano/_store.py#normalize_dist_name]] and [[src/chano/_store.py#index_store]] record PEP 503 names, in-store `RECORD` paths, top-level import names, `Requires-Dist` names, and byte sizes.
 
 Covers a synthetic store fixture (including `top_level.txt`, namespace packages, quoted CSV paths, escaped/absolute `RECORD` entries, excluded `*.dist-info`/`*.data`/`__pycache__`/`bin/`, and missing stores) and the real `_vendor/` from `examples/hello`.
 
 ## Build size report and limits
 
-Verify [[src/chano/build.py#SIZE_WARN_BYTES]], [[src/chano/build.py#SIZE_LIMIT_BYTES]], per-function size and distribution count reporting in [[src/chano/build.py#build]] and [[src/chano/cli.py#main]], warnings above the warn threshold, and `RuntimeError` failure above the limit.
+Verify [[src/chano/_report.py#SIZE_WARN_BYTES]], [[src/chano/_report.py#SIZE_LIMIT_BYTES]], per-function size and distribution count reporting in [[src/chano/build.py#build]] and [[src/chano/cli.py#main]], warnings above the warn threshold, and `RuntimeError` failure above the limit.
 
 Lowers thresholds via `monkeypatch` to confirm warning messages name the largest distributions in descending size order while letting the build succeed, and that exceeding the fail limit raises `RuntimeError` naming the oversized function and largest distributions.
 
@@ -248,7 +274,7 @@ Covers recursive project helpers with relative imports and cycles, transitive `R
 
 ## Import tracer and closure
 
-Verify [[src/chano/build.py#_trace_function_chains]], [[src/chano/build.py#_resolve_closure_with_reasons]], [[src/chano/build.py#ALWAYS_INCLUDED]], and [[src/chano/build.py#_read_route_include]] handle tracer, closure, size-report, and validation edge cases against a synthetic store.
+Verify [[src/chano/_trace.py#_trace_function_chains]], [[src/chano/_trace.py#_resolve_closure_with_reasons]], [[src/chano/_trace.py#ALWAYS_INCLUDED]], and [[src/chano/build.py#_read_module_include]] handle tracer, closure, size-report, and validation edge cases against a synthetic store.
 
 Covers `vercel` inclusion with its closure, cyclic `Requires-Dist`, namespace packages in the store and project helpers, package `__init__.py` tracing, `if TYPE_CHECKING:` `else` branches and `if not TYPE_CHECKING:`, aliased/relative `importlib.import_module`, unknown/stdlib ignores, per-function size warnings, and `ValueError` on invalid route `include`.
 
@@ -266,11 +292,11 @@ Also verifies `PYTHONPATH` is ignored by `-I` and no `__pycache__` directories a
 
 ## Import check platform matching
 
-Verify [[src/chano/build.py#_check_function_imports]] skips with a printed message (without invoking `uv python find`) when `plan.platform` does not match the host OS/architecture, and runs when it matches.
+Verify [[src/chano/_importcheck.py#_check_function_imports]] skips with a printed message (without invoking `uv python find`) when `plan.platform` does not match the host OS/architecture, and runs when it matches.
 
 ## Import check target interpreter
 
-Verify [[src/chano/build.py#_check_function_imports]] executes the interpreter returned by `uv python find <python>` with `-I` instead of `sys.executable`, and skips with a printed message when `uv python find` finds none.
+Verify [[src/chano/_importcheck.py#_check_function_imports]] executes the interpreter returned by `uv python find <python>` with `-I` instead of `sys.executable`, and skips with a printed message when `uv python find` finds none.
 
 ## Build explain
 
@@ -280,9 +306,15 @@ Covers direct and helper-file traced imports, multi-hop transitive `Requires-Dis
 
 ## Streaming responses
 
-Verify [[src/chano/responses.py#StreamingResponse]] sends async-generator, sync-generator and list chunks in order (`str` encoded as UTF-8), with `more_body: True` on each and a final empty body.
+Verify [[src/chano/responses.py#StreamingResponse]] and [[src/chano/responses.py#SSEResponse]] streaming chunk order and `HEAD` handling.
 
-No `content-length` is sent even when the caller passes `Content-Length`. `HEAD` sends headers and an empty final body without calling `__iter__`/`__aiter__`, for `SSEResponse` too.
+### Streams chunks in order
+
+Verify async-generator, sync-generator, and list chunks stream in order (`str` as UTF-8) with `more_body: True`, a final empty body, and no `content-length`.
+
+### HEAD skips producer
+
+Verify `HEAD` on `StreamingResponse` and `SSEResponse` sends `200` headers and an empty final body without stepping a generator or calling `__iter__`/`__aiter__`.
 
 ## Streaming disconnect
 
@@ -308,7 +340,15 @@ Verify that cancelling the request while a disconnect is closing the producer wa
 
 ## SSE headers and ping validation
 
-Verify [[src/chano/responses.py#SSEResponse]] always sends `content-type: text/event-stream` and `cache-control: no-cache` over caller headers, and rejects zero, negative and non-finite `ping` with `ValueError`.
+Verify [[src/chano/responses.py#SSEResponse]] header enforcement and `ping` validation.
+
+### Enforces SSE headers
+
+Verify `SSEResponse` always sends `content-type: text/event-stream` and `cache-control: no-cache` over caller headers and accepts `None` or positive `ping`.
+
+### Rejects invalid ping
+
+Verify `SSEResponse` rejects zero, negative, and non-finite `ping` values with `ValueError`.
 
 ## Request cookies
 
@@ -614,7 +654,7 @@ Verify invalid `after_backend` values raise `ValueError`, `"local"` never import
 
 ### Build entrypoint and vercel install
 
-Verify [[src/chano/build.py#plan_build]] emits `after_backend="wait_until"` in `index.py`, [[src/chano/build.py#_install_dependencies]] installs `vercel>=0.10.0`, and executing the emitted `index.py` schedules route `after()` work via `vercel.functions.wait_until`.
+Verify [[src/chano/build.py#plan_build]] emits `after_backend="wait_until"` in `index.py`, [[src/chano/_vendor.py#_install_dependencies]] installs `vercel>=0.10.0`, and executing the emitted `index.py` schedules route `after()` work via `vercel.functions.wait_until`.
 
 ## Vercel Queues
 
@@ -667,6 +707,10 @@ Verify [[src/chano/build.py#emit_build]] emits `_queues/*.func` with `queue/v2be
 ### Queue CLI list and send
 
 Verify `chano queue list` and `chano queue send` (including `--consumer` and stdin `-` payload) list and invoke local queue consumers.
+
+### Consumer lookup strips whitespace
+
+Verify [[src/chano/queues.py#resolve_queues]] strips whitespace from `consumer` before sanitizing so `" default "` matches `"default"` as in [[src/chano/queues.py#read_queue_trigger]].
 
 ## Vercel Schedules
 
@@ -722,7 +766,11 @@ Verify building `[[tool.vercel.workflows]]` fails with `RuntimeError` when `verc
 
 ### Local dev without SDK is graceful
 
-Verify [[src/chano/routing.py#create_app]] succeeds with `workflows_mounted=False` when `vercel-workflow` is not installed, while deployed workflow factories raise `RuntimeError`.
+Verify [[src/chano/routing.py#create_app]] succeeds without mounting `/.well-known/workflow/v1/flow` (404) when `vercel-workflow` is not installed, while deployed workflow factories raise `RuntimeError`.
+
+### Partial SDK fallback to http_handler
+
+Verify [[src/chano/workflows.py#create_workflow_app]] falls back to the registry's `http_handler` when importing `vercel_runtime.workers` raises `ModuleNotFoundError` for another optional Vercel SDK package (such as `vercel_workflow.dependencies`).
 
 ### Real vercel-workflow SDK end-to-end run and build
 
@@ -736,6 +784,34 @@ Verify [[src/chano/workflows.py#introspect_workflow_triggers]] attributes only s
 
 Verify multi-namespace `Workflows` registries mount `/.well-known/workflow/v1/flow` and `manifest.json` in `create_app`, route by `x-vqs-queue-name`, manage lifespan hooks, and emit valid build artifacts.
 
+### Multi-namespace step topic routing
+
+Verify [[src/chano/workflows.py#create_workflow_app]] routes step-prefixed `x-vqs-queue-name` headers to the matching namespace registry and raises `ValueError` on unexpected ASGI body messages.
+
+### Namespace validation and prefix fallback
+
+Verify [[src/chano/workflows.py#validate_workflow_namespace]], [[src/chano/workflows.py#get_workflow_topic_prefix]], and [[src/chano/workflows.py#get_step_topic_prefix]] reject invalid namespaces with `ValueError`.
+
+### Topic prefix fallback and concurrency
+
+Verify [[src/chano/workflows.py#get_workflow_topic_prefix]] falls back when `vercel.workflow` is absent and [[src/chano/workflows.py#workflow_flow_trigger]] emits `maxConcurrency`.
+
+### Src trace roots and missing attribute
+
+Verify [[src/chano/workflows.py#resolve_workflow_trace_roots]] finds package `__init__.py` under `src/` and [[src/chano/workflows.py#load_workflow_entrypoint]] raises `AttributeError` on missing attributes.
+
+### Trigger introspection error paths
+
+Verify [[src/chano/workflows.py#introspect_workflow_triggers]] reports missing `get_subscriptions`, missing `vercel-workflow`, propagated user `ModuleNotFoundError`, non-string namespaces, and unregistered subscriptions.
+
+### ASGI adapter lifespan and chunking
+
+Verify [[src/chano/workflows.py#create_workflow_app]] handles ASGI `lifespan`, ignores non-HTTP scopes, chunks request bodies in `aiter_bytes(chunk_size=...)`, encodes `str` bodies, and stops on `http.disconnect`.
+
+### Dev mount edge cases
+
+Verify [[src/chano/workflows.py#mount_workflows]] returns `False` for empty configs or non-serving registries, propagates user `ModuleNotFoundError`, and mounts flow even when `manifest_handler` raises.
+
 ## Combined Vercel primitives
 
 Verify a single project combining HTTP `route.py`, `queue.py`, `schedule.py`, and `[[tool.vercel.workflows]]` builds cleanly with all functions, `config.json` sections, and isolated OpenAPI output.
@@ -746,7 +822,31 @@ Tests for [[src/chano/responses.py#Outcome]], [[src/chano/responses.py#Failure]]
 
 ### Returned and raised outcomes
 
-Verify status, body, headers, cookies, and bodyless framing (`1xx`, `204`, `304`, `None`) for returned and raised outcomes, `TypeError` on abstract `Outcome`/`Failure`, and `RequestValidationError` as a `Failure`.
+Verify status, body, headers, cookies, bodyless framing, and payload wrapping for returned and raised outcomes.
+
+#### Base types require status
+
+Verify instantiating abstract [[src/chano/responses.py#Outcome]] or [[src/chano/responses.py#Failure]] directly raises `TypeError`.
+
+#### Success outcomes
+
+Verify `Created` and `Accepted` outcomes serialize JSON payloads, empty `Accepted()`, custom headers, and `Set-Cookie` headers.
+
+#### Bodyless outcomes
+
+Verify `103`, `204`, custom `204`, and `304` outcomes send empty bodies without `content-type` or `content-length`, while `OK(None)` sends an empty body with `content-length: 0` and no `content-type`.
+
+#### Returned vs raised failures
+
+Verify returning or raising `NotFound` produces identical `404` JSON, headers, and cookies.
+
+#### Custom failure media type
+
+Verify a `Failure` subclass with custom `media_type` emits `application/problem+json` and its struct payload.
+
+#### Failure payload wrapping
+
+Verify `Failure[str]` preserves raw strings while default/explicit/aliased `ErrorDetail` wraps strings, generic subclass `__init__` and nesting work, and `RequestValidationError` is a `422` `Failure`.
 
 ### Returned failures reach error boundaries
 
@@ -754,7 +854,27 @@ Verify a returned `Failure` passes through `boundary.py` `recover` identically t
 
 ### OpenAPI from return annotations
 
-Verify union branches, PEP 695 aliases, generic envelope subclasses, custom media types, dependency and guard outcomes, same-status `anyOf`, docstring vs HTTP reason descriptions, `HTTPBearer`'s automatic `401`, and `422` on request inputs.
+Verify OpenAPI schema generation from handler, dependency, and guard return annotations.
+
+#### Handler, deps, and guards
+
+Verify `GET /items/{item_id}` combines `@openapi` description, guard `303`, nested `HTTPBearer` `401`, dependency `403`, merged `anyOf` `404`, and `422`.
+
+#### Envelopes and media types
+
+Verify generic `ApiCreated[Item]` resolves to `Document[Item]` at `201` and `ApiNotFound` emits `application/problem+json` at `404` without inventing `200`.
+
+#### Bodyless, unions, bearer
+
+Verify `204` omits `content`, plain unions form `anyOf` on `200` without `422`, and bare `HTTPBearer` documents `401` without `422`.
+
+#### Aliases and generics
+
+Verify `Annotated` outcomes/aliases, unhashable metadata, PEP 695 default and chained type parameters, multi-param subclasses, and generic mixins resolve cleanly.
+
+#### Union meta and dep 200
+
+Verify `Annotated` union `Meta(description=...)` is preserved on plain and struct unions and `@openapi(response_description=...)` overrides a dependency's `200`.
 
 ### Queue retry on returned and raised Failure
 
@@ -764,6 +884,34 @@ Verify a queue consumer returning or raising a `Failure` triggers a retry even w
 
 Verify `ty check` passes on [[tests/typing/ok.py]] and reports errors on the exact marked lines of [[tests/typing/bad.py]].
 
+### Outcome type aliases
+
+Verify routes returning PEP 695 `Outcome` aliases produce the expected HTTP response and OpenAPI schema, and [[src/chano/responses.py#resolve_outcome_content]] unwraps plain and generic aliases.
+
+## List query parameters with unions and aliases
+
+Verify [[src/chano/params.py#Field#is_list]] binds list-only unions and PEP 695 aliases as repeated query lists while keeping mixed scalar/list unions scalar.
+
+Covers `list[str] | None`, `Optional[list[str]]`, PEP 695 aliases, and a mixed `str | list[str]` query parameter paired with a scalar `Depends` (both request handling and `/openapi.json`).
+
+## Embedded body fields
+
+Verify [[src/chano/params.py#Endpoint#_resolve]] behavior on routes with multiple embedded `Body()` fields for invalid and empty request bodies.
+
+### Malformed or non-object JSON
+
+Verify malformed JSON, JSON arrays, and JSON `null` report only the top-level `["body"]` validation error.
+
+### Empty body reports missing fields
+
+Verify an empty request body reports `Field required` for each missing embedded `Body()` field.
+
+## Root-only build ignores preserve nested public and tests
+
+Verify [[src/chano/build.py#_project_ignore]] ignores `public` and `tests` only at the project root while ignoring dotfiles, `__pycache__`, `*.pyc`, `node_modules`, and `uv.lock` at every depth.
+
+Invokes built functions in a fresh interpreter after deleting the source tree to cover `app/public/` importing a nested `tests/` package alongside nested `node_modules`, a dangling symlink inside nested `subpkg/tests/fixtures/`, `public -> app/images`, and `public -> shared` with an imported `shared` package.
+
 ## Checked Depends
 
 Tests for default-value [[src/chano/params.py#Depends]] short-circuiting and caching.
@@ -771,3 +919,31 @@ Tests for default-value [[src/chano/params.py#Depends]] short-circuiting and cac
 ### Short-circuiting and caching
 
 Verify a dependency or inherited check returning a `Failure` or `SeeOther` short-circuits later dependencies and the handler, while a shared dependency returning a value is cached once per request.
+
+## CLI
+
+Tests for [[src/chano/cli.py#main]] and [[src/chano/cli.py#dev_app]].
+
+### Dev app factory
+
+Verify [[src/chano/cli.py#dev_app]] loads routes from `app/` and static files from `public/` in the current working directory.
+
+### Dev command delegates to uvicorn
+
+Verify `chano dev` passes `chano.cli:dev_app`, host, port, reload directory, and reload includes to `uvicorn.run`.
+
+### Dev propagates non-uvicorn import errors
+
+Verify `chano dev` re-raises `ModuleNotFoundError` when importing `uvicorn` fails on a different missing dependency.
+
+### Empty queue and schedule lists
+
+Verify `chano queue list` and `chano schedule list` print their empty-state messages when no consumers or schedules exist.
+
+### Queue and schedule result formatting
+
+Verify `chano schedule run` prints nothing for `None` or empty `Response`, prints decoded text for non-empty `Response`, and falls back to `str()` for non-JSON objects.
+
+### Invalid arguments exit with usage error
+
+Verify missing or unknown subcommands exit with code `2` and print `usage: chano` to stderr.

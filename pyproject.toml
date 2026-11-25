@@ -35,6 +35,9 @@ build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "slow: tests that invoke real uv or full example/workspace builds",
+]
 
 [tool.ruff]
 line-length = 88

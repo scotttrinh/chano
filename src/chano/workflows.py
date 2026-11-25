@@ -33,6 +33,11 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequenc
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
+from chano._primitives import (
+    handle_noop_lifespan,
+    headers_from_scope,
+    is_missing_module,
+)
 from chano.app import ASGIApp
 from chano.config import WorkflowConfig
 from chano.requests import Receive, Scope, Send
@@ -43,11 +48,8 @@ if TYPE_CHECKING:
 WORKFLOW_FLOW_FUNCTION = ".well-known/workflow/v1/flow"
 WORKFLOW_STEP_FUNCTION = ".well-known/workflow/v1/step"
 WORKFLOW_FLOW_PATH = f"/{WORKFLOW_FLOW_FUNCTION}"
-WORKFLOW_STEP_PATH = f"/{WORKFLOW_STEP_FUNCTION}"
 WORKFLOW_MANIFEST_PATH = "/.well-known/workflow/v1/manifest.json"
 
-WORKFLOW_FLOW_TOPIC = "__wkf_workflow_*"
-WORKFLOW_STEP_TOPIC = "__wkf_step_*"
 WORKFLOW_CONSUMER = "default"
 WORKFLOW_FLOW_MAX_DURATION = 60
 WORKFLOW_STEP_MAX_DURATION = "max"
@@ -211,15 +213,7 @@ def load_workflow_entrypoint(entrypoint: str | WorkflowConfig) -> Any:
 
 
 def _is_optional_vercel_missing(exc: ModuleNotFoundError) -> bool:
-    name = exc.name or ""
-    return (
-        name == "vercel"
-        or name.startswith("vercel.")
-        or name == "vercel_workflow"
-        or name.startswith("vercel_workflow.")
-        or name == "vercel_runtime"
-        or name.startswith("vercel_runtime.")
-    )
+    return is_missing_module(exc, "vercel", "vercel_workflow", "vercel_runtime")
 
 
 def _trigger_from_subscription(sub: Any, *, kind: WorkflowKind) -> dict[str, object]:
@@ -283,26 +277,43 @@ def _subscriptions_for_registry(candidates: Sequence[Any], registry: Any) -> lis
     return [sub for sub in candidates if _subscription_owner(sub) is registry]
 
 
-def introspect_workflow_triggers(
+def _load_one_workflow_registry(
+    wf: WorkflowConfig,
+) -> tuple[WorkflowConfig, Any, str | None]:
+    try:
+        registry = load_workflow_entrypoint(wf)
+    except ModuleNotFoundError as exc:
+        if _is_optional_vercel_missing(exc):
+            raise RuntimeError(
+                f"Cannot build workflow entrypoint {wf.entrypoint!r}: "
+                "'vercel-workflow' is not installed in the build environment. "
+                "Install 'vercel-workflow' (or 'vercel>=0.10.0') to build "
+                "[[tool.vercel.workflows]]."
+            ) from exc
+        raise
+    if _registry_http_handler(registry) is None:
+        raise RuntimeError(
+            f"Workflow entrypoint {wf.entrypoint!r} does not serve queue "
+            "deliveries (its `http_handler` is unavailable). Ensure it "
+            "exports a vercel.workflow.Workflows registry with "
+            "as_vercel_job=True."
+        )
+    ns = getattr(registry, "namespace", None)
+    if ns is not None and not isinstance(ns, str):
+        raise ValueError(f"invalid namespace on workflow {wf.entrypoint!r}: {ns!r}")
+    validate_workflow_namespace(ns)
+    return wf, registry, ns
+
+
+def _load_workflow_registries(
     workflows: Sequence[WorkflowConfig],
     project_dir: Path,
-) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    """Derive ``(flow_triggers, step_triggers)`` from live ``Workflows``
-    registries and their actual registered ``vercel.queue`` subscriptions.
-
-    Verifies that each configured registry actually serves queue deliveries
-    (via ``http_handler``) and owns its registered subscription(s), failing
-    with an actionable ``RuntimeError`` when ``vercel-workflow`` /
-    ``vercel-queue`` is unavailable or a registry does not serve queue
-    deliveries. Never manufactures triggers that are not backed by actual
-    SDK subscriptions or attributes another registry's subscriptions.
-    """
+) -> tuple[list[tuple[WorkflowConfig, Any, str | None]], Sequence[Any]]:
     project_root = str(project_dir.resolve())
     added_path = project_root not in sys.path
     if added_path:
         sys.path.insert(0, project_root)
 
-    loaded_entries: list[tuple[WorkflowConfig, Any, str | None]] = []
     try:
         try:
             queue_mod = importlib.import_module("vercel.queue")
@@ -321,39 +332,35 @@ def introspect_workflow_triggers(
                 "does not expose get_subscriptions()."
             )
 
-        for wf in workflows:
-            try:
-                registry = load_workflow_entrypoint(wf)
-            except ModuleNotFoundError as exc:
-                if _is_optional_vercel_missing(exc):
-                    raise RuntimeError(
-                        f"Cannot build workflow entrypoint {wf.entrypoint!r}: "
-                        "'vercel-workflow' is not installed in the build environment. "
-                        "Install 'vercel-workflow' (or 'vercel>=0.10.0') to build "
-                        "[[tool.vercel.workflows]]."
-                    ) from exc
-                raise
-            if _registry_http_handler(registry) is None:
-                raise RuntimeError(
-                    f"Workflow entrypoint {wf.entrypoint!r} does not serve queue "
-                    "deliveries (its `http_handler` is unavailable). Ensure it "
-                    "exports a vercel.workflow.Workflows registry with "
-                    "as_vercel_job=True."
-                )
-            ns = getattr(registry, "namespace", None)
-            if ns is not None and not isinstance(ns, str):
-                raise ValueError(
-                    f"invalid namespace on workflow {wf.entrypoint!r}: {ns!r}"
-                )
-            validate_workflow_namespace(ns)
-            loaded_entries.append((wf, registry, ns))
-
+        loaded_entries = [_load_one_workflow_registry(wf) for wf in workflows]
         all_subs = cast("Sequence[Any]", get_subs())
     finally:
         if added_path:
             with contextlib.suppress(ValueError):
                 sys.path.remove(project_root)
 
+    return loaded_entries, all_subs
+
+
+def _append_unique_triggers(
+    subs: Sequence[Any],
+    *,
+    kind: WorkflowKind,
+    seen: set[tuple[str, str]],
+    target: list[dict[str, object]],
+) -> None:
+    for sub in subs:
+        trigger = _trigger_from_subscription(sub, kind=kind)
+        key = (str(trigger["topic"]), str(trigger["consumer"]))
+        if key not in seen:
+            seen.add(key)
+            target.append(trigger)
+
+
+def _collect_workflow_triggers(
+    loaded_entries: Sequence[tuple[WorkflowConfig, Any, str | None]],
+    all_subs: Sequence[Any],
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     subs_by_topic: dict[str, list[Any]] = {}
     for sub in all_subs:
         topic = getattr(sub, "topic", None)
@@ -382,21 +389,32 @@ def introspect_workflow_triggers(
                 "a vercel.workflow.Workflows registry with as_vercel_job=True."
             )
 
-        for sub in matched_flow:
-            trigger = _trigger_from_subscription(sub, kind="flow")
-            key = (str(trigger["topic"]), str(trigger["consumer"]))
-            if key not in seen_flow:
-                seen_flow.add(key)
-                flow_triggers.append(trigger)
-
-        for sub in matched_step:
-            trigger = _trigger_from_subscription(sub, kind="step")
-            key = (str(trigger["topic"]), str(trigger["consumer"]))
-            if key not in seen_step:
-                seen_step.add(key)
-                step_triggers.append(trigger)
+        _append_unique_triggers(
+            matched_flow, kind="flow", seen=seen_flow, target=flow_triggers
+        )
+        _append_unique_triggers(
+            matched_step, kind="step", seen=seen_step, target=step_triggers
+        )
 
     return flow_triggers, step_triggers
+
+
+def introspect_workflow_triggers(
+    workflows: Sequence[WorkflowConfig],
+    project_dir: Path,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Derive ``(flow_triggers, step_triggers)`` from live ``Workflows``
+    registries and their actual registered ``vercel.queue`` subscriptions.
+
+    Verifies that each configured registry actually serves queue deliveries
+    (via ``http_handler``) and owns its registered subscription(s), failing
+    with an actionable ``RuntimeError`` when ``vercel-workflow`` /
+    ``vercel-queue`` is unavailable or a registry does not serve queue
+    deliveries. Never manufactures triggers that are not backed by actual
+    SDK subscriptions or attributes another registry's subscriptions.
+    """
+    loaded_entries, all_subs = _load_workflow_registries(workflows, project_dir)
+    return _collect_workflow_triggers(loaded_entries, all_subs)
 
 
 class _ASGIHTTPRequest:
@@ -408,10 +426,7 @@ class _ASGIHTTPRequest:
         path = scope.get("path", "/")
         qs = scope.get("query_string", b"")
         self._url = f"{path}?{qs.decode('latin-1')}" if qs else path
-        self._headers = {
-            k.decode("latin-1").lower(): v.decode("latin-1")
-            for k, v in scope.get("headers", ())
-        }
+        self._headers = headers_from_scope(scope)
 
     @property
     def method(self) -> str:
@@ -431,16 +446,17 @@ class _ASGIHTTPRequest:
             msg_type = message.get("type")
             if msg_type == "http.disconnect":
                 return
-            if msg_type == "http.request":
-                body = cast("bytes", message.get("body", b""))
-                if body:
-                    if chunk_size is not None and chunk_size > 0:
-                        for idx in range(0, len(body), chunk_size):
-                            yield body[idx : idx + chunk_size]
-                    else:
-                        yield body
-                if not message.get("more_body", False):
-                    return
+            if msg_type != "http.request":
+                raise ValueError(f"unexpected ASGI message: {msg_type!r}")
+            body = cast("bytes", message.get("body", b""))
+            if body:
+                if chunk_size is not None and chunk_size > 0:
+                    for idx in range(0, len(body), chunk_size):
+                        yield body[idx : idx + chunk_size]
+                else:
+                    yield body
+            if not message.get("more_body", False):
+                return
 
 
 def _http_handler_to_asgi(handler: Callable[[Any], Awaitable[Any]]) -> ASGIApp:
@@ -449,11 +465,8 @@ def _http_handler_to_asgi(handler: Callable[[Any], Awaitable[Any]]) -> ASGIApp:
 
     async def asgi(scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "lifespan":
-            while True:
-                msg = await receive()
-                await send({"type": f"{msg['type']}.complete"})
-                if msg["type"] == "lifespan.shutdown":
-                    return
+            await handle_noop_lifespan(receive, send)
+            return
         if scope["type"] != "http":
             return
         req = _ASGIHTTPRequest(scope, receive)
@@ -498,12 +511,13 @@ def _registry_manifest_handler(
 def _registries_flow_asgi(registries: Sequence[Any]) -> ASGIApp | None:
     """Build an ASGI app serving ``Workflows.http_handler`` for one or more
     registries, routing multi-namespace requests by ``x-vqs-queue-name``."""
-    entries: list[tuple[str, Callable[[Any], Awaitable[Any]]]] = []
+    entries: list[tuple[tuple[str, str], Callable[[Any], Awaitable[Any]]]] = []
     for registry in registries:
         handler = _registry_http_handler(registry)
         if handler is not None:
             ns = getattr(registry, "namespace", None)
-            entries.append((get_workflow_topic_prefix(ns), handler))
+            prefixes = (get_workflow_topic_prefix(ns), get_step_topic_prefix(ns))
+            entries.append((prefixes, handler))
     if not entries:
         return None
     if len(entries) == 1:
@@ -512,8 +526,8 @@ def _registries_flow_asgi(registries: Sequence[Any]) -> ASGIApp | None:
     async def dispatch(request: _ASGIHTTPRequest) -> Any:
         queue_name = request.headers.get("x-vqs-queue-name", "")
         if queue_name:
-            for prefix, handler in entries:
-                if queue_name.startswith(prefix):
+            for prefixes, handler in entries:
+                if queue_name.startswith(prefixes):
                     return await handler(request)
         return await entries[0][1](request)
 
@@ -539,17 +553,13 @@ def _try_create_queue_service_app() -> ASGIApp | None:
 
 def create_workflow_app(
     entrypoints: Sequence[str | WorkflowConfig],
-    *,
-    kind: WorkflowKind,
 ) -> ASGIApp:
-    """Load configured workflow ``entrypoints`` and return the ASGI app for
-    ``kind`` (``"flow"`` or ``"step"``).
+    """Load configured workflow ``entrypoints`` and return their ASGI app.
 
     On Vercel, prefers ``vercel_runtime.workers.create_queue_service_app()``
     backed by the ``vercel.queue`` subscriptions registered when ``Workflows``
     is imported, and falls back to adapting ``Workflows.http_handler``.
     """
-    _ = kind
     registries = [load_workflow_entrypoint(ep) for ep in entrypoints]
     if queue_app := _try_create_queue_service_app():
         return queue_app
@@ -559,20 +569,6 @@ def create_workflow_app(
         "vercel-workflow is required to serve workflow handlers; "
         "install `vercel-workflow` in your project"
     )
-
-
-def create_workflow_flow_app(
-    entrypoints: Sequence[str | WorkflowConfig],
-) -> ASGIApp:
-    """Build the ASGI app for ``.well-known/workflow/v1/flow.func``."""
-    return create_workflow_app(entrypoints, kind="flow")
-
-
-def create_workflow_step_app(
-    entrypoints: Sequence[str | WorkflowConfig],
-) -> ASGIApp:
-    """Build the ASGI app for ``.well-known/workflow/v1/step.func``."""
-    return create_workflow_app(entrypoints, kind="step")
 
 
 async def _start_workflow_world() -> None:
@@ -648,5 +644,4 @@ def mount_workflows(
 
     app.on_startup(_start_workflow_world)
     app.on_shutdown(_close_workflow_world)
-    app.workflows_mounted = True
     return True
